@@ -1,0 +1,12 @@
+node_modules/
+dist-types/
+**/dist-types/
+apps/desktop/out/
+apps/desktop/out-e2e/
+release/
+coverage/
+playwright-report/
+test-results/
+*.tsbuildinfo
+*.log
+.DS_Store

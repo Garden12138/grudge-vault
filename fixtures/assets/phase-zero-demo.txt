@@ -1,0 +1,4 @@
+Grudge Vault Phase 0 fixture
+
+This synthetic, non-sensitive file verifies encrypted import, content hashing,
+background integrity checks, and persistence across an application restart.

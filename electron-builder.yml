@@ -1,0 +1,29 @@
+appId: com.grudgevault.desktop
+productName: Grudge Vault
+copyright: Copyright © 2026 Grudge Vault contributors
+asar: true
+npmRebuild: true
+directories:
+  app: apps/desktop
+  output: release
+files:
+  - out/**/*
+  - package.json
+extraMetadata:
+  main: out/main/index.js
+asarUnpack:
+  - node_modules/better-sqlite3/**/*.node
+mac:
+  category: public.app-category.productivity
+  target:
+    - dmg
+    - zip
+  identity: null
+win:
+  target:
+    - nsis
+linux:
+  category: Utility
+  target:
+    - AppImage
+artifactName: "${productName}-${version}-${os}-${arch}.${ext}"

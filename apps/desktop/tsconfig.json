@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "composite": true, "declaration": true, "emitDeclarationOnly": true, "outDir": "dist-types", "types": ["node", "vite/client"] },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "electron.vite.config.ts"],
+  "references": [
+    { "path": "../../packages/domain" },
+    { "path": "../../packages/shared" },
+    { "path": "../../packages/application" },
+    { "path": "../../packages/object-vault" },
+    { "path": "../../packages/persistence-sqlite" }
+  ]
+}

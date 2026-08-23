@@ -108,10 +108,29 @@ Case Binder、本地模型、多源自动同步和主动周期回顾将在基础
 
 - [架构设计与实现](docs/ARCHITECTURE.md)
 - [分阶段开发计划](docs/DEVELOPMENT_PLAN.md)
+- [开发与验证](docs/DEVELOPMENT.md)
+- [架构决策记录](docs/adr/)
 - [产品构想参考对话](https://chatgpt.com/share/6a8b0514-1c4c-83ea-aacf-e1d4971390fa)
 
 ## 当前状态
 
-项目处于产品与架构设计阶段。仓库将按开发计划从可运行骨架开始，以纵向切片方式逐步交付记录、导入、检索、分析和证据整理能力。
+Phase 0 Developer Preview 已建立可运行基础：
+
+- Electron + React + TypeScript Monorepo 与安全的 Main / Preload / Renderer 边界；
+- 可创建、打开并自动恢复最近的本地工作区；
+- SQLite 迁移、WAL、Asset repository 与可恢复 Job Runner；
+- 由系统密钥存储保护的 Workspace Key；
+- AES-256-GCM 加密、SHA-256 内容寻址的对象保险库；
+- 文件拖入、哈希展示、完整性校验和任务重试 UI；
+- lint、typecheck、unit/integration/E2E、生产构建与三平台 CI 打包基线。
+
+快速启动：
+
+```bash
+pnpm install
+pnpm dev
+```
+
+当前版本尚不包含 Chat、Event 编辑、搜索、Day One 导入和模型能力；这些功能按[分阶段开发计划](docs/DEVELOPMENT_PLAN.md)继续交付。
 
 > Grudge Vault 可以帮助整理材料和准备问题，但涉及法律结论时，应结合所在地、事发时点与具体事实核验有效规则，并在需要时咨询专业人士。

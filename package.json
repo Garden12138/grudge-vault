@@ -1,0 +1,54 @@
+{
+  "name": "grudge-vault",
+  "version": "0.0.1",
+  "private": true,
+  "description": "A local-first event memory and evidence vault.",
+  "author": "Grudge Vault contributors",
+  "type": "module",
+  "packageManager": "pnpm@11.23.0",
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "scripts": {
+    "dev": "electron-vite dev --config apps/desktop/electron.vite.config.ts",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "pretest:e2e": "electron-vite build --mode e2e --config apps/desktop/electron.vite.config.ts",
+    "test:e2e": "playwright test",
+    "build": "electron-vite build --config apps/desktop/electron.vite.config.ts",
+    "dist": "pnpm build && electron-builder --config electron-builder.yml",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "dependencies": {
+    "better-sqlite3": "13.0.3",
+    "mime-types": "3.0.2",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.2",
+    "@playwright/test": "1.62.1",
+    "@types/better-sqlite3": "9.6.0",
+    "@types/mime-types": "2.1.4",
+    "@types/node": "24.10.1",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@typescript-eslint/eslint-plugin": "8.67.0",
+    "@typescript-eslint/parser": "8.67.0",
+    "@vitejs/plugin-react": "6.1.0",
+    "electron": "43.4.1",
+    "electron-builder": "26.15.3",
+    "electron-vite": "5.0.0",
+    "eslint": "9.39.2",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "eslint-plugin-react-refresh": "0.5.4",
+    "jsdom": "30.0.1",
+    "pnpm": "11.23.0",
+    "typescript": "5.9.3",
+    "vite": "8.2.2",
+    "vitest": "4.1.11"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "react-jsx",
+    "baseUrl": ".",
+    "paths": {
+      "@grudge-vault/domain": ["packages/domain/src/index.ts"],
+      "@grudge-vault/shared": ["packages/shared/src/index.ts"],
+      "@grudge-vault/application": ["packages/application/src/index.ts"],
+      "@grudge-vault/persistence-sqlite": ["packages/persistence-sqlite/src/index.ts"],
+      "@grudge-vault/object-vault": ["packages/object-vault/src/index.ts"]
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "@grudge-vault/desktop",
+  "version": "0.0.1",
+  "description": "Grudge Vault local-first desktop application.",
+  "author": "Grudge Vault contributors",
+  "private": true,
+  "type": "module",
+  "main": "out/main/index.js",
+  "dependencies": {
+    "better-sqlite3": "13.0.3"
+  },
+  "devDependencies": {
+    "@grudge-vault/application": "workspace:*",
+    "@grudge-vault/domain": "workspace:*",
+    "@grudge-vault/object-vault": "workspace:*",
+    "@grudge-vault/persistence-sqlite": "workspace:*",
+    "@grudge-vault/shared": "workspace:*"
+  }
+}

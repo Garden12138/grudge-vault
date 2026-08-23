@@ -1,0 +1,9 @@
+packages:
+  - apps/*
+  - packages/*
+allowBuilds:
+  better-sqlite3: true
+  electron-winstaller: true
+  esbuild: true
+minimumReleaseAgeExclude:
+  - pnpm@11.23.0

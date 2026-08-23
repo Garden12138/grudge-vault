@@ -1,0 +1,12 @@
+{
+  "name": "@grudge-vault/application",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@grudge-vault/domain": "workspace:*",
+    "@grudge-vault/shared": "workspace:*",
+    "mime-types": "3.0.2"
+  }
+}

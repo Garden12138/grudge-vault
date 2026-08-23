@@ -1,0 +1,16 @@
+{
+  "metadata": {
+    "version": "synthetic-phase-zero",
+    "notice": "This fixture is synthetic and is not a Day One compatibility claim."
+  },
+  "entries": [
+    {
+      "uuid": "11111111-2222-4333-8444-555555555555",
+      "creationDate": "2025-09-15T10:30:00Z",
+      "modifiedDate": "2025-09-15T10:35:00Z",
+      "timeZone": "Asia/Shanghai",
+      "text": "Synthetic journal entry for future importer development.",
+      "tags": ["synthetic"]
+    }
+  ]
+}

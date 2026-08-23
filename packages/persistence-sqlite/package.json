@@ -1,0 +1,13 @@
+{
+  "name": "@grudge-vault/persistence-sqlite",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@grudge-vault/application": "workspace:*",
+    "@grudge-vault/domain": "workspace:*",
+    "@grudge-vault/shared": "workspace:*",
+    "better-sqlite3": "13.0.3"
+  }
+}
