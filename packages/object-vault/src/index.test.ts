@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { EncryptedObjectVault } from "./index";
 
@@ -22,11 +23,13 @@ describe("EncryptedObjectVault", () => {
       const key = randomBytes(32);
 
       const first = await vault.put(input, key);
-      const second = await vault.put(input, key);
+      const progress: number[] = [];
+      const second = await vault.putStream(Readable.from(content), key, content.length, (value) => progress.push(value));
 
       expect(first.sha256).toHaveLength(64);
       expect(first.deduplicated).toBe(false);
       expect(second.deduplicated).toBe(true);
+      expect(progress.at(-1)).toBe(1);
       expect(await vault.verify(first.sha256, key)).toBe(true);
       expect(await readAll(await vault.open(first.sha256, key))).toEqual(content);
       expect(await readFile(vault.objectPath(first.sha256))).not.toContain(content);

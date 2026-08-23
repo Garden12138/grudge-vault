@@ -1,6 +1,10 @@
 packages:
   - apps/*
   - packages/*
+nodeLinker: hoisted
+strictPeerDependencies: false
+verifyDepsBeforeRun: error
+enableGlobalVirtualStore: false
 allowBuilds:
   better-sqlite3: true
   electron-winstaller: true

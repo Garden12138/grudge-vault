@@ -1,5 +1,8 @@
 import type {
   Asset,
+  BackfillRun,
+  CandidateDetail,
+  CandidateSummary,
   Clarification,
   Conversation,
   Emotion,
@@ -10,6 +13,8 @@ import type {
   EventSearchQuery,
   Interest,
   Job,
+  ImportRun,
+  ImportRunDetail,
   Message,
   Person,
   Statement,
@@ -33,6 +38,11 @@ export const APP_ERROR_CODES = [
   "EVENT_REVISION_CONFLICT",
   "BACKUP_INVALID",
   "BACKUP_EXISTS",
+  "IMPORT_INVALID_ARCHIVE",
+  "IMPORT_LIMIT_EXCEEDED",
+  "IMPORT_RUN_STATE_CONFLICT",
+  "BACKFILL_STATE_CONFLICT",
+  "CANDIDATE_STATE_CONFLICT",
   "JOB_NOT_RETRYABLE",
   "VALIDATION_FAILED",
   "INTERNAL_ERROR"
@@ -124,6 +134,26 @@ export interface BackupSummary {
   byteSize: number;
 }
 
+export interface StartBackfillInput {
+  importRunId?: string;
+  from?: string;
+  to?: string;
+  tags: string[];
+  batchSize?: number;
+}
+
+export interface CandidateMergeInput {
+  candidateEventId: string;
+  candidateExpectedRevision: number;
+  targetEventId: string;
+  targetExpectedRevision: number;
+}
+
+export interface CandidateMergeResult {
+  candidate: Event;
+  target: Event;
+}
+
 export interface GrudgeVaultApi {
   workspace: {
     current(): Promise<IpcResult<Workspace | null>>;
@@ -167,6 +197,25 @@ export interface GrudgeVaultApi {
     verify(assetId: string): Promise<IpcResult<Job>>;
     preview(assetId: string): Promise<IpcResult<AssetPreview>>;
     exportCopy(assetId: string): Promise<IpcResult<string | null>>;
+  };
+  imports: {
+    chooseDayOneZip(): Promise<IpcResult<ImportRun | null>>;
+    list(): Promise<IpcResult<ImportRun[]>>;
+    get(id: string): Promise<IpcResult<ImportRunDetail>>;
+  };
+  backfill: {
+    list(): Promise<IpcResult<BackfillRun[]>>;
+    start(input: StartBackfillInput): Promise<IpcResult<BackfillRun>>;
+    pause(id: string): Promise<IpcResult<BackfillRun>>;
+    resume(id: string): Promise<IpcResult<BackfillRun>>;
+    cancel(id: string): Promise<IpcResult<BackfillRun>>;
+  };
+  candidates: {
+    list(): Promise<IpcResult<CandidateSummary[]>>;
+    get(eventId: string): Promise<IpcResult<CandidateDetail>>;
+    confirm(eventId: string, expectedRevision: number): Promise<IpcResult<Event>>;
+    ignore(eventId: string, expectedRevision: number): Promise<IpcResult<Event>>;
+    merge(input: CandidateMergeInput): Promise<IpcResult<CandidateMergeResult>>;
   };
   backups: {
     createSnapshot(): Promise<IpcResult<BackupSummary | null>>;

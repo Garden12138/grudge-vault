@@ -48,6 +48,141 @@ export interface SourceItem {
   deletedAt?: IsoDateTime;
 }
 
+export interface SourceVersion {
+  id: EntityId;
+  sourceItemId: EntityId;
+  version: number;
+  content?: string;
+  contentHash: string;
+  externalModifiedAt?: IsoDateTime;
+  raw: unknown;
+  importRunId: EntityId;
+  createdAt: IsoDateTime;
+}
+
+export interface JournalLocation {
+  name?: string;
+  locality?: string;
+  administrativeArea?: string;
+  country?: string;
+  latitude?: number;
+  longitude?: number;
+}
+
+export interface JournalEntry {
+  sourceItemId: EntityId;
+  externalId: string;
+  entryUuid?: string;
+  fingerprint: string;
+  creationDate: IsoDateTime;
+  journalDate: string;
+  modifiedDate?: IsoDateTime;
+  timeZone?: string;
+  tags: string[];
+  location?: JournalLocation;
+  currentVersionId: EntityId;
+  currentVersion: number;
+  importRunId: EntityId;
+}
+
+export type ImportRunState = "queued" | "running" | "succeeded" | "failed";
+
+export interface ImportRunCounts {
+  totalEntries: number;
+  newEntries: number;
+  updatedEntries: number;
+  skippedEntries: number;
+  mediaImported: number;
+  mediaMissing: number;
+  errorCount: number;
+}
+
+export interface ImportRun {
+  id: EntityId;
+  archiveAssetId: EntityId;
+  archiveFileName: string;
+  state: ImportRunState;
+  progress: number;
+  counts: ImportRunCounts;
+  startedAt?: IsoDateTime;
+  finishedAt?: IsoDateTime;
+  lastError?: string;
+  createdAt: IsoDateTime;
+  updatedAt: IsoDateTime;
+}
+
+export interface ImportIssue {
+  id: EntityId;
+  importRunId: EntityId;
+  severity: "warning" | "error";
+  code: string;
+  entryExternalId?: string;
+  archivePath?: string;
+  message: string;
+  createdAt: IsoDateTime;
+}
+
+export interface ImportRunDetail {
+  run: ImportRun;
+  issues: ImportIssue[];
+}
+
+export interface BackfillScope {
+  importRunId?: EntityId;
+  from?: string;
+  to?: string;
+  tags: string[];
+  batchSize: number;
+}
+
+export type BackfillRunState = "queued" | "running" | "paused" | "completed" | "cancelled" | "failed";
+
+export interface BackfillRun {
+  id: EntityId;
+  scope: BackfillScope;
+  detectorIdentity: string;
+  detectorVersion: number;
+  state: BackfillRunState;
+  totalItems: number;
+  processedItems: number;
+  candidateCount: number;
+  cursor?: string;
+  lastError?: string;
+  createdAt: IsoDateTime;
+  updatedAt: IsoDateTime;
+  finishedAt?: IsoDateTime;
+}
+
+export type CandidateReviewState = "pending" | "confirmed" | "ignored" | "merged" | "superseded";
+
+export interface CandidateExtraction {
+  id: EntityId;
+  sourceVersionId: EntityId;
+  eventId: EntityId;
+  detectorIdentity: string;
+  detectorVersion: number;
+  ordinal: number;
+  anchorStart: number;
+  anchorEnd: number;
+  temporalBasis: "source-text" | "relative" | "journal-date";
+  reviewState: CandidateReviewState;
+  mergedIntoEventId?: EntityId;
+  createdAt: IsoDateTime;
+  updatedAt: IsoDateTime;
+}
+
+export interface CandidateSummary {
+  extraction: CandidateExtraction;
+  event: Event;
+  journalEntry: JournalEntry;
+  excerpt: string;
+}
+
+export interface CandidateDetail extends CandidateSummary {
+  detail: EventDetail;
+  sourceVersion: SourceVersion;
+}
+
 export interface Conversation {
   id: EntityId;
   sourceId: EntityId;

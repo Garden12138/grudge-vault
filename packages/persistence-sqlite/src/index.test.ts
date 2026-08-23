@@ -38,7 +38,7 @@ describe("SQLite foundation", () => {
       runMigrations(database);
       expect(database.pragma("journal_mode", { simple: true })).toBe("wal");
       expect(database.pragma("foreign_keys", { simple: true })).toBe(1);
-      expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 2 });
+      expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 3 });
       expect(database.prepare("SELECT count(*) AS count FROM pragma_module_list WHERE name = 'fts5'").get()).toEqual({ count: 1 });
       database.close();
     } finally {
@@ -59,8 +59,26 @@ describe("SQLite foundation", () => {
     runMigrations(database, [DEFAULT_MIGRATIONS[0]!]);
     expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 1 });
     runMigrations(database);
-    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 2 });
+    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 3 });
     expect(database.prepare("SELECT name FROM sqlite_master WHERE name = 'events'").get()).toEqual({ name: "events" });
+    database.close();
+  });
+
+  it("upgrades a Phase 1 database with all Phase 2 import and backfill tables", () => {
+    const database = new Database(":memory:");
+    runMigrations(database, DEFAULT_MIGRATIONS.slice(0, 2));
+    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 2 });
+    runMigrations(database);
+    const tables = database.prepare(`
+      SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (
+        'import_runs', 'import_issues', 'import_run_entries', 'source_versions',
+        'journal_entries', 'source_version_assets', 'backfill_runs', 'candidate_extractions'
+      ) ORDER BY name
+    `).all() as Array<{ name: string }>;
+    expect(tables.map(({ name }) => name)).toEqual([
+      "backfill_runs", "candidate_extractions", "import_issues", "import_run_entries",
+      "import_runs", "journal_entries", "source_version_assets", "source_versions"
+    ]);
     database.close();
   });
 

@@ -12,6 +12,7 @@
   "devDependencies": {
     "@grudge-vault/application": "workspace:*",
     "@grudge-vault/domain": "workspace:*",
+    "@grudge-vault/importer-dayone": "workspace:*",
     "@grudge-vault/object-vault": "workspace:*",
     "@grudge-vault/persistence-sqlite": "workspace:*",
     "@grudge-vault/shared": "workspace:*"

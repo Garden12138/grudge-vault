@@ -1,4 +1,5 @@
 node_modules/
+.pnpm-store/
 dist-types/
 **/dist-types/
 apps/desktop/out/

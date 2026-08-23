@@ -286,6 +286,7 @@ export class LocalWorkspaceManager implements WorkspaceManagerPort {
         assets: openedDatabase.assets,
         jobs: openedDatabase.jobs,
         memory: openedDatabase.memory,
+        dayOne: openedDatabase.dayOne,
         vault,
         backupDatabase: (destinationPath) => openedDatabase.backup(destinationPath),
         close: async () => {

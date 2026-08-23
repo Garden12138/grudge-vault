@@ -1,0 +1,23 @@
+{
+  "name": "@grudge-vault/importer-dayone",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@grudge-vault/application": "workspace:*",
+    "@grudge-vault/shared": "workspace:*",
+    "stream-json": "3.5.0",
+    "yauzl": "3.4.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@grudge-vault/object-vault": "workspace:*",
+    "@grudge-vault/persistence-sqlite": "workspace:*",
+    "@types/better-sqlite3": "9.6.0",
+    "@types/yauzl": "3.4.0",
+    "@types/yazl": "3.3.1",
+    "better-sqlite3": "13.0.3",
+    "yazl": "3.3.1"
+  }
+}

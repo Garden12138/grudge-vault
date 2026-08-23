@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type {
-  Asset, Conversation, Event, EventDetail, EventRevision, Job, Message, Person,
-  StatementKind, TemporalValue, Workspace
+  Asset, BackfillRun, CandidateDetail, CandidateSummary, Conversation, Event, EventDetail,
+  EventRevision, ImportRun, ImportRunDetail, Job, Message, Person, StatementKind,
+  TemporalValue, Workspace
 } from "@grudge-vault/domain";
 import type { EventWriteFields, IpcResult } from "@grudge-vault/shared";
 import { detectLanguage, translator, type Language } from "./i18n";
 
-type View = "chat" | "events" | "vault" | "settings";
+type View = "chat" | "events" | "backfill" | "vault" | "settings";
 
 interface EventForm {
   title: string;
@@ -44,6 +45,15 @@ function formatBytes(bytes: number): string {
     unit = units[index]!;
   }
   return `${value.toFixed(value >= 10 ? 1 : 2)} ${unit}`;
+}
+
+function formatJournalTimestamp(value: string, language: Language, timeZone?: string): string {
+  const date = new Date(value);
+  try {
+    return date.toLocaleString(language, timeZone ? { timeZone } : undefined);
+  } catch {
+    return date.toLocaleString(language);
+  }
 }
 
 function eventToForm(event: Event): EventForm {
@@ -160,6 +170,17 @@ export function App() {
   const [assets, setAssets] = useState<Asset[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [preview, setPreview] = useState<PreviewState>();
+  const [importRuns, setImportRuns] = useState<ImportRun[]>([]);
+  const [selectedImportId, setSelectedImportId] = useState<string>();
+  const [importDetail, setImportDetail] = useState<ImportRunDetail>();
+  const [backfillRuns, setBackfillRuns] = useState<BackfillRun[]>([]);
+  const [candidates, setCandidates] = useState<CandidateSummary[]>([]);
+  const [candidateDetail, setCandidateDetail] = useState<CandidateDetail>();
+  const [backfillFrom, setBackfillFrom] = useState("");
+  const [backfillTo, setBackfillTo] = useState("");
+  const [backfillTags, setBackfillTags] = useState("");
+  const [backfillBatchSize, setBackfillBatchSize] = useState("25");
+  const [mergeTargetId, setMergeTargetId] = useState("");
 
   const searchEvents = useCallback(async () => {
     const result = await window.grudgeVault.events.search({
@@ -174,9 +195,10 @@ export function App() {
   }, [queryFrom, queryPerson, queryStatus, queryText, queryTo]);
 
   const refreshLists = useCallback(async () => {
-    const [conversationResult, eventResult, peopleResult, assetResult, jobResult] = await Promise.all([
+    const [conversationResult, eventResult, peopleResult, assetResult, jobResult, importResult, backfillResult, candidateResult] = await Promise.all([
       window.grudgeVault.conversations.list(), window.grudgeVault.events.search({}),
-      window.grudgeVault.people.list(), window.grudgeVault.assets.list(), window.grudgeVault.jobs.list()
+      window.grudgeVault.people.list(), window.grudgeVault.assets.list(), window.grudgeVault.jobs.list(),
+      window.grudgeVault.imports.list(), window.grudgeVault.backfill.list(), window.grudgeVault.candidates.list()
     ]);
     if (conversationResult.ok) {
       setConversations(conversationResult.data);
@@ -187,6 +209,12 @@ export function App() {
     if (peopleResult.ok) setPeople(peopleResult.data); else setError(peopleResult.error.message);
     if (assetResult.ok) setAssets(assetResult.data); else setError(assetResult.error.message);
     if (jobResult.ok) setJobs(jobResult.data); else setError(jobResult.error.message);
+    if (importResult.ok) {
+      setImportRuns(importResult.data);
+      setSelectedImportId((current) => current && importResult.data.some(({ id }) => id === current) ? current : importResult.data[0]?.id);
+    } else setError(importResult.error.message);
+    if (backfillResult.ok) setBackfillRuns(backfillResult.data); else setError(backfillResult.error.message);
+    if (candidateResult.ok) setCandidates(candidateResult.data); else setError(candidateResult.error.message);
   }, []);
 
   const refresh = useCallback(async () => {
@@ -206,6 +234,12 @@ export function App() {
       if (result.ok) setMessages(result.data); else setError(result.error.message);
     });
   }, [selectedConversationId]);
+  useEffect(() => {
+    if (!selectedImportId) return setImportDetail(undefined);
+    void window.grudgeVault.imports.get(selectedImportId).then((result) => {
+      if (result.ok) setImportDetail(result.data); else setError(result.error.message);
+    });
+  }, [selectedImportId, importRuns]);
   useEffect(() => () => { if (preview?.url) URL.revokeObjectURL(preview.url); }, [preview]);
 
   const runWorkspaceAction = async (action: () => Promise<IpcResult<Workspace | null>>) => {
@@ -338,6 +372,69 @@ export function App() {
     await refreshLists();
   };
 
+  const chooseDayOneZip = async () => {
+    setBusy(true); setError(undefined);
+    const result = await window.grudgeVault.imports.chooseDayOneZip();
+    setBusy(false);
+    if (!result.ok) return setError(result.error.message);
+    if (result.data) {
+      setSelectedImportId(result.data.id);
+      setNotice(t("importQueued"));
+      await refreshLists();
+    }
+  };
+
+  const startBackfill = async () => {
+    const importRunId = selectedImportId && importRuns.find(({ id }) => id === selectedImportId)?.state === "succeeded"
+      ? selectedImportId : undefined;
+    const result = await window.grudgeVault.backfill.start({
+      ...(importRunId ? { importRunId } : {}), ...(backfillFrom ? { from: backfillFrom } : {}),
+      ...(backfillTo ? { to: backfillTo } : {}), tags: backfillTags.split(",").map((tag) => tag.trim()).filter(Boolean),
+      batchSize: Number(backfillBatchSize) || 25
+    });
+    if (!result.ok) return setError(result.error.message);
+    setNotice(t("backfillQueued"));
+    await refreshLists();
+  };
+
+  const changeBackfill = async (run: BackfillRun, action: "pause" | "resume" | "cancel") => {
+    const result = await window.grudgeVault.backfill[action](run.id);
+    if (!result.ok) return setError(result.error.message);
+    await refreshLists();
+  };
+
+  const inspectCandidate = async (eventId: string) => {
+    const result = await window.grudgeVault.candidates.get(eventId);
+    if (!result.ok) return setError(result.error.message);
+    setCandidateDetail(result.data);
+    setMergeTargetId("");
+  };
+
+  const reviewCandidate = async (action: "confirm" | "ignore") => {
+    if (!candidateDetail) return;
+    const result = await window.grudgeVault.candidates[action](
+      candidateDetail.event.id, candidateDetail.event.currentRevision
+    );
+    if (!result.ok) return setError(result.error.message);
+    setCandidateDetail(undefined);
+    await refreshLists();
+  };
+
+  const mergeCandidate = async () => {
+    if (!candidateDetail || !mergeTargetId) return;
+    const target = events.find(({ id }) => id === mergeTargetId);
+    if (!target) return;
+    const result = await window.grudgeVault.candidates.merge({
+      candidateEventId: candidateDetail.event.id,
+      candidateExpectedRevision: candidateDetail.event.currentRevision,
+      targetEventId: target.id,
+      targetExpectedRevision: target.currentRevision
+    });
+    if (!result.ok) return setError(result.error.message);
+    setCandidateDetail(undefined); setMergeTargetId("");
+    await refreshLists();
+  };
+
   const editPerson = async (person: Person) => {
     const displayName = window.prompt(t("personName"), person.displayName);
     if (!displayName?.trim()) return;
@@ -390,7 +487,7 @@ export function App() {
     <aside className="app-sidebar">
       <div className="brand"><p className="eyebrow">GRUDGE VAULT</p><h1>{t("appName")}</h1></div>
       <nav>
-        {(["chat", "events", "vault", "settings"] as View[]).map((item) =>
+        {(["chat", "events", "backfill", "vault", "settings"] as View[]).map((item) =>
           <button key={item} className={view === item ? "active" : ""} onClick={() => setView(item)}>{t(item)}</button>)}
       </nav>
       <div className="workspace-card"><strong>{workspace.name}</strong><span>{workspace.rootPath}</span><em>{t("encryptedLocally")}</em></div>
@@ -495,6 +592,70 @@ export function App() {
             <section className="subsection"><h3>{t("revisions")}</h3><div className="revision-list">{revisions.map((revision) => <article key={revision.id}>
               <strong>{t("revision")} {revision.revision}</strong><span>{revision.reason} · {new Date(revision.createdAt).toLocaleString(language)}</span></article>)}</div></section>
           </>}
+        </section>
+      </div>}
+
+      {view === "backfill" && <div className="backfill-layout">
+        <section className="panel import-panel">
+          <div className="section-heading"><div><p className="eyebrow">DAY ONE SOURCE MEMORY</p><h2>{t("dayOneImports")}</h2></div>
+            <button className="primary" disabled={busy} onClick={() => void chooseDayOneZip()}>{t("chooseDayOneZip")}</button></div>
+          {importRuns.length === 0 ? <div className="empty compact">{t("noImports")}</div> : <div className="run-list">{importRuns.map((run) =>
+            <article key={run.id} className={selectedImportId === run.id ? "selected" : ""} onClick={() => setSelectedImportId(run.id)}>
+              <div><strong>{run.archiveFileName}</strong><span>{new Date(run.createdAt).toLocaleString(language)}</span></div>
+              <em className={`status ${run.state}`}>{run.state}</em>
+              <progress max={1} value={run.progress} />
+              <span>{t("entries")}: {run.counts.totalEntries} · +{run.counts.newEntries} · ↻{run.counts.updatedEntries} · ={run.counts.skippedEntries}</span>
+              <span>{t("media")}: {run.counts.mediaImported} · {t("issues")}: {run.counts.errorCount + run.counts.mediaMissing}</span>
+            </article>)}</div>}
+          {importDetail && <div className="issue-list"><h3>{t("importReport")}</h3>
+            {importDetail.issues.length === 0 ? <p className="muted">{t("noIssues")}</p> : importDetail.issues.map((issue) =>
+              <article key={issue.id}><em className={`status ${issue.severity === "error" ? "failed" : "archived"}`}>{issue.code}</em>
+                <div><strong>{issue.message}</strong><span>{issue.entryExternalId ?? issue.archivePath ?? ""}</span></div></article>)}</div>}
+        </section>
+
+        <section className="panel backfill-controls">
+          <div className="section-heading"><div><p className="eyebrow">RECOVERABLE BACKFILL</p><h2>{t("backfillRuns")}</h2></div></div>
+          <div className="backfill-form"><div className="date-filter"><label className="field"><span>{t("from")}</span><input type="date" value={backfillFrom} onChange={(event) => setBackfillFrom(event.target.value)} /></label>
+            <label className="field"><span>{t("to")}</span><input type="date" value={backfillTo} onChange={(event) => setBackfillTo(event.target.value)} /></label></div>
+            <label className="field"><span>{t("tagFilter")}</span><input value={backfillTags} placeholder={t("tagFilterHelp")} onChange={(event) => setBackfillTags(event.target.value)} /></label>
+            <label className="field"><span>{t("batchSize")}</span><input type="number" min={1} max={100} value={backfillBatchSize} onChange={(event) => setBackfillBatchSize(event.target.value)} /></label>
+            <button className="primary" disabled={importRuns.length === 0} onClick={() => void startBackfill()}>{t("startBackfill")}</button></div>
+          <div className="run-list">{backfillRuns.map((run) => <article key={run.id}>
+            <div><strong>{run.detectorIdentity} v{run.detectorVersion}</strong><span>{run.processedItems}/{run.totalItems} · {run.candidateCount} {t("candidates")}</span></div>
+            <em className={`status ${run.state}`}>{run.state}</em><progress max={Math.max(1, run.totalItems)} value={run.processedItems} />
+            <div className="row-actions permanent">{(run.state === "queued" || run.state === "running") && <button onClick={() => void changeBackfill(run, "pause")}>{t("pause")}</button>}
+              {(run.state === "paused" || run.state === "failed") && <button onClick={() => void changeBackfill(run, "resume")}>{t("resume")}</button>}
+              {!["completed", "cancelled"].includes(run.state) && <button onClick={() => void changeBackfill(run, "cancel")}>{t("cancel")}</button>}</div>
+          </article>)}</div>
+        </section>
+
+        <section className="panel candidate-inbox">
+          <div className="section-heading"><div><p className="eyebrow">CANDIDATE INBOX</p><h2>{t("candidateInbox")}</h2></div><span className="count-badge">{candidates.length}</span></div>
+          {candidates.length === 0 ? <div className="empty compact">{t("noCandidates")}</div> : <div className="candidate-list">{candidates.map((candidate) =>
+            <article key={candidate.event.id} className={candidateDetail?.event.id === candidate.event.id ? "selected" : ""} onClick={() => void inspectCandidate(candidate.event.id)}>
+              <div><strong>{candidate.event.title}</strong><span>{candidate.journalEntry.journalDate} · {candidate.journalEntry.tags.join(", ")}</span>
+                <p>{candidate.excerpt}</p></div><em className="status candidate">v{candidate.extraction.detectorVersion}</em></article>)}</div>}
+        </section>
+
+        <section className="panel candidate-source">
+          {!candidateDetail ? <div className="empty">{t("selectCandidate")}</div> : <>
+            <div className="section-heading"><div><p className="eyebrow">{candidateDetail.extraction.detectorIdentity} v{candidateDetail.extraction.detectorVersion}</p><h2>{candidateDetail.event.title}</h2></div>
+              <button onClick={() => void openEvent(candidateDetail.event.id)}>{t("openEvent")}</button></div>
+            <div className="source-card"><div className="source-meta"><span>{formatJournalTimestamp(
+              candidateDetail.journalEntry.creationDate, language, candidateDetail.journalEntry.timeZone
+            )}</span>
+              <span>{candidateDetail.journalEntry.timeZone ?? t("unknown")}</span><span>{candidateDetail.journalEntry.tags.join(", ")}</span></div>
+              <h3>{t("sourceExcerpt")}</h3><pre>{candidateDetail.excerpt}</pre>
+              <p className="muted">{t("candidateTimeSource")}: {candidateDetail.extraction.temporalBasis === "source-text"
+                ? t("timeFromSource") : candidateDetail.extraction.temporalBasis === "relative" ? t("timeFromRelative") : t("timeFromJournal")}</p>
+              <p className="muted">{t("sourceVersion")} {candidateDetail.sourceVersion.version} · {candidateDetail.sourceVersion.contentHash}</p>
+              <div className="candidate-actions"><button className="primary" onClick={() => void reviewCandidate("confirm")}>{t("confirm")}</button>
+                <button onClick={() => void reviewCandidate("ignore")}>{t("ignoreCandidate")}</button>
+                <select aria-label={t("mergeTarget")} value={mergeTargetId} onChange={(event) => setMergeTargetId(event.target.value)}>
+                  <option value="">{t("mergeTarget")}</option>{events.filter(({ id, status }) => id !== candidateDetail.event.id && status !== "archived").map((event) =>
+                    <option key={event.id} value={event.id}>{event.title}</option>)}</select>
+                <button disabled={!mergeTargetId} onClick={() => void mergeCandidate()}>{t("mergeCandidate")}</button></div>
+            </div></>}
         </section>
       </div>}
 

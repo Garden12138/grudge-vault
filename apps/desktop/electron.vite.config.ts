@@ -9,6 +9,7 @@ const packageAliases = {
   "@grudge-vault/domain": join(repositoryRoot, "packages/domain/src/index.ts"),
   "@grudge-vault/shared": join(repositoryRoot, "packages/shared/src/index.ts"),
   "@grudge-vault/application": join(repositoryRoot, "packages/application/src/index.ts"),
+  "@grudge-vault/importer-dayone": join(repositoryRoot, "packages/importer-dayone/src/index.ts"),
   "@grudge-vault/object-vault": join(repositoryRoot, "packages/object-vault/src/index.ts"),
   "@grudge-vault/persistence-sqlite": join(repositoryRoot, "packages/persistence-sqlite/src/index.ts")
 };

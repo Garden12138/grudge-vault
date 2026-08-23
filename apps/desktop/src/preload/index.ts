@@ -68,6 +68,25 @@ const api: GrudgeVaultApi = {
     preview: (assetId) => invoke("assets:preview", assetId),
     exportCopy: (assetId) => invoke("assets:export", assetId)
   },
+  imports: {
+    chooseDayOneZip: () => invoke("imports:choose-dayone"),
+    list: () => invoke("imports:list"),
+    get: (id) => invoke("imports:get", id)
+  },
+  backfill: {
+    list: () => invoke("backfill:list"),
+    start: (input) => invoke("backfill:start", input),
+    pause: (id) => invoke("backfill:pause", id),
+    resume: (id) => invoke("backfill:resume", id),
+    cancel: (id) => invoke("backfill:cancel", id)
+  },
+  candidates: {
+    list: () => invoke("candidates:list"),
+    get: (eventId) => invoke("candidates:get", eventId),
+    confirm: (eventId, expectedRevision) => invoke("candidates:confirm", { id: eventId, expectedRevision }),
+    ignore: (eventId, expectedRevision) => invoke("candidates:ignore", { id: eventId, expectedRevision }),
+    merge: (input) => invoke("candidates:merge", input)
+  },
   backups: {
     createSnapshot: () => invoke("backups:create"),
     restoreSnapshot: () => invoke("backups:restore")

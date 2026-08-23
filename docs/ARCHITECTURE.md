@@ -329,8 +329,8 @@ sequenceDiagram
 ### 7.2 Day One 导入与历史回填
 
 1. 用户选择 JSON ZIP；
-2. Importer 在隔离的 staging 目录校验压缩包、路径和大小；
-3. 解析条目与媒体，创建 Import Run；
+2. Main 先将原始 ZIP 加密保存为 Asset，任务只持有 Asset ID，再在权限受限的临时位置打开；
+3. `@grudge-vault/importer-dayone` 逐项校验 ZIP 并流式解析 JSON；Importer 只通过端口提交记录和媒体流，不访问 SQLite；
 4. 优先按 Day One Entry UUID 去重，UUID 缺失时使用稳定指纹辅助判断；
 5. 新条目写入 SourceItem，已存在且修改时间变化的条目写入 SourceVersion；
 6. 媒体进入对象保险库，并关联 SourceItem；
@@ -338,6 +338,8 @@ sequenceDiagram
 8. 用户确认、合并、忽略或编辑候选事件。
 
 导入器必须幂等：重复导入同一个 ZIP 不创建重复条目；重新导出后发生变化的条目产生新来源版本。
+
+ZIP 边界默认限制为 20 GiB 压缩包、100,000 个条目、20 GiB 单条目、100 GiB 总解压量和 200:1 膨胀比。绝对路径、路径穿越、大小写或 Unicode 规范化后的重复路径、符号链接、加密条目和不支持的压缩方式会使 Import Run 失败。媒体从 ZIP Readable 直接进入 AES-256-GCM Object Vault，不写出完整明文文件。
 
 Day One 官方当前支持 JSON ZIP 导出，并可包含分类后的媒体，详见 [Exporting entries](https://dayoneapp.com/guides/tips-and-tutorials/exporting-entries/)。官方 CLI 当前不能导出既有数据，因此它不作为读取路径，详见 [Command Line Interface](https://dayoneapp.com/guides/day-one-for-mac/command-line-interface-cli/)。
 

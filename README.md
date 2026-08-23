@@ -114,7 +114,7 @@ Case Binder、本地模型、多源自动同步和主动周期回顾将在基础
 
 ## 当前状态
 
-Phase 1 Internal Alpha 已完成事件记录闭环：
+Phase 2 Alpha 已完成 Day One 历史回填闭环，并保留 Phase 1 的事件记录能力：
 
 - Electron + React + TypeScript Monorepo 与安全的 Main / Preload / Renderer 边界；
 - 可创建、打开并自动恢复最近的本地工作区，支持中英文切换；
@@ -126,6 +126,10 @@ Phase 1 Internal Alpha 已完成事件记录闭环：
 - AES-256-GCM 加密、SHA-256 内容寻址的对象保险库；
 - 事件附件关联、常见格式受控预览、导出副本、完整性校验和任务重试；
 - 带 manifest 和文件哈希校验的同账户加密工作区快照与恢复；
+- Day One JSON ZIP 安全校验、流式解析、原始 ZIP 与媒体加密入库；
+- Entry UUID / 稳定指纹幂等导入、追加式 SourceVersion 与逐条错误报告；
+- 可按导入批次、日期和标签限定的可恢复 Backfill，支持暂停、恢复和取消；
+- 离线确定性候选检测、来源段落定位，以及确认、忽略和无字段覆盖的合并审阅；
 - lint、typecheck、unit/integration/E2E、生产构建与三平台 CI 打包基线。
 
 快速启动：
@@ -135,6 +139,6 @@ pnpm install
 pnpm dev
 ```
 
-当前版本尚不包含 Day One 导入、OCR/ASR、语义检索、人物合并、外部模型和 Harness Agent；这些功能按[分阶段开发计划](docs/DEVELOPMENT_PLAN.md)继续交付。SQLite 中的事件与消息正文仍是本地未加密元数据；原始二进制附件已加密。
+当前版本尚不包含 Import Folder 监听、超大 ZIP 专项优化、OCR/ASR、语义检索、人物合并、外部模型和 Harness Agent；这些功能按[分阶段开发计划](docs/DEVELOPMENT_PLAN.md)继续交付。SQLite 中的事件、消息和 Day One 来源正文仍是本地未加密元数据；原始 ZIP 与二进制媒体已加密。
 
 > Grudge Vault 可以帮助整理材料和准备问题，但涉及法律结论时，应结合所在地、事发时点与具体事实核验有效规则，并在需要时咨询专业人士。

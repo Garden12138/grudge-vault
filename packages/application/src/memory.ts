@@ -56,25 +56,40 @@ function pad(value: string): string {
   return value.padStart(2, "0");
 }
 
+function validCalendarDate(year: string, month: string, day: string): boolean {
+  const candidate = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+  return candidate.getUTCFullYear() === Number(year)
+    && candidate.getUTCMonth() + 1 === Number(month)
+    && candidate.getUTCDate() === Number(day);
+}
+
+function validCalendarMonth(year: string, month: string): boolean {
+  return /^\d{4}$/.test(year) && Number(month) >= 1 && Number(month) <= 12;
+}
+
 export function parseConservativeTemporalValue(content: string): TemporalValue {
   const isoDate = content.match(/\b(\d{4})-(\d{1,2})-(\d{1,2})\b/);
-  if (isoDate?.[1] && isoDate[2] && isoDate[3]) {
+  if (isoDate?.[1] && isoDate[2] && isoDate[3] && validCalendarDate(isoDate[1], isoDate[2], isoDate[3])) {
     return { kind: "date", value: `${isoDate[1]}-${pad(isoDate[2])}-${pad(isoDate[3])}` };
   }
   const chineseDate = content.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
-  if (chineseDate?.[1] && chineseDate[2] && chineseDate[3]) {
+  if (chineseDate?.[1] && chineseDate[2] && chineseDate[3] && validCalendarDate(chineseDate[1], chineseDate[2], chineseDate[3])) {
     return { kind: "date", value: `${chineseDate[1]}-${pad(chineseDate[2])}-${pad(chineseDate[3])}` };
   }
   const isoMonth = content.match(/\b(\d{4})-(\d{1,2})(?!-\d)/);
-  if (isoMonth?.[1] && isoMonth[2]) {
+  if (isoMonth?.[1] && isoMonth[2] && validCalendarMonth(isoMonth[1], isoMonth[2])) {
     return { kind: "month", value: `${isoMonth[1]}-${pad(isoMonth[2])}` };
   }
   const chineseMonth = content.match(/(\d{4})年(\d{1,2})月/);
-  if (chineseMonth?.[1] && chineseMonth[2]) {
+  if (chineseMonth?.[1] && chineseMonth[2] && validCalendarMonth(chineseMonth[1], chineseMonth[2])) {
     return { kind: "month", value: `${chineseMonth[1]}-${pad(chineseMonth[2])}` };
   }
-  const relative = content.match(/(?:大约|约|去年|今年|上个月|这个月|上次|那天|当时)?\s*\d{1,2}\s*月(?:份)?|去年|今年|上个月|这个月|上次|那天|当时/);
-  if (relative?.[0]?.trim()) return { kind: "relative", text: relative[0].trim() };
+  const relativeMonth = content.match(/(?:大约|约)?\s*(\d{1,2})\s*月(?:份)?/);
+  if (relativeMonth?.[0]?.trim() && relativeMonth[1] && Number(relativeMonth[1]) >= 1 && Number(relativeMonth[1]) <= 12) {
+    return { kind: "relative", text: relativeMonth[0].trim() };
+  }
+  const relative = content.match(/去年|今年|上个月|这个月|上次|那天|当时|那件事/);
+  if (relative?.[0]) return { kind: "relative", text: relative[0] };
   return { kind: "unknown" };
 }
 

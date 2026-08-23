@@ -90,6 +90,8 @@
 
 ## 5. Phase 2：Day One 与历史回填
 
+> 状态：Phase 2 Core 已实现。Import Folder 监听、超大 ZIP 专项优化、OCR/ASR 和统一来源搜索仍按后续阶段推进；两份真实去隐私化 fixture 的兼容验收等待安全样本输入。
+
 ### 目标
 
 把用户已经存在的 Day One 日记转化为可逐步整理的 Source Memory，开始补回过去可能遗忘的事件。

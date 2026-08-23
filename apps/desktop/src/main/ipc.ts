@@ -3,7 +3,8 @@ import { z, ZodError, type ZodType } from "zod";
 import type { GrudgeVaultApplication, JobRunner, WorkspaceManagerPort } from "@grudge-vault/application";
 import type { EventSearchQuery, Person } from "@grudge-vault/domain";
 import type {
-  ClarificationAnswerInput, CreateEventInput, SendMessageInput, UpdateEventInput
+  CandidateMergeInput, ClarificationAnswerInput, CreateEventInput, SendMessageInput,
+  StartBackfillInput, UpdateEventInput
 } from "@grudge-vault/shared";
 import { AppError, toSerializedError, type IpcResult } from "@grudge-vault/shared";
 
@@ -62,6 +63,15 @@ const searchSchema = z.object({
   personId: idSchema.optional(), from: z.iso.date().optional(), to: z.iso.date().optional(),
   limit: z.number().int().min(1).max(200).optional()
 });
+const startBackfillSchema = z.object({
+  importRunId: idSchema.optional(), from: z.iso.date().optional(), to: z.iso.date().optional(),
+  tags: z.array(z.string().trim().min(1).max(120)).max(100),
+  batchSize: z.number().int().min(1).max(100).optional()
+}).refine((value) => !value.from || !value.to || value.from <= value.to, { message: "Invalid date range." });
+const candidateMergeSchema = z.object({
+  candidateEventId: idSchema, candidateExpectedRevision: z.number().int().positive(),
+  targetEventId: idSchema, targetExpectedRevision: z.number().int().positive()
+}).refine((value) => value.candidateEventId !== value.targetEventId, { message: "A candidate cannot merge into itself." });
 
 interface IpcDependencies {
   window: BrowserWindow;
@@ -204,6 +214,42 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     if (selection.canceled || !selection.filePath) return null;
     return dependencies.application.exportAsset(assetId, selection.filePath);
   });
+
+  add("imports:choose-dayone", emptySchema, async () => {
+    const selection = await dialog.showOpenDialog(dependencies.window, {
+      title: "Import a Day One JSON ZIP", properties: ["openFile"],
+      filters: [{ name: "Day One JSON ZIP", extensions: ["zip"] }]
+    });
+    if (selection.canceled || !selection.filePaths[0]) return null;
+    const run = await dependencies.application.createDayOneImport(selection.filePaths[0]);
+    dependencies.getRunner()?.wake();
+    return run;
+  });
+  add("imports:list", emptySchema, () => dependencies.application.listImportRuns());
+  add("imports:get", idSchema, (id) => dependencies.application.getImportRun(id));
+
+  add("backfill:list", emptySchema, () => dependencies.application.listBackfillRuns());
+  add("backfill:start", startBackfillSchema, (input) => {
+    const run = dependencies.application.startBackfill(input as StartBackfillInput);
+    dependencies.getRunner()?.wake();
+    return run;
+  });
+  add("backfill:pause", idSchema, (id) => dependencies.application.pauseBackfill(id));
+  add("backfill:resume", idSchema, (id) => {
+    const run = dependencies.application.resumeBackfill(id);
+    dependencies.getRunner()?.wake();
+    return run;
+  });
+  add("backfill:cancel", idSchema, (id) => dependencies.application.cancelBackfill(id));
+
+  add("candidates:list", emptySchema, () => dependencies.application.listCandidates());
+  add("candidates:get", idSchema, (eventId) => dependencies.application.getCandidate(eventId));
+  add("candidates:confirm", idRevisionSchema, ({ id, expectedRevision }) =>
+    dependencies.application.confirmCandidate(id, expectedRevision));
+  add("candidates:ignore", idRevisionSchema, ({ id, expectedRevision }) =>
+    dependencies.application.ignoreCandidate(id, expectedRevision));
+  add("candidates:merge", candidateMergeSchema, (input) =>
+    dependencies.application.mergeCandidate(input as CandidateMergeInput));
 
   add("backups:create", emptySchema, async () => {
     const workspace = dependencies.application.getCurrentWorkspace();

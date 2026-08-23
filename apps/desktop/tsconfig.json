@@ -8,5 +8,6 @@
     { "path": "../../packages/application" },
     { "path": "../../packages/object-vault" },
     { "path": "../../packages/persistence-sqlite" }
+    ,{ "path": "../../packages/importer-dayone" }
   ]
 }

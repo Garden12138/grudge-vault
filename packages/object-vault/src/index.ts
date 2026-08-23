@@ -34,6 +34,10 @@ export class EncryptedObjectVault implements ObjectVaultPort {
   }
 
   async put(inputPath: string, key: Buffer): Promise<StoredObject> {
+    return this.putStream(createReadStream(inputPath), key, (await stat(inputPath)).size);
+  }
+
+  async putStream(input: Readable, key: Buffer, expectedByteSize?: number, onProgress?: (progress: number) => void): Promise<StoredObject> {
     assertKey(key);
     await this.initialize();
     const nonce = randomBytes(NONCE_SIZE);
@@ -49,6 +53,7 @@ export class EncryptedObjectVault implements ObjectVaultPort {
       transform(chunk: Buffer, _encoding, callback) {
         hash.update(chunk);
         byteSize += chunk.length;
+        onProgress?.(expectedByteSize === undefined || expectedByteSize === 0 ? 0 : Math.min(1, byteSize / expectedByteSize));
         callback(null, chunk);
       }
     });
@@ -62,7 +67,7 @@ export class EncryptedObjectVault implements ObjectVaultPort {
         autoClose: false,
         start: HEADER_SIZE
       });
-      await pipeline(createReadStream(inputPath), meter, cipher, encryptedOutput);
+      await pipeline(input, meter, cipher, encryptedOutput);
       const tag = cipher.getAuthTag();
       await handle.write(tag, 0, tag.length, HEADER_SIZE + byteSize);
       await handle.sync();
@@ -90,6 +95,7 @@ export class EncryptedObjectVault implements ObjectVaultPort {
         return { sha256, byteSize, vaultFormat: FORMAT_VERSION, deduplicated: true };
       }
       await chmod(destination, 0o600).catch(() => undefined);
+      onProgress?.(1);
       return { sha256, byteSize, vaultFormat: FORMAT_VERSION, deduplicated: false };
     } catch (error) {
       await handle.close().catch(() => undefined);

@@ -97,6 +97,7 @@ h3 { margin-bottom: 12px; font-size: 18px; }
 .status.confirmed, .status.verified, .status.succeeded, .status.answered { color: #2f6139; background: #e5f2e5; }
 .status.archived, .status.dismissed { color: #67625b; background: #e5e3df; }
 .status.candidate, .status.running { color: #305a77; background: #e4eff7; }
+.status.queued, .status.paused { color: #6a5630; background: #f4ead4; }
 .status.corrupt, .status.failed { color: #8a281b; background: #f9e4df; }
 .editor-form { display: grid; gap: 15px; padding: 22px; }
 .textareas textarea { min-height: 122px; }
@@ -130,6 +131,34 @@ fieldset .inline-create { padding: 13px 0 0; }
 .job-row p { margin: 0; color: #8a281b; font-size: 11px; }
 .job-row button { justify-self: start; }
 
+.backfill-layout { display: grid; grid-template-columns: minmax(300px, .9fr) minmax(360px, 1.1fr); gap: 18px; align-items: start; }
+.import-panel, .backfill-controls, .candidate-inbox, .candidate-source { min-height: 0; }
+.run-list { display: grid; }
+.run-list article { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px 12px; padding: 14px 17px; border-bottom: 1px solid #ebe3d8; }
+.run-list article.selected { background: #fbf6ed; box-shadow: inset 3px 0 #8d3b24; }
+.run-list article > div:first-child { display: grid; gap: 4px; }
+.run-list article span, .issue-list span, .source-meta span { color: #7b746a; font-size: 10px; }
+.run-list progress { grid-column: 1 / -1; width: 100%; height: 5px; accent-color: #8d3b24; }
+.run-list article > span { grid-column: 1 / -1; }
+.run-list .row-actions.permanent { display: flex; grid-column: 1 / -1; }
+.backfill-form { display: grid; gap: 12px; padding: 18px; border-bottom: 1px solid #e6ddd0; }
+.issue-list { padding: 18px; border-top: 1px solid #e6ddd0; }
+.issue-list article { display: flex; align-items: flex-start; gap: 10px; padding: 9px 0; border-top: 1px solid #ece4d8; }
+.issue-list article > div { display: grid; gap: 3px; }
+.muted { color: #7b746a; font-size: 11px; overflow-wrap: anywhere; }
+.count-badge { display: grid; min-width: 30px; height: 30px; place-items: center; border-radius: 999px; color: #fff; background: #8d3b24; font-weight: 800; }
+.candidate-list { max-height: 620px; overflow: auto; }
+.candidate-list article { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 15px 17px; border-bottom: 1px solid #ebe3d8; cursor: pointer; }
+.candidate-list article:hover, .candidate-list article.selected { background: #fbf6ed; }
+.candidate-list article.selected { box-shadow: inset 3px 0 #8d3b24; }
+.candidate-list article > div { min-width: 0; }
+.candidate-list span { display: block; margin-top: 4px; color: #7b746a; font-size: 10px; }
+.candidate-list p { display: -webkit-box; margin: 8px 0 0; overflow: hidden; color: #5d574f; font-size: 12px; line-height: 1.5; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
+.source-card { padding: 20px; }
+.source-meta { display: flex; gap: 9px 16px; margin-bottom: 18px; flex-wrap: wrap; }
+.source-card pre { max-height: 420px; padding: 15px; overflow: auto; border: 1px solid #e3d9cc; border-radius: 10px; white-space: pre-wrap; background: #fffdf8; line-height: 1.6; }
+.candidate-actions { display: grid; grid-template-columns: auto auto minmax(160px, 1fr) auto; gap: 8px; margin-top: 18px; }
+
 .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
 .settings-card { padding: 25px; }
 .settings-card p:not(.eyebrow) { margin: 12px 0 18px; color: #71695f; line-height: 1.6; }
@@ -150,7 +179,7 @@ fieldset .inline-create { padding: 13px 0 0; }
 
 @media (max-width: 1050px) {
   .app-shell { grid-template-columns: 190px minmax(0, 1fr); }
-  .events-layout, .chat-layout, .vault-grid { grid-template-columns: 1fr; height: auto; }
+  .events-layout, .chat-layout, .vault-grid, .backfill-layout { grid-template-columns: 1fr; height: auto; }
   .event-list-panel { position: static; max-height: 520px; }
   .conversation-panel { max-height: 380px; }
   .chat-main { min-height: 600px; }
@@ -160,9 +189,9 @@ fieldset .inline-create { padding: 13px 0 0; }
 @media (max-width: 720px) {
   .app-shell { display: block; }
   .app-sidebar { position: static; width: 100%; height: auto; }
-  .app-sidebar nav { grid-template-columns: repeat(4, 1fr); }
+  .app-sidebar nav { grid-template-columns: repeat(5, 1fr); }
   .workspace-card { display: none; }
   .workspace-view { padding: 12px; }
-  .form-row, .date-filter, .settings-grid { grid-template-columns: 1fr; }
+  .form-row, .date-filter, .settings-grid, .candidate-actions { grid-template-columns: 1fr; }
   .asset-row { grid-template-columns: 1fr; }
 }

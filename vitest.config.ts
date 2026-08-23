@@ -9,6 +9,7 @@ export default defineConfig({
       "@grudge-vault/domain": fromRoot("./packages/domain/src/index.ts"),
       "@grudge-vault/shared": fromRoot("./packages/shared/src/index.ts"),
       "@grudge-vault/application": fromRoot("./packages/application/src/index.ts"),
+      "@grudge-vault/importer-dayone": fromRoot("./packages/importer-dayone/src/index.ts"),
       "@grudge-vault/persistence-sqlite": fromRoot("./packages/persistence-sqlite/src/index.ts"),
       "@grudge-vault/object-vault": fromRoot("./packages/object-vault/src/index.ts")
     }

@@ -5,7 +5,7 @@ const zh = {
   createWorkspace: "创建工作区", openWorkspace: "打开已有工作区",
   landingLede: "为事件、来源与加密原件建立一份可追溯的私人记忆。",
   securityNote: "原始附件在进入工作区保险库前会被加密。", encryptedLocally: "本地加密",
-  chat: "记录", events: "事件", vault: "保险库", settings: "设置", tasks: "任务",
+  chat: "记录", events: "事件", backfill: "历史回填", vault: "保险库", settings: "设置", tasks: "任务",
   conversations: "会话", newConversation: "新建会话", conversationTitle: "会话名称",
   rename: "重命名", delete: "删除", deletedConversationWarning: "删除会清除会话与消息正文；已有事件仍保留并显示来源墓碑。继续吗？",
   noConversation: "新建一个会话，开始记录发生的事情。", noMessages: "还没有消息。原始消息会先保存，再生成候选事件。",
@@ -33,7 +33,16 @@ const zh = {
   activeWorkspace: "当前工作区", stored: "已保存", error: "操作失败", close: "关闭", edit: "编辑",
   personName: "人物姓名", personNotes: "备注", addPerson: "添加人物", archivePerson: "归档人物",
   monthValue: "YYYY-MM", relativeValue: "例如：约 9 月", endValue: "结束日期",
-  emptyRequired: "请填写必填内容。", sourceDeleted: "来源正文已删除", loading: "加载中……"
+  emptyRequired: "请填写必填内容。", sourceDeleted: "来源正文已删除", loading: "加载中……",
+  dayOneImports: "Day One 导入", chooseDayOneZip: "选择 JSON ZIP", noImports: "尚未导入 Day One 日记。",
+  importQueued: "Day One 导入已进入后台任务。", entries: "条目", media: "媒体", issues: "问题",
+  importReport: "导入报告", noIssues: "没有导入问题。", backfillRuns: "历史回填任务",
+  tagFilter: "标签范围", tagFilterHelp: "多个标签用逗号分隔", batchSize: "每批数量", startBackfill: "开始回填",
+  backfillQueued: "历史回填已开始。", candidates: "个候选", pause: "暂停", resume: "恢复", cancel: "取消",
+  candidateInbox: "待补全箱", noCandidates: "没有待审阅候选。", selectCandidate: "选择一个候选以核对原始日记。",
+  sourceExcerpt: "原始日记段落", sourceVersion: "来源版本", ignoreCandidate: "忽略候选",
+  candidateTimeSource: "候选时间来源", timeFromSource: "原文绝对日期", timeFromRelative: "原文相对指代", timeFromJournal: "Day One 日记日期",
+  mergeTarget: "选择合并目标", mergeCandidate: "合并来源"
 } as const;
 
 export type TranslationKey = keyof typeof zh;
@@ -43,7 +52,7 @@ const en: Record<TranslationKey, string> = {
   createWorkspace: "Create workspace", openWorkspace: "Open existing",
   landingLede: "Build a private, traceable memory for events, sources, and encrypted originals.",
   securityNote: "Original attachments are encrypted before entering the workspace vault.", encryptedLocally: "Encrypted locally",
-  chat: "Chat", events: "Events", vault: "Vault", settings: "Settings", tasks: "Tasks",
+  chat: "Chat", events: "Events", backfill: "Backfill", vault: "Vault", settings: "Settings", tasks: "Tasks",
   conversations: "Conversations", newConversation: "New conversation", conversationTitle: "Conversation title",
   rename: "Rename", delete: "Delete", deletedConversationWarning: "Deleting clears the conversation and message text. Existing events remain with source tombstones. Continue?",
   noConversation: "Create a conversation to start recording what happened.", noMessages: "No messages yet. The original message is saved before an event draft is generated.",
@@ -71,7 +80,16 @@ const en: Record<TranslationKey, string> = {
   activeWorkspace: "Active workspace", stored: "stored", error: "Operation failed", close: "Close", edit: "Edit",
   personName: "Person name", personNotes: "Notes", addPerson: "Add person", archivePerson: "Archive person",
   monthValue: "YYYY-MM", relativeValue: "For example: around September", endValue: "End date",
-  emptyRequired: "Complete the required fields.", sourceDeleted: "Source content deleted", loading: "Loading…"
+  emptyRequired: "Complete the required fields.", sourceDeleted: "Source content deleted", loading: "Loading…",
+  dayOneImports: "Day One imports", chooseDayOneZip: "Choose JSON ZIP", noImports: "No Day One journal has been imported.",
+  importQueued: "The Day One import was queued.", entries: "Entries", media: "Media", issues: "Issues",
+  importReport: "Import report", noIssues: "No import issues.", backfillRuns: "Backfill runs",
+  tagFilter: "Tag scope", tagFilterHelp: "Separate tags with commas", batchSize: "Batch size", startBackfill: "Start backfill",
+  backfillQueued: "Historical backfill started.", candidates: "candidates", pause: "Pause", resume: "Resume", cancel: "Cancel",
+  candidateInbox: "Candidate inbox", noCandidates: "No candidates are waiting for review.", selectCandidate: "Select a candidate to inspect its journal source.",
+  sourceExcerpt: "Original journal passage", sourceVersion: "Source version", ignoreCandidate: "Ignore candidate",
+  candidateTimeSource: "Candidate time source", timeFromSource: "absolute date in source", timeFromRelative: "relative reference in source", timeFromJournal: "Day One journal date",
+  mergeTarget: "Choose merge target", mergeCandidate: "Merge sources"
 };
 
 export function detectLanguage(): Language {

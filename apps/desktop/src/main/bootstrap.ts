@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { app, BrowserWindow, session } from "electron";
 import { z } from "zod";
 import { GrudgeVaultApplication, JobRunner, type KeyProtectorPort } from "@grudge-vault/application";
+import { DayOneZipImporter } from "@grudge-vault/importer-dayone";
 import { AppError } from "@grudge-vault/shared";
 import { registerIpcHandlers } from "./ipc";
 import { SafeStorageKeyProtector } from "./key-protector";
@@ -14,6 +15,8 @@ interface BootstrapOptions {
 }
 
 const verifyPayloadSchema = z.object({ assetId: z.string().uuid(), sha256: z.string().regex(/^[a-f0-9]{64}$/) });
+const importPayloadSchema = z.object({ importRunId: z.string().uuid() });
+const backfillPayloadSchema = z.object({ backfillRunId: z.string().uuid() });
 
 export async function bootstrap(options: BootstrapOptions = {}): Promise<void> {
   await app.whenReady();
@@ -21,7 +24,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<void> {
     options.keyProtector ?? new SafeStorageKeyProtector(),
     join(app.getPath("userData"), "state.json")
   );
-  const application = new GrudgeVaultApplication(workspaces);
+  const application = new GrudgeVaultApplication(workspaces, undefined, new DayOneZipImporter());
 
   if (options.initialWorkspacePath) {
     try {
@@ -79,6 +82,12 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<void> {
           throw new AppError("ASSET_CORRUPT", "The encrypted object failed integrity verification.");
         }
         current.assets.setIntegrity(asset.id, "verified", new Date().toISOString());
+      },
+      "dayone.import": async (job, context) => {
+        await application.runDayOneImport(importPayloadSchema.parse(job.payload).importRunId, context);
+      },
+      "dayone.backfill": async (job, context) => {
+        await application.runBackfill(backfillPayloadSchema.parse(job.payload).backfillRunId, context);
       }
     }, { onChanged: notifyJobsChanged });
     runner.start();

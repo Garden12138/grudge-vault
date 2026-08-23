@@ -4,11 +4,12 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { _electron as electron, expect, test } from "@playwright/test";
 
-test("completes the Phase 1 event recording loop and restores it after restart", async () => {
+test("completes the Phase 2 recording, Day One backfill, and idempotent re-import loop", async () => {
   const root = await mkdtemp(join(tmpdir(), "grudge-vault-e2e-"));
   const workspace = join(root, "workspace");
   const userData = join(root, "user-data");
   const fixture = resolve("fixtures/assets/phase-zero-demo.txt");
+  const dayOneFixture = resolve("fixtures/dayone/synthetic-minimal.zip");
   const expectedHash = createHash("sha256").update(await readFile(fixture)).digest("hex");
   const entry = resolve("apps/desktop/out-e2e/main/main.js");
   const inheritedEnvironment = Object.fromEntries(
@@ -57,6 +58,36 @@ test("completes the Phase 1 event recording loop and restores it after restart",
     await page.locator(".filters select").nth(1).selectOption({ label: "Alex" });
     await page.getByRole("button", { name: "Search", exact: true }).click();
     await expect(page.getByText("On 2026-08-20 Alex omitted my name from the report", { exact: true }).first()).toBeVisible();
+
+    await application.evaluate(({ dialog }, filePath) => {
+      Object.defineProperty(dialog, "showOpenDialog", {
+        configurable: true,
+        value: async () => ({ canceled: false, filePaths: [filePath] })
+      });
+    }, dayOneFixture);
+    await page.getByRole("button", { name: "Backfill", exact: true }).click();
+    await page.getByRole("button", { name: "Choose JSON ZIP", exact: true }).click();
+    const latestImport = page.locator(".import-panel .run-list article").first();
+    await expect(latestImport.locator(".status")).toHaveText("succeeded", { timeout: 15_000 });
+    await expect(latestImport).toContainText("+1");
+    await page.getByRole("button", { name: "Start backfill", exact: true }).click();
+    const importedTitle = "Synthetic journal entry for future importer development.";
+    await expect(page.getByText(importedTitle, { exact: true }).first()).toBeVisible({ timeout: 15_000 });
+    await page.getByText(importedTitle, { exact: true }).first().click();
+    await page.getByRole("button", { name: "Open event", exact: true }).click();
+    await page.getByLabel("Facts").fill("[unknown] Approximate amount: CNY 500.");
+    await page.getByRole("button", { name: "Save revision", exact: true }).click();
+    await page.getByRole("button", { name: "Confirm event", exact: true }).click();
+    await expect(page.getByText("Revision 3", { exact: true })).toBeVisible();
+
+    await page.getByRole("button", { name: "Backfill", exact: true }).click();
+    await page.getByRole("button", { name: "Choose JSON ZIP", exact: true }).click();
+    await expect(page.locator(".import-panel .run-list article")).toHaveCount(2);
+    const repeatedImport = page.locator(".import-panel .run-list article").first();
+    await expect(repeatedImport.locator(".status")).toHaveText("succeeded", { timeout: 15_000 });
+    await expect(repeatedImport).toContainText("+0");
+    await expect(repeatedImport).toContainText("=1");
+    await expect(page.locator(".candidate-inbox").getByText("No candidates are waiting for review.", { exact: true })).toBeVisible();
     await application.close();
 
     application = await launch();
