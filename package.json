@@ -1,6 +1,6 @@
 {
   "name": "grudge-vault",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": true,
   "description": "A local-first event memory and evidence vault.",
   "author": "Grudge Vault contributors",
@@ -15,8 +15,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "pretest:e2e": "electron-vite build --mode e2e --config apps/desktop/electron.vite.config.ts",
-    "test:e2e": "playwright test",
+    "test:e2e": "electron-vite build --mode e2e --config apps/desktop/electron.vite.config.ts && playwright test",
     "build": "electron-vite build --config apps/desktop/electron.vite.config.ts",
     "dist": "pnpm build && electron-builder --config electron-builder.yml",
     "postinstall": "electron-builder install-app-deps"

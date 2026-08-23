@@ -29,7 +29,7 @@ export interface Workspace {
   updatedAt: IsoDateTime;
 }
 
-export type SourceKind = "chat" | "dayone" | "manual-file";
+export type SourceKind = "chat" | "dayone" | "manual" | "manual-file";
 
 export interface Source {
   id: EntityId;
@@ -45,6 +45,26 @@ export interface SourceItem {
   content?: string;
   recordedAt: IsoDateTime;
   assetRefs: EntityId[];
+  deletedAt?: IsoDateTime;
+}
+
+export interface Conversation {
+  id: EntityId;
+  sourceId: EntityId;
+  title: string;
+  createdAt: IsoDateTime;
+  updatedAt: IsoDateTime;
+  deletedAt?: IsoDateTime;
+}
+
+export interface Message {
+  id: EntityId;
+  conversationId: EntityId;
+  sourceItemId: EntityId;
+  role: "user" | "assistant" | "system";
+  content?: string;
+  createdAt: IsoDateTime;
+  deletedAt?: IsoDateTime;
 }
 
 export type IntegrityStatus = "pending" | "verified" | "corrupt";
@@ -76,6 +96,39 @@ export interface Statement {
   sourceRefs: EntityId[];
 }
 
+export interface Emotion {
+  id: EntityId;
+  label: string;
+  intensity?: 1 | 2 | 3 | 4 | 5;
+  sourceRefs: EntityId[];
+}
+
+export interface Interest {
+  id: EntityId;
+  label: string;
+  description?: string;
+  sourceRefs: EntityId[];
+}
+
+export interface Person {
+  id: EntityId;
+  displayName: string;
+  notes?: string;
+  status: "active" | "archived";
+  createdAt: IsoDateTime;
+  updatedAt: IsoDateTime;
+}
+
+export interface EventParticipant {
+  personId: EntityId;
+  role?: string;
+}
+
+export interface CompletenessSummary {
+  missingFields: string[];
+  openClarificationCount: number;
+}
+
 export interface Event {
   id: EntityId;
   title: string;
@@ -85,9 +138,14 @@ export interface Event {
   narrative?: string;
   facts: Statement[];
   interpretations: Statement[];
+  emotions: Emotion[];
+  interests: Interest[];
+  participants: EventParticipant[];
   sourceRefs: EntityId[];
   assetRefs: EntityId[];
+  completeness: CompletenessSummary;
   currentRevision: number;
+  updatedAt: IsoDateTime;
 }
 
 export interface EventRevision {
@@ -100,6 +158,36 @@ export interface EventRevision {
   reason: string;
   sourceRefs: EntityId[];
   createdAt: IsoDateTime;
+}
+
+export interface Clarification {
+  id: EntityId;
+  eventId: EntityId;
+  fieldPath?: string;
+  question: string;
+  reason: string;
+  priority: "normal" | "important" | "rights_related";
+  status: "open" | "answered" | "dismissed";
+  answerSourceRef?: EntityId;
+  sourceRefs: EntityId[];
+  createdAt: IsoDateTime;
+  updatedAt: IsoDateTime;
+}
+
+export interface EventDetail {
+  event: Event;
+  people: Person[];
+  clarifications: Clarification[];
+  assets: Asset[];
+}
+
+export interface EventSearchQuery {
+  text?: string;
+  status?: Event["status"];
+  personId?: EntityId;
+  from?: string;
+  to?: string;
+  limit?: number;
 }
 
 export type JobState = "queued" | "running" | "succeeded" | "failed" | "cancelled";

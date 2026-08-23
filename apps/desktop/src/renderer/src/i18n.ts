@@ -1,0 +1,86 @@
+export type Language = "zh-CN" | "en";
+
+const zh = {
+  appName: "记仇账本", localFirst: "本地优先事件记忆", workspaceName: "工作区名称",
+  createWorkspace: "创建工作区", openWorkspace: "打开已有工作区",
+  landingLede: "为事件、来源与加密原件建立一份可追溯的私人记忆。",
+  securityNote: "原始附件在进入工作区保险库前会被加密。", encryptedLocally: "本地加密",
+  chat: "记录", events: "事件", vault: "保险库", settings: "设置", tasks: "任务",
+  conversations: "会话", newConversation: "新建会话", conversationTitle: "会话名称",
+  rename: "重命名", delete: "删除", deletedConversationWarning: "删除会清除会话与消息正文；已有事件仍保留并显示来源墓碑。继续吗？",
+  noConversation: "新建一个会话，开始记录发生的事情。", noMessages: "还没有消息。原始消息会先保存，再生成候选事件。",
+  messagePlaceholder: "描述刚发生的事情……", createDraft: "同时生成事件草稿", send: "保存记录",
+  draftCreated: "已生成候选事件", draftFailed: "消息已保存，但事件草稿生成失败。", openEvent: "打开事件",
+  search: "搜索", searchPlaceholder: "关键词、事实、情绪或利益", allStatuses: "全部状态",
+  candidate: "候选", confirmed: "已确认", archived: "已归档", allPeople: "全部人物",
+  from: "开始日期", to: "结束日期", noEvents: "没有匹配的事件。", newEvent: "手工新建事件",
+  eventDetails: "事件详情", title: "标题", status: "状态", occurredAt: "发生时间",
+  unknown: "未知", date: "日期", month: "月份", range: "范围", relative: "相对描述", instant: "时刻",
+  narrative: "经过", facts: "事实", factsHelp: "每行一条；可用 [confirmed]、[disputed]、[unknown] 前缀。",
+  interpretations: "解释/判断", emotions: "情绪", emotionsHelp: "每行一个情绪，可写成 生气|4。",
+  interests: "利益", interestsHelp: "每行一项，可写成 成果归属|需要明确署名。", people: "人物",
+  save: "保存修订", confirm: "确认事件", archive: "归档", revisionConflict: "事件已有更新；已载入最新版本，请核对当前未提交内容。",
+  clarifications: "待补全", answer: "回答", dismiss: "忽略", answerPrompt: "请输入补充信息",
+  attachments: "附件", attachFiles: "添加加密附件", dropFiles: "拖入文件以关联到当前事件",
+  revisions: "修订历史", revision: "修订", currentRevision: "当前修订",
+  originals: "加密原件", chooseFiles: "选择文件", noAssets: "尚未保存原件。", verify: "校验",
+  preview: "预览", exportCopy: "导出副本", previewUnavailable: "此格式或大小不支持内置预览，请导出副本查看。",
+  recoverableWork: "可恢复任务", noJobs: "没有后台任务。", retry: "重试", attempt: "尝试",
+  language: "界面语言", chinese: "简体中文", english: "English",
+  backup: "备份与恢复", createBackup: "创建加密快照", restoreBackup: "恢复快照",
+  backupHelp: "快照包含数据库、加密对象和校验 manifest，仅能由同一系统账户的钥匙串解锁。",
+  backupCreated: "备份已创建", restoreWarning: "恢复会打开备份副本，并要求一个空目录。继续吗？",
+  activeWorkspace: "当前工作区", stored: "已保存", error: "操作失败", close: "关闭", edit: "编辑",
+  personName: "人物姓名", personNotes: "备注", addPerson: "添加人物", archivePerson: "归档人物",
+  monthValue: "YYYY-MM", relativeValue: "例如：约 9 月", endValue: "结束日期",
+  emptyRequired: "请填写必填内容。", sourceDeleted: "来源正文已删除", loading: "加载中……"
+} as const;
+
+export type TranslationKey = keyof typeof zh;
+
+const en: Record<TranslationKey, string> = {
+  appName: "Grudge Vault", localFirst: "LOCAL-FIRST EVENT MEMORY", workspaceName: "Workspace name",
+  createWorkspace: "Create workspace", openWorkspace: "Open existing",
+  landingLede: "Build a private, traceable memory for events, sources, and encrypted originals.",
+  securityNote: "Original attachments are encrypted before entering the workspace vault.", encryptedLocally: "Encrypted locally",
+  chat: "Chat", events: "Events", vault: "Vault", settings: "Settings", tasks: "Tasks",
+  conversations: "Conversations", newConversation: "New conversation", conversationTitle: "Conversation title",
+  rename: "Rename", delete: "Delete", deletedConversationWarning: "Deleting clears the conversation and message text. Existing events remain with source tombstones. Continue?",
+  noConversation: "Create a conversation to start recording what happened.", noMessages: "No messages yet. The original message is saved before an event draft is generated.",
+  messagePlaceholder: "Describe what just happened…", createDraft: "Also create an event draft", send: "Save record",
+  draftCreated: "Candidate event created", draftFailed: "The message was saved, but event draft generation failed.", openEvent: "Open event",
+  search: "Search", searchPlaceholder: "Keywords, facts, emotions, or interests", allStatuses: "All statuses",
+  candidate: "Candidate", confirmed: "Confirmed", archived: "Archived", allPeople: "All people",
+  from: "From", to: "To", noEvents: "No matching events.", newEvent: "Create event manually",
+  eventDetails: "Event details", title: "Title", status: "Status", occurredAt: "Occurred at",
+  unknown: "Unknown", date: "Date", month: "Month", range: "Range", relative: "Relative", instant: "Instant",
+  narrative: "Narrative", facts: "Facts", factsHelp: "One per line; prefixes: [confirmed], [disputed], or [unknown].",
+  interpretations: "Interpretations", emotions: "Emotions", emotionsHelp: "One per line, for example Angry|4.",
+  interests: "Interests", interestsHelp: "One per line, for example Attribution|Clarify authorship.", people: "People",
+  save: "Save revision", confirm: "Confirm event", archive: "Archive", revisionConflict: "This event changed. The latest revision was loaded; review your unsaved content.",
+  clarifications: "Clarifications", answer: "Answer", dismiss: "Dismiss", answerPrompt: "Enter the missing information",
+  attachments: "Attachments", attachFiles: "Add encrypted attachments", dropFiles: "Drop files to attach them to this event",
+  revisions: "Revision history", revision: "Revision", currentRevision: "Current revision",
+  originals: "Encrypted originals", chooseFiles: "Choose files", noAssets: "No originals stored yet.", verify: "Verify",
+  preview: "Preview", exportCopy: "Export copy", previewUnavailable: "This format or size cannot be previewed. Export a copy instead.",
+  recoverableWork: "Recoverable work", noJobs: "No background tasks.", retry: "Retry", attempt: "Attempt",
+  language: "Interface language", chinese: "简体中文", english: "English",
+  backup: "Backup and restore", createBackup: "Create encrypted snapshot", restoreBackup: "Restore snapshot",
+  backupHelp: "Snapshots contain the database, encrypted objects, and a verification manifest. They require the same OS account keychain.",
+  backupCreated: "Backup created", restoreWarning: "Restore opens a copy of the backup and requires an empty folder. Continue?",
+  activeWorkspace: "Active workspace", stored: "stored", error: "Operation failed", close: "Close", edit: "Edit",
+  personName: "Person name", personNotes: "Notes", addPerson: "Add person", archivePerson: "Archive person",
+  monthValue: "YYYY-MM", relativeValue: "For example: around September", endValue: "End date",
+  emptyRequired: "Complete the required fields.", sourceDeleted: "Source content deleted", loading: "Loading…"
+};
+
+export function detectLanguage(): Language {
+  const stored = window.localStorage.getItem("grudge-vault.language");
+  if (stored === "zh-CN" || stored === "en") return stored;
+  return window.navigator.language.toLowerCase().startsWith("zh") ? "zh-CN" : "en";
+}
+
+export function translator(language: Language): (key: TranslationKey) => string {
+  const dictionary = language === "zh-CN" ? zh : en;
+  return (key) => dictionary[key];
+}

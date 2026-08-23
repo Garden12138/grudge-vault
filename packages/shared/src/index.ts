@@ -1,4 +1,21 @@
-import type { Asset, Job, Workspace } from "@grudge-vault/domain";
+import type {
+  Asset,
+  Clarification,
+  Conversation,
+  Emotion,
+  Event,
+  EventDetail,
+  EventParticipant,
+  EventRevision,
+  EventSearchQuery,
+  Interest,
+  Job,
+  Message,
+  Person,
+  Statement,
+  TemporalValue,
+  Workspace
+} from "@grudge-vault/domain";
 
 export const APP_ERROR_CODES = [
   "NO_ACTIVE_WORKSPACE",
@@ -10,6 +27,12 @@ export const APP_ERROR_CODES = [
   "ASSET_IMPORT_FAILED",
   "ASSET_NOT_FOUND",
   "ASSET_CORRUPT",
+  "ASSET_PREVIEW_UNAVAILABLE",
+  "ASSET_EXPORT_FAILED",
+  "ENTITY_NOT_FOUND",
+  "EVENT_REVISION_CONFLICT",
+  "BACKUP_INVALID",
+  "BACKUP_EXISTS",
   "JOB_NOT_RETRYABLE",
   "VALIDATION_FAILED",
   "INTERNAL_ERROR"
@@ -44,17 +67,110 @@ export interface AssetImportResult {
   deduplicated: boolean;
 }
 
+export interface EventWriteFields {
+  title: string;
+  status: Event["status"];
+  occurredAt: TemporalValue;
+  narrative?: string;
+  facts: Statement[];
+  interpretations: Statement[];
+  emotions: Emotion[];
+  interests: Interest[];
+  participants: EventParticipant[];
+  sourceRefs: string[];
+  assetRefs: string[];
+}
+
+export interface CreateEventInput extends EventWriteFields {
+  reason: string;
+}
+
+export interface UpdateEventInput extends EventWriteFields {
+  eventId: string;
+  expectedRevision: number;
+  reason: string;
+}
+
+export interface SendMessageInput {
+  conversationId: string;
+  content: string;
+  createDraft: boolean;
+}
+
+export interface SendMessageResult {
+  message: Message;
+  draft?: Event;
+  draftError?: SerializedAppError;
+}
+
+export interface ClarificationAnswerInput {
+  clarificationId: string;
+  answer: string;
+  expectedRevision: number;
+}
+
+export interface AssetPreview {
+  assetId: string;
+  fileName: string;
+  mimeType: string;
+  bytes: Uint8Array;
+}
+
+export interface BackupSummary {
+  path: string;
+  workspaceId: string;
+  createdAt: string;
+  fileCount: number;
+  byteSize: number;
+}
+
 export interface GrudgeVaultApi {
   workspace: {
     current(): Promise<IpcResult<Workspace | null>>;
     create(name: string): Promise<IpcResult<Workspace | null>>;
     open(): Promise<IpcResult<Workspace | null>>;
   };
+  conversations: {
+    list(): Promise<IpcResult<Conversation[]>>;
+    create(title: string): Promise<IpcResult<Conversation>>;
+    rename(id: string, title: string): Promise<IpcResult<Conversation>>;
+    delete(id: string): Promise<IpcResult<Conversation>>;
+    listMessages(id: string): Promise<IpcResult<Message[]>>;
+    send(input: SendMessageInput): Promise<IpcResult<SendMessageResult>>;
+  };
+  events: {
+    search(query: EventSearchQuery): Promise<IpcResult<Event[]>>;
+    get(id: string): Promise<IpcResult<EventDetail>>;
+    create(input: CreateEventInput): Promise<IpcResult<Event>>;
+    update(input: UpdateEventInput): Promise<IpcResult<Event>>;
+    confirm(id: string, expectedRevision: number): Promise<IpcResult<Event>>;
+    archive(id: string, expectedRevision: number): Promise<IpcResult<Event>>;
+    listRevisions(id: string): Promise<IpcResult<EventRevision[]>>;
+  };
+  people: {
+    list(includeArchived?: boolean): Promise<IpcResult<Person[]>>;
+    create(displayName: string, notes?: string): Promise<IpcResult<Person>>;
+    update(person: Pick<Person, "id" | "displayName" | "notes">): Promise<IpcResult<Person>>;
+    archive(id: string): Promise<IpcResult<Person>>;
+  };
+  clarifications: {
+    list(eventId?: string): Promise<IpcResult<Clarification[]>>;
+    answer(input: ClarificationAnswerInput): Promise<IpcResult<Event>>;
+    dismiss(id: string, expectedRevision: number): Promise<IpcResult<Event>>;
+  };
   assets: {
     importDropped(files: File[]): Promise<IpcResult<AssetImportResult[]>>;
     chooseAndImport(): Promise<IpcResult<AssetImportResult[]>>;
+    importForEvent(files: File[], eventId: string, expectedRevision: number): Promise<IpcResult<Event>>;
+    chooseAndImportForEvent(eventId: string, expectedRevision: number): Promise<IpcResult<Event | null>>;
     list(): Promise<IpcResult<Asset[]>>;
     verify(assetId: string): Promise<IpcResult<Job>>;
+    preview(assetId: string): Promise<IpcResult<AssetPreview>>;
+    exportCopy(assetId: string): Promise<IpcResult<string | null>>;
+  };
+  backups: {
+    createSnapshot(): Promise<IpcResult<BackupSummary | null>>;
+    restoreSnapshot(): Promise<IpcResult<Workspace | null>>;
   };
   jobs: {
     list(): Promise<IpcResult<Job[]>>;
