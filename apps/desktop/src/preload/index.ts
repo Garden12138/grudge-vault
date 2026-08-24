@@ -17,6 +17,18 @@ const api: GrudgeVaultApi = {
     listMessages: (id) => invoke("conversations:messages", id),
     send: (input) => invoke("conversations:send", input)
   },
+  agent: {
+    send: (input) => invoke("agent:send", input),
+    resume: (runId, disclosureId) => invoke("agent:resume", { runId, disclosureId }),
+    cancel: (runId) => invoke("agent:cancel", runId),
+    listRuns: (conversationId) => invoke("agent:list-runs", conversationId),
+    getRun: (runId) => invoke("agent:get-run", runId),
+    approveAction: (actionId) => invoke("agent:approve-action", actionId),
+    rejectAction: (actionId) => invoke("agent:reject-action", actionId),
+    getSettings: () => invoke("agent:get-settings"),
+    updateSettings: (input) => invoke("agent:update-settings", input),
+    clearCredential: (mode) => invoke("agent:clear-credential", mode)
+  },
   events: {
     search: (query) => invoke("events:search", query),
     get: (id) => invoke("events:get", id),
@@ -28,14 +40,48 @@ const api: GrudgeVaultApi = {
   },
   people: {
     list: (includeArchived) => invoke("people:list", includeArchived),
+    listIdentities: () => invoke("people:list-identities"),
     create: (displayName, notes) => invoke("people:create", { displayName, ...(notes === undefined ? {} : { notes }) }),
     update: (person) => invoke("people:update", person),
-    archive: (id) => invoke("people:archive", id)
+    archive: (id) => invoke("people:archive", id),
+    get: (id) => invoke("people:get", id),
+    addAlias: (input) => invoke("people:add-alias", input),
+    deactivateAlias: (id) => invoke("people:deactivate-alias", id),
+    listMergeSuggestions: () => invoke("people:merge-suggestions"),
+    rejectMergeSuggestion: (id) => invoke("people:reject-merge-suggestion", id),
+    merge: (input) => invoke("people:merge", input),
+    revertMerge: (id) => invoke("people:revert-merge", id)
+  },
+  relations: {
+    listForEvent: (eventId) => invoke("relations:list", eventId),
+    refreshSuggestions: () => invoke("relations:refresh"),
+    create: (input) => invoke("relations:create", input),
+    confirm: (id) => invoke("relations:confirm", id),
+    reject: (id) => invoke("relations:reject", id),
+    remove: (id) => invoke("relations:remove", id)
+  },
+  timeline: {
+    query: (input) => invoke("timeline:query", input)
+  },
+  search: {
+    query: (input) => invoke("search:query", input),
+    getEmbeddingStatus: () => invoke("search:embedding-status"),
+    setSemanticEnabled: (enabled) => invoke("search:semantic-enabled", enabled),
+    rebuildEmbeddings: () => invoke("search:rebuild-embeddings")
+  },
+  reviews: {
+    list: () => invoke("reviews:list"),
+    get: (id) => invoke("reviews:get", id),
+    generate: (input) => invoke("reviews:generate", input)
+  },
+  sources: {
+    getReference: (sourceItemId) => invoke("sources:get-reference", sourceItemId)
   },
   clarifications: {
     list: (eventId) => invoke("clarifications:list", eventId),
     answer: (input) => invoke("clarifications:answer", input),
-    dismiss: (id, expectedRevision) => invoke("clarifications:dismiss", { id, expectedRevision })
+    dismiss: (id, expectedRevision) => invoke("clarifications:dismiss", { id, expectedRevision }),
+    setPriority: (id, priority) => invoke("clarifications:priority", { id, priority })
   },
   assets: {
     importDropped: async (files) => {

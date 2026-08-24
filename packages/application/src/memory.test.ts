@@ -3,16 +3,16 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   GrudgeVaultApplication, parseConservativeTemporalValue,
-  type EventDraftGeneratorPort, type NormalizedDayOneEntry, type ObjectVaultPort,
+  type EmbeddingAdapterPort, type EventDraftGeneratorPort, type NormalizedDayOneEntry, type ObjectVaultPort,
   type WorkspaceManagerPort, type WorkspaceSession
 } from "./index";
 import type { ImportRun } from "@grudge-vault/domain";
 import {
-  runMigrations, SqliteAssetRepository, SqliteDayOneRepository, SqliteJobRepository, SqliteMemoryRepository
+  runMigrations, SqliteAgentRepository, SqliteAssetRepository, SqliteDayOneRepository, SqliteJobRepository, SqliteMemoryRepository
 } from "@grudge-vault/persistence-sqlite";
 import { AppError } from "@grudge-vault/shared";
 
-function testContext(generator?: EventDraftGeneratorPort) {
+function testContext(generator?: EventDraftGeneratorPort, embeddingAdapter?: EmbeddingAdapterPort) {
   const database = new Database(":memory:");
   database.pragma("foreign_keys = ON");
   runMigrations(database);
@@ -31,7 +31,7 @@ function testContext(generator?: EventDraftGeneratorPort) {
     },
     key: Buffer.alloc(32),
     assets: new SqliteAssetRepository(database), jobs: new SqliteJobRepository(database),
-    memory, dayOne: new SqliteDayOneRepository(database, memory), vault,
+    memory, agents: new SqliteAgentRepository(database), dayOne: new SqliteDayOneRepository(database, memory), vault,
     async backupDatabase() {}, async close() { database.close(); }
   };
   const manager: WorkspaceManagerPort = {
@@ -40,7 +40,7 @@ function testContext(generator?: EventDraftGeneratorPort) {
     async createBackup() { throw new Error("unused"); }, async restoreBackup() { return session; },
     async close() {}
   };
-  return { database, session, application: new GrudgeVaultApplication(manager, generator) };
+  return { database, session, application: new GrudgeVaultApplication(manager, generator, undefined, embeddingAdapter) };
 }
 
 describe("Phase 1 event recording application", () => {
@@ -178,6 +178,8 @@ describe("Phase 2 historical backfill application", () => {
     expect(updated.outcome).toBe("updated");
     expect(updated.sourceVersion.version).toBe(2);
     expect(context.database.prepare("SELECT count(*) AS count FROM source_versions").get()).toEqual({ count: 2 });
+    expect(context.database.prepare("SELECT count(*) AS count FROM source_search_documents").get()).toEqual({ count: 1 });
+    expect(context.database.prepare("SELECT content FROM source_search_documents").get()).toEqual({ content: "Changed version" });
 
     const repeatedRun = { ...run, id: "import-run-1-repeat", counts: { ...run.counts, newEntries: 0, skippedEntries: 1 } };
     context.session.dayOne.createImportRun(repeatedRun);
@@ -347,6 +349,155 @@ describe("Phase 2 historical backfill application", () => {
     await context.application.runBackfill(paused.id, { signal: new AbortController().signal, reportProgress() {} });
     expect(context.session.dayOne.getBackfillRun(paused.id)).toMatchObject({ state: "completed", processedItems: 26 });
     expect(context.application.listCandidates()).toHaveLength(26);
+    context.database.close();
+  });
+});
+
+describe("Phase 3 relations, retrieval, and review application", () => {
+  it("merges duplicate identities without rewriting events and can revert the merge", () => {
+    const context = testContext();
+    const first = context.application.createPerson("Alexander Zhang");
+    const second = context.application.createPerson("Alex");
+    const alias = context.application.addPersonAlias({ personId: first.id, value: "Alex" });
+    const event = context.application.createEvent({
+      title: "Attribution conversation", status: "confirmed", occurredAt: { kind: "date", value: "2026-01-04" },
+      narrative: "Alex discussed attribution.", facts: [], interpretations: [], emotions: [], interests: [],
+      participants: [{ personId: first.id }], sourceRefs: [], assetRefs: [], reason: "test"
+    });
+    const suggestion = context.application.listPersonMergeSuggestions().find(({ status }) => status === "pending")!;
+    expect(suggestion.basis.join(" ")).toContain("Alex");
+    const merge = context.application.mergePeople({
+      sourcePersonId: first.id, targetPersonId: second.id, suggestionId: suggestion.id
+    });
+    const identity = context.application.getPersonIdentity(second.id);
+    expect(identity.identities.map(({ id }) => id).sort()).toEqual([first.id, second.id].sort());
+    expect(identity.events.map(({ id }) => id)).toContain(event.id);
+    expect(context.application.getEvent(event.id).event.participants).toEqual([{ personId: first.id }]);
+    expect(() => context.application.mergePeople({ sourcePersonId: second.id, targetPersonId: first.id }))
+      .toThrow(/already resolve/);
+    context.application.revertPersonMerge(merge.id);
+    expect(context.application.getPersonIdentity(first.id).identities).toHaveLength(1);
+    expect(context.application.getPersonIdentity(first.id).aliases.find(({ id }) => id === alias.id)?.status).toBe("active");
+    context.database.close();
+  });
+
+  it("preserves rejected relation decisions and grounds reviews in event revisions and sources", () => {
+    const context = testContext();
+    const person = context.application.createPerson("Alex");
+    const create = (title: string, date: string) => context.application.createEvent({
+      title, status: "confirmed", occurredAt: { kind: "date", value: date }, narrative: `${title} about report attribution`,
+      facts: [], interpretations: [], emotions: [],
+      interests: [{ id: `interest-${date}`, label: "Attribution", sourceRefs: [] }],
+      participants: [{ personId: person.id }], sourceRefs: [], assetRefs: [], reason: "test"
+    });
+    const first = create("First report issue", "2026-01-04");
+    const second = create("Second report issue", "2026-01-20");
+    const suggestions = context.application.refreshRelationSuggestions();
+    const similar = suggestions.find(({ kind }) => kind === "similar")!;
+    context.application.rejectEventRelation(similar.id);
+    context.application.updateEvent({
+      eventId: first.id, expectedRevision: first.currentRevision, title: `${first.title} updated`, status: first.status,
+      occurredAt: first.occurredAt, ...(first.narrative ? { narrative: first.narrative } : {}), facts: first.facts,
+      interpretations: first.interpretations, emotions: first.emotions, interests: first.interests,
+      participants: first.participants, sourceRefs: first.sourceRefs, assetRefs: first.assetRefs, reason: "reorder events"
+    });
+    context.application.refreshRelationSuggestions();
+    expect(context.session.memory.getEventRelation(similar.id)?.status).toBe("rejected");
+    expect(context.session.memory.listEventRelations(undefined, true).filter(({ kind }) => kind === "similar")).toHaveLength(1);
+
+    const review = context.application.generateReview({ from: "2026-01-01", to: "2026-01-31" });
+    expect(review.patterns.some(({ kind }) => kind === "person")).toBe(true);
+    expect(review.patterns.every(({ eventRevisionRefs, sourceRefs }) => eventRevisionRefs.length >= 2 && sourceRefs.length >= 2)).toBe(true);
+    expect(review.eventIds.sort()).toEqual([first.id, second.id].sort());
+    expect(review.patterns.some(({ kind, title }) => kind === "relation" && title.includes("similar"))).toBe(false);
+    const timeline = context.application.queryTimeline({ personId: person.id, from: "2026-01-01", to: "2026-01-31" });
+    expect(timeline.total).toBe(2);
+    expect(timeline.groups[0]?.key).toBe("2026-01");
+    context.database.close();
+  });
+
+  it("sorts and updates the global clarification inbox by explicit priority", async () => {
+    const context = testContext();
+    const conversation = context.application.createConversation("Clarifications");
+    const first = await context.application.sendMessage({ conversationId: conversation.id, content: "First unknown event", createDraft: true });
+    const second = await context.application.sendMessage({ conversationId: conversation.id, content: "Second unknown event", createDraft: true });
+    const firstClarification = context.application.listClarifications(first.draft!.id)[0]!;
+    const secondClarification = context.application.listClarifications(second.draft!.id)[0]!;
+    context.application.setClarificationPriority(firstClarification.id, "important");
+    context.application.setClarificationPriority(secondClarification.id, "rights_related");
+    expect(context.application.listClarifications().slice(0, 2).map(({ id }) => id))
+      .toEqual([secondClarification.id, firstClarification.id]);
+    context.database.close();
+  });
+
+  it("unifies Event and current Day One source search with traceable source details", async () => {
+    const context = testContext();
+    const event = context.application.createEvent({
+      title: "Unique event memory", status: "confirmed", occurredAt: { kind: "date", value: "2026-01-01" },
+      narrative: "A uniquely searchable event.", facts: [], interpretations: [], emotions: [], interests: [],
+      participants: [], sourceRefs: [], assetRefs: [], reason: "test"
+    });
+    const now = "2026-08-24T00:00:00.000Z";
+    context.session.assets.upsert({
+      id: "phase3-archive", sha256: "3".repeat(64), byteSize: 10, mimeType: "application/zip",
+      originalFileName: "DayOne.zip", vaultFormat: 1, integrityStatus: "verified", createdAt: now
+    });
+    const run: ImportRun = {
+      id: "phase3-import", archiveAssetId: "phase3-archive", archiveFileName: "DayOne.zip", state: "succeeded", progress: 1,
+      counts: { totalEntries: 1, newEntries: 1, updatedEntries: 0, skippedEntries: 0, mediaImported: 0, mediaMissing: 0, errorCount: 0 },
+      createdAt: now, updatedAt: now, finishedAt: now
+    };
+    context.session.dayOne.createImportRun(run);
+    const imported = context.session.dayOne.upsertEntry(run.id, {
+      externalId: "uuid:phase3", entryUuid: "PHASE3", fingerprint: "4".repeat(64),
+      creationDate: "2026-01-02T00:00:00.000Z", journalDate: "2026-01-02", tags: [], media: [],
+      text: "Historical unique journal memory", contentHash: "5".repeat(64), raw: { text: "Historical unique journal memory" }
+    }, now);
+    const hits = await context.application.unifiedSearch({ text: "unique", semantic: false });
+    expect(hits.map(({ kind }) => kind)).toEqual(expect.arrayContaining(["event", "journal_entry"]));
+    expect(hits.find(({ eventId }) => eventId === event.id)).toBeDefined();
+    const source = context.application.getSourceReference(imported.sourceVersion.sourceItemId);
+    expect(source).toMatchObject({ kind: "journal_entry", sourceVersion: 1, contentHash: "5".repeat(64) });
+    expect(source.excerpt).toContain("Historical unique");
+    context.database.close();
+  });
+
+  it("builds embedding generations atomically and keeps the active generation after a failed rebuild", async () => {
+    let fail = false;
+    const adapter: EmbeddingAdapterPort = {
+      identity: "test.embedding", version: 1, dimensions: 3,
+      async embed(texts) {
+        if (fail) throw new Error("adapter failed");
+        return texts.map((text) => new Float32Array([
+          text.toLocaleLowerCase().includes("unique") ? 1 : 0,
+          text.toLocaleLowerCase().includes("other") ? 1 : 0,
+          0.25
+        ]));
+      }
+    };
+    const context = testContext(undefined, adapter);
+    const event = context.application.createEvent({
+      title: "Unique semantic memory", status: "confirmed", occurredAt: { kind: "date", value: "2026-01-01" },
+      narrative: "A semantic document", facts: [], interpretations: [], emotions: [], interests: [],
+      participants: [], sourceRefs: [], assetRefs: [], reason: "test"
+    });
+    context.application.setSemanticEnabled(true);
+    const firstJob = context.application.rebuildEmbeddings();
+    const firstGenerationId = (firstJob.payload as { generationId: string }).generationId;
+    await context.application.runEmbeddingRebuild(firstGenerationId, {
+      signal: new AbortController().signal, reportProgress() {}
+    });
+    expect(context.application.getEmbeddingStatus()).toMatchObject({ state: "ready", activeGenerationId: firstGenerationId });
+    const hits = await context.application.unifiedSearch({ text: "unique", semantic: true });
+    expect(hits[0]?.eventId).toBe(event.id);
+
+    fail = true;
+    const secondJob = context.application.rebuildEmbeddings();
+    await expect(context.application.runEmbeddingRebuild(
+      (secondJob.payload as { generationId: string }).generationId,
+      { signal: new AbortController().signal, reportProgress() {} }
+    )).rejects.toThrow("adapter failed");
+    expect(context.application.getEmbeddingStatus()).toMatchObject({ state: "ready", activeGenerationId: firstGenerationId });
     context.database.close();
   });
 });

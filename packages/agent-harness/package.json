@@ -1,0 +1,13 @@
+{
+  "name": "@grudge-vault/agent-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@grudge-vault/application": "workspace:*",
+    "@grudge-vault/domain": "workspace:*",
+    "@grudge-vault/shared": "workspace:*",
+    "zod": "4.4.3"
+  }
+}

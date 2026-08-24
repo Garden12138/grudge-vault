@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   GrudgeVaultApplication, type KeyProtectorPort, type NormalizedDayOneEntry
 } from "@grudge-vault/application";
+import { AgentHarness } from "@grudge-vault/agent-harness";
 import type { ImportRun } from "@grudge-vault/domain";
 import { LocalWorkspaceManager } from "./workspace-manager";
 
@@ -57,6 +58,30 @@ describe("encrypted workspace snapshots", () => {
       await application.runBackfill(backfill.id, { signal: new AbortController().signal, reportProgress() {} });
       expect(application.listBackfillRuns()[0]).toMatchObject({ state: "queued", processedItems: 1 });
       expect(application.listCandidates()).toHaveLength(1);
+      const firstPerson = application.createPerson("Backup Alexander");
+      const secondPerson = application.createPerson("Backup Alex");
+      application.addPersonAlias({ personId: firstPerson.id, value: "Backup Alex" });
+      const mergeSuggestion = application.listPersonMergeSuggestions().find(({ status }) => status === "pending")!;
+      const identityMerge = application.mergePeople({
+        sourcePersonId: firstPerson.id, targetPersonId: secondPerson.id, suggestionId: mergeSuggestion.id
+      });
+      const relation = application.createEventRelation({
+        sourceEventId: recorded.draft!.id, targetEventId: application.listCandidates()[0]!.event.id, kind: "similar"
+      });
+      application.setSemanticEnabled(true);
+      const agentResult = await new AgentHarness(application).send({
+        conversationId: conversation.id, content: "Record: a restorable Agent proposal"
+      });
+      application.saveAgentModelCallAudit({
+        id: "00000000-0000-4000-8000-000000000080", runId: agentResult.run.id, sequence: 0,
+        endpointOrigin: "https://model.example", model: "backup-fake", categories: ["conversation_text"],
+        contextHash: agentResult.run.contextHash, status: "failed", errorCode: "AGENT_MODEL_UNAVAILABLE",
+        startedAt: now, finishedAt: now
+      });
+      application.updateAgentSettings({
+        mode: "private",
+        privateEndpoint: { baseUrl: "http://127.0.0.1:11434/v1", model: "local-backup", apiKey: "backup-secret" }
+      });
 
       const backupPath = join(root, "snapshot.gvbackup");
       const summary = await application.createBackup(backupPath);
@@ -78,6 +103,22 @@ describe("encrypted workspace snapshots", () => {
       expect(application.listBackfillRuns()[0]).toMatchObject({ state: "queued", processedItems: 1 });
       expect(application.listBackfillRuns()[0]?.cursor).toBeTruthy();
       expect(application.listCandidates()[0]?.excerpt).toContain("Restorable Day One entry");
+      expect(application.getPersonIdentity(secondPerson.id).identities).toHaveLength(2);
+      expect(application.getPersonIdentity(secondPerson.id).activeMerges[0]?.id).toBe(identityMerge.id);
+      expect(application.listEventRelations(recorded.draft!.id)[0]?.id).toBe(relation.id);
+      expect(application.getEmbeddingStatus()).toMatchObject({ available: false, enabled: true, state: "unavailable" });
+      expect((await application.unifiedSearch({ text: "Restorable Day One", semantic: false }))
+        .some(({ kind }) => kind === "journal_entry")).toBe(true);
+      expect(application.listAgentRuns(conversation.id)[0]).toMatchObject({
+        id: agentResult.run.id, status: "succeeded", intent: "record"
+      });
+      expect(application.listAgentModelCallAudits(agentResult.run.id)[0]).toMatchObject({
+        model: "backup-fake", status: "failed"
+      });
+      expect(application.getAgentSettings().privateEndpoint).toMatchObject({
+        baseUrl: "http://127.0.0.1:11434/v1", model: "local-backup", credentialConfigured: true
+      });
+      expect(application.getAgentCredential("private")).toBe("backup-secret");
     } finally {
       await manager.close();
       await rm(root, { recursive: true, force: true });

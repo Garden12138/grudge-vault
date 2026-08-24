@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { app, BrowserWindow, session } from "electron";
 import { z } from "zod";
 import { GrudgeVaultApplication, JobRunner, type KeyProtectorPort } from "@grudge-vault/application";
+import { AgentHarness, type AgentModelAdapterPort } from "@grudge-vault/agent-harness";
 import { DayOneZipImporter } from "@grudge-vault/importer-dayone";
 import { AppError } from "@grudge-vault/shared";
 import { registerIpcHandlers } from "./ipc";
@@ -10,6 +11,7 @@ import { LocalWorkspaceManager } from "./workspace-manager";
 
 interface BootstrapOptions {
   keyProtector?: KeyProtectorPort;
+  agentModelAdapter?: AgentModelAdapterPort;
   initialWorkspacePath?: string;
   initialWorkspaceName?: string;
 }
@@ -17,6 +19,7 @@ interface BootstrapOptions {
 const verifyPayloadSchema = z.object({ assetId: z.string().uuid(), sha256: z.string().regex(/^[a-f0-9]{64}$/) });
 const importPayloadSchema = z.object({ importRunId: z.string().uuid() });
 const backfillPayloadSchema = z.object({ backfillRunId: z.string().uuid() });
+const embeddingPayloadSchema = z.object({ generationId: z.string().uuid() });
 
 export async function bootstrap(options: BootstrapOptions = {}): Promise<void> {
   await app.whenReady();
@@ -25,6 +28,9 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<void> {
     join(app.getPath("userData"), "state.json")
   );
   const application = new GrudgeVaultApplication(workspaces, undefined, new DayOneZipImporter());
+  const agent = new AgentHarness(application, {
+    ...(options.agentModelAdapter ? { modelAdapter: options.agentModelAdapter } : {})
+  });
 
   if (options.initialWorkspacePath) {
     try {
@@ -88,6 +94,9 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<void> {
       },
       "dayone.backfill": async (job, context) => {
         await application.runBackfill(backfillPayloadSchema.parse(job.payload).backfillRunId, context);
+      },
+      "search.embedding-rebuild": async (job, context) => {
+        await application.runEmbeddingRebuild(embeddingPayloadSchema.parse(job.payload).generationId, context);
       }
     }, { onChanged: notifyJobsChanged });
     runner.start();
@@ -97,6 +106,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<void> {
   const removeIpcHandlers = registerIpcHandlers({
     window,
     application,
+    agent,
     workspaces,
     restartRunner,
     getRunner: () => runner

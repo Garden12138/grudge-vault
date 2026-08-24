@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { lstat, rename, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
@@ -7,24 +7,35 @@ import { pipeline } from "node:stream/promises";
 import { setImmediate } from "node:timers";
 import { lookup as lookupMimeType } from "mime-types";
 import type {
-  Asset, BackfillRun, CandidateDetail, CandidateExtraction, CandidateSummary, Clarification,
-  Conversation, Event, EventRevision, EventSearchQuery, ImportIssue, ImportRun, ImportRunDetail,
-  Job, Message, Person, Source, SourceItem, SourceVersion, Workspace
+  AgentExecutionMode, AgentModelCallAudit, AgentModelSettings, AgentRun, Asset, BackfillRun, CandidateDetail,
+  CandidateExtraction, CandidateSummary, Clarification, Conversation, EmbeddingGeneration,
+  EmbeddingIndexStatus, Event, EventRelation, EventRevision,
+  EventSearchQuery, ImportIssue, ImportRun, ImportRunDetail, Job, Message, Person, PersonAlias,
+  PersonIdentityDetail, PersonMergeRecord, PersonMergeSuggestion, ReviewRun, Source,
+  SourceItem, SourceReferenceDetail, SourceVersion, TimelineQuery, TimelineResult,
+  UnifiedSearchHit, UnifiedSearchQuery, Workspace
 } from "@grudge-vault/domain";
 import {
   AppError, toSerializedError, type AssetImportResult, type AssetPreview,
   type BackupSummary, type ClarificationAnswerInput, type CreateEventInput,
-  type CandidateMergeInput, type CandidateMergeResult, type EventWriteFields, type SendMessageInput,
+  type AgentSettingsUpdateInput, type CandidateMergeInput, type CandidateMergeResult, type CreateRelationInput, type EventWriteFields,
+  type PersonAliasInput, type PersonMergeInput, type ReviewGenerateInput, type SendMessageInput,
   type SendMessageResult, type StartBackfillInput, type UpdateEventInput
 } from "@grudge-vault/shared";
 import {
   DeterministicEventDraftGenerator, parseConservativeTemporalValue, type EventCommitExtras,
-  type EventDraftGeneratorPort, type EventDraftProposal, type MemoryRepositoryPort
+  type AgentRepositoryPort, type EventDraftGeneratorPort, type EventDraftProposal, type MemoryRepositoryPort
 } from "./memory";
 import type { DayOneImporterPort, NormalizedDayOneEntry, NormalizedDayOneMedia } from "./dayone";
+import {
+  buildReviewPatterns, buildTimeline, cosineSimilarity, normalizeIdentity, personSuggestionScore,
+  reciprocalRankFusion, relationSuggestions, REVIEW_GENERATOR_IDENTITY, REVIEW_GENERATOR_VERSION,
+  type EmbeddingAdapterPort
+} from "./phase3";
 
 export * from "./memory";
 export * from "./dayone";
+export * from "./phase3";
 
 export interface StoredObject {
   sha256: string;
@@ -65,6 +76,7 @@ export interface WorkspaceSession {
   assets: AssetRepositoryPort;
   jobs: JobRepositoryPort;
   memory: MemoryRepositoryPort;
+  agents: AgentRepositoryPort;
   dayOne: import("./dayone").DayOneRepositoryPort;
   vault: ObjectVaultPort;
   backupDatabase(destinationPath: string): Promise<void>;
@@ -86,11 +98,65 @@ export interface KeyProtectorPort {
   unprotect(envelope: string): Promise<{ key: Buffer; refreshedEnvelope?: string }>;
 }
 
+const AGENT_CONSENT_POLICY_VERSION = 1;
+
+function normalizeAgentEndpoint(mode: AgentExecutionMode, baseUrl: string): string {
+  const input = baseUrl.trim();
+  let url: URL;
+  try {
+    url = new URL(input);
+  } catch (cause) {
+    throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "The model base URL is invalid.", false, { cause });
+  }
+  if (url.username || url.password || url.search || url.hash || input.includes("?") || input.includes("#")) {
+    throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "Model URLs cannot contain credentials, query strings, or fragments.");
+  }
+  const loopback = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+  if (mode === "private" && (!loopback.has(url.hostname) || !["http:", "https:"].includes(url.protocol))) {
+    throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "Private model endpoints must use HTTP(S) on loopback.");
+  }
+  if (mode === "enhanced" && url.protocol !== "https:") {
+    throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "Enhanced model endpoints must use HTTPS.");
+  }
+  url.pathname = url.pathname.replace(/\/+$/, "");
+  return url.toString().replace(/\/$/, "");
+}
+
+function encryptAgentCredential(value: string, key: Buffer, workspaceId: string, mode: AgentExecutionMode) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  cipher.setAAD(Buffer.from(`grudge-vault:agent:${workspaceId}:${mode}:v1`, "utf8"));
+  const ciphertext = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
+  return {
+    algorithm: "aes-256-gcm" as const, version: 1 as const, iv: iv.toString("base64"),
+    authTag: cipher.getAuthTag().toString("base64"), ciphertext: ciphertext.toString("base64")
+  };
+}
+
+function decryptAgentCredential(
+  envelope: import("./memory").AgentCredentialEnvelope,
+  key: Buffer,
+  workspaceId: string,
+  mode: AgentExecutionMode
+): string {
+  try {
+    const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(envelope.iv, "base64"));
+    decipher.setAAD(Buffer.from(`grudge-vault:agent:${workspaceId}:${mode}:v1`, "utf8"));
+    decipher.setAuthTag(Buffer.from(envelope.authTag, "base64"));
+    return Buffer.concat([
+      decipher.update(Buffer.from(envelope.ciphertext, "base64")), decipher.final()
+    ]).toString("utf8");
+  } catch (cause) {
+    throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "The stored model credential could not be decrypted.", false, { cause });
+  }
+}
+
 export class GrudgeVaultApplication {
   constructor(
     private readonly workspaces: WorkspaceManagerPort,
     private readonly draftGenerator: EventDraftGeneratorPort = new DeterministicEventDraftGenerator(),
-    private readonly dayOneImporter?: DayOneImporterPort
+    private readonly dayOneImporter?: DayOneImporterPort,
+    private readonly embeddingAdapter?: EmbeddingAdapterPort
   ) {}
 
   getCurrentWorkspace(): Workspace | null {
@@ -140,6 +206,108 @@ export class GrudgeVaultApplication {
     return this.requireSession().memory.listMessages(conversationId);
   }
 
+  recordConversationMessage(conversationId: string, role: Message["role"], content: string): Message {
+    const normalized = content.trim();
+    if (!normalized) throw new AppError("VALIDATION_FAILED", "Message content is required.");
+    const now = new Date().toISOString();
+    const message: Message = {
+      id: randomUUID(), conversationId, sourceItemId: randomUUID(), role, content: normalized, createdAt: now
+    };
+    return this.requireSession().memory.appendMessage(message, {
+      id: message.sourceItemId, sourceId: "", externalId: message.id, content: normalized, recordedAt: now, assetRefs: []
+    });
+  }
+
+  listAgentRuns(conversationId: string): AgentRun[] {
+    return this.requireSession().agents.listRuns(conversationId);
+  }
+
+  getAgentRun(id: string): AgentRun {
+    const run = this.requireSession().agents.getRun(id);
+    if (!run) throw new AppError("ENTITY_NOT_FOUND", "The Agent run no longer exists.");
+    return run;
+  }
+
+  saveAgentRun(run: AgentRun): AgentRun {
+    return this.requireSession().agents.saveRun(run);
+  }
+
+  listAgentModelCallAudits(runId: string): AgentModelCallAudit[] {
+    return this.requireSession().agents.listModelCallAudits(runId);
+  }
+
+  saveAgentModelCallAudit(audit: AgentModelCallAudit): AgentModelCallAudit {
+    return this.requireSession().agents.saveModelCallAudit(audit);
+  }
+
+  getAgentSettings(): AgentModelSettings {
+    const repository = this.requireSession().agents;
+    const stored = repository.getSettings() ?? {
+      mode: "private" as const, consentPolicyVersion: AGENT_CONSENT_POLICY_VERSION, consentedDataCategories: []
+    };
+    const withCredential = (mode: AgentExecutionMode, endpoint: AgentModelSettings["privateEndpoint"]) => endpoint
+      ? { ...endpoint, credentialConfigured: Boolean(repository.getCredential(mode)) }
+      : undefined;
+    const privateEndpoint = withCredential("private", stored.privateEndpoint);
+    const enhancedEndpoint = withCredential("enhanced", stored.enhancedEndpoint);
+    return {
+      mode: stored.mode, consentPolicyVersion: AGENT_CONSENT_POLICY_VERSION,
+      consentedDataCategories: stored.consentPolicyVersion === AGENT_CONSENT_POLICY_VERSION
+        ? stored.consentedDataCategories : [],
+      ...(privateEndpoint ? { privateEndpoint } : {}),
+      ...(enhancedEndpoint ? { enhancedEndpoint } : {})
+    };
+  }
+
+  updateAgentSettings(input: AgentSettingsUpdateInput): AgentModelSettings {
+    const session = this.requireSession();
+    const repository = session.agents;
+    const current = this.getAgentSettings();
+    const updateEndpoint = (mode: AgentExecutionMode, value: typeof input.privateEndpoint) => {
+      const previous = mode === "private" ? current.privateEndpoint : current.enhancedEndpoint;
+      if (!value) return previous;
+      const baseUrl = normalizeAgentEndpoint(mode, value.baseUrl);
+      const model = value.model.trim();
+      if (!model || model.length > 200) {
+        throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "A model name is required.");
+      }
+      if (value.clearCredential) repository.saveCredential(mode, undefined, new Date().toISOString());
+      if (value.apiKey !== undefined) {
+        const apiKey = value.apiKey.trim();
+        if (!apiKey || apiKey.length > 10_000) {
+          throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "The model credential is invalid.");
+        }
+        repository.saveCredential(mode, encryptAgentCredential(apiKey, session.key, session.workspace.id, mode), new Date().toISOString());
+      }
+      return { baseUrl, model, credentialConfigured: Boolean(repository.getCredential(mode)) };
+    };
+    const privateEndpoint = updateEndpoint("private", input.privateEndpoint);
+    const enhancedEndpoint = updateEndpoint("enhanced", input.enhancedEndpoint);
+    if (input.mode === "enhanced" && !enhancedEndpoint) {
+      throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "Configure an Enhanced model endpoint before enabling it.");
+    }
+    repository.saveSettings({
+      mode: input.mode, consentPolicyVersion: AGENT_CONSENT_POLICY_VERSION,
+      consentedDataCategories: input.consentedDataCategories ?? current.consentedDataCategories,
+      ...(privateEndpoint ? { privateEndpoint } : {}),
+      ...(enhancedEndpoint ? { enhancedEndpoint } : {})
+    }, new Date().toISOString());
+    return this.getAgentSettings();
+  }
+
+  clearAgentCredential(mode: AgentExecutionMode): AgentModelSettings {
+    this.requireSession().agents.saveCredential(mode, undefined, new Date().toISOString());
+    const current = this.getAgentSettings();
+    this.requireSession().agents.saveSettings(current, new Date().toISOString());
+    return this.getAgentSettings();
+  }
+
+  getAgentCredential(mode: AgentExecutionMode): string | undefined {
+    const session = this.requireSession();
+    const envelope = session.agents.getCredential(mode);
+    return envelope ? decryptAgentCredential(envelope, session.key, session.workspace.id, mode) : undefined;
+  }
+
   async sendMessage(input: SendMessageInput): Promise<SendMessageResult> {
     const memory = this.requireSession().memory;
     const now = new Date().toISOString();
@@ -165,7 +333,9 @@ export class GrudgeVaultApplication {
   }
 
   searchEvents(query: EventSearchQuery): Event[] {
-    return this.requireSession().memory.searchEvents(query);
+    const memory = this.requireSession().memory;
+    if (!query.personId) return memory.searchEvents(query);
+    return memory.searchEvents({ ...query, personIds: memory.listIdentityPersonIds(query.personId) });
   }
 
   getEvent(id: string) {
@@ -205,6 +375,45 @@ export class GrudgeVaultApplication {
     return this.commitRevision(current, input, input.reason);
   }
 
+  proposeAgentEvent(fields: EventWriteFields, sourceRef: string): Event {
+    const now = new Date().toISOString();
+    return this.commitNewEvent({
+      ...fields, status: "candidate", sourceRefs: [...new Set([...fields.sourceRefs, sourceRef])]
+    }, "Agent proposal approved by user", now, {}, "agent");
+  }
+
+  updateEventFromAgent(input: UpdateEventInput, sourceRef: string): Event {
+    const current = this.getCurrentEvent(input.eventId);
+    this.assertRevision(current, input.expectedRevision);
+    return this.commitRevision(current, {
+      ...input, sourceRefs: [...new Set([...input.sourceRefs, sourceRef])]
+    }, input.reason || "Agent update approved by user", "agent");
+  }
+
+  answerClarificationFromAgent(
+    clarificationId: string,
+    answer: string,
+    expectedRevision: number,
+    answerSourceRef: string
+  ): Event {
+    const memory = this.requireSession().memory;
+    const clarification = memory.getClarification(clarificationId);
+    if (!clarification) throw new AppError("ENTITY_NOT_FOUND", "The clarification no longer exists.");
+    if (clarification.status !== "open") throw new AppError("AGENT_ACTION_CONFLICT", "The clarification is already closed.");
+    const current = this.getCurrentEvent(clarification.eventId);
+    this.assertRevision(current, expectedRevision);
+    const now = new Date().toISOString();
+    const next = this.eventWithFields(current, {
+      ...current, sourceRefs: [...new Set([...current.sourceRefs, answerSourceRef])]
+    }, now, -1);
+    return memory.commitEvent(next, this.revisionFor(
+      current, next, "Clarification answered through Agent", [answerSourceRef], now, "agent"
+    ), { clarifications: [{
+      ...clarification, status: "answered", answerSourceRef,
+      sourceRefs: [...new Set([...clarification.sourceRefs, answerSourceRef])], updatedAt: now
+    }] });
+  }
+
   confirmEvent(id: string, expectedRevision: number): Event {
     const session = this.requireSession();
     const candidate = session.dayOne.getCandidate(id, (eventId) => session.memory.getEventDetail(eventId));
@@ -225,6 +434,12 @@ export class GrudgeVaultApplication {
 
   listPeople(includeArchived = false): Person[] {
     return this.requireSession().memory.listPeople(includeArchived);
+  }
+
+  listPersonIdentities(): PersonIdentityDetail[] {
+    const memory = this.requireSession().memory;
+    const canonicalIds = [...new Set(memory.listPeople().map(({ id }) => memory.resolveCanonicalPersonId(id)))];
+    return canonicalIds.map((id) => this.getPersonIdentity(id));
   }
 
   createPerson(displayName: string, notes?: string): Person {
@@ -253,6 +468,304 @@ export class GrudgeVaultApplication {
     const current = memory.getPerson(id);
     if (!current) throw new AppError("ENTITY_NOT_FOUND", "The person no longer exists.");
     return memory.updatePerson({ ...current, status: "archived", updatedAt: new Date().toISOString() });
+  }
+
+  getPersonIdentity(id: string): PersonIdentityDetail {
+    const memory = this.requireSession().memory;
+    const canonicalId = memory.resolveCanonicalPersonId(id);
+    const canonicalPerson = memory.getPerson(canonicalId);
+    if (!canonicalPerson) throw new AppError("ENTITY_NOT_FOUND", "The person no longer exists.");
+    const memberIds = memory.listIdentityPersonIds(canonicalId);
+    const identities = memberIds.map((personId) => memory.getPerson(personId)).filter((person): person is Person => Boolean(person));
+    return {
+      canonicalPerson, identities,
+      aliases: memberIds.flatMap((personId) => memory.listPersonAliases(personId, true)),
+      events: memory.searchEvents({ personIds: memberIds, limit: 200 }),
+      activeMerges: memory.listPersonMergeRecords().filter((record) =>
+        memberIds.includes(record.sourcePersonId) || memberIds.includes(record.targetPersonId))
+    };
+  }
+
+  addPersonAlias(input: PersonAliasInput): PersonAlias {
+    const memory = this.requireSession().memory;
+    if (!memory.getPerson(input.personId)) throw new AppError("ENTITY_NOT_FOUND", "The person no longer exists.");
+    const value = input.value.trim();
+    const normalizedValue = normalizeIdentity(value);
+    if (!normalizedValue) throw new AppError("VALIDATION_FAILED", "An alias must contain letters or numbers.");
+    const now = new Date().toISOString();
+    return memory.createPersonAlias({
+      id: randomUUID(), personId: input.personId, value, normalizedValue,
+      sourceRefs: [...new Set(input.sourceRefs ?? [])], status: "active", createdAt: now, updatedAt: now
+    });
+  }
+
+  deactivatePersonAlias(id: string): PersonAlias {
+    return this.requireSession().memory.deactivatePersonAlias(id, new Date().toISOString());
+  }
+
+  listPersonMergeSuggestions(): PersonMergeSuggestion[] {
+    const memory = this.requireSession().memory;
+    const people = memory.listPeople().filter(({ status }) => status === "active");
+    const aliases = memory.listPersonAliases();
+    const now = new Date().toISOString();
+    for (let leftIndex = 0; leftIndex < people.length; leftIndex += 1) {
+      for (let rightIndex = leftIndex + 1; rightIndex < people.length; rightIndex += 1) {
+        const left = people[leftIndex]!;
+        const right = people[rightIndex]!;
+        if (memory.resolveCanonicalPersonId(left.id) === memory.resolveCanonicalPersonId(right.id)) continue;
+        const match = personSuggestionScore(
+          left, aliases.filter(({ personId }) => personId === left.id),
+          right, aliases.filter(({ personId }) => personId === right.id)
+        );
+        if (!match) continue;
+        const [personAId, personBId] = [left.id, right.id].sort();
+        memory.upsertPersonMergeSuggestion({
+          id: randomUUID(), personAId: personAId!, personBId: personBId!, score: match.score, basis: match.basis,
+          algorithmIdentity: "local.person-identity-match", algorithmVersion: 1,
+          status: "pending", createdAt: now, updatedAt: now
+        });
+      }
+    }
+    return memory.listPersonMergeSuggestions();
+  }
+
+  rejectPersonMergeSuggestion(id: string): PersonMergeSuggestion {
+    return this.requireSession().memory.updatePersonMergeSuggestion(id, "rejected", new Date().toISOString());
+  }
+
+  mergePeople(input: PersonMergeInput): PersonMergeRecord {
+    const memory = this.requireSession().memory;
+    const sourceInput = memory.getPerson(input.sourcePersonId);
+    const targetInput = memory.getPerson(input.targetPersonId);
+    if (!sourceInput || !targetInput) {
+      throw new AppError("ENTITY_NOT_FOUND", "One of the people no longer exists.");
+    }
+    if (sourceInput.status !== "active" || targetInput.status !== "active") {
+      throw new AppError("PERSON_MERGE_CONFLICT", "Archived people cannot participate in an identity merge.");
+    }
+    const sourcePersonId = memory.resolveCanonicalPersonId(input.sourcePersonId);
+    const targetPersonId = memory.resolveCanonicalPersonId(input.targetPersonId);
+    if (sourcePersonId === targetPersonId) throw new AppError("PERSON_MERGE_CONFLICT", "These people already resolve to one identity.");
+    const now = new Date().toISOString();
+    const record: PersonMergeRecord = {
+      id: randomUUID(), sourcePersonId, targetPersonId, status: "active", createdAt: now,
+      ...(input.suggestionId ? { suggestionId: input.suggestionId } : {})
+    };
+    const saved = memory.createPersonMerge(record);
+    if (input.suggestionId) memory.updatePersonMergeSuggestion(input.suggestionId, "confirmed", now, saved.id);
+    return saved;
+  }
+
+  revertPersonMerge(id: string): PersonMergeRecord {
+    const memory = this.requireSession().memory;
+    const existing = memory.listPersonMergeRecords(true).find((record) => record.id === id);
+    if (!existing) throw new AppError("ENTITY_NOT_FOUND", "The identity merge no longer exists.");
+    const now = new Date().toISOString();
+    const reverted = memory.revertPersonMerge(id, now);
+    if (existing.suggestionId) memory.updatePersonMergeSuggestion(existing.suggestionId, "pending", now);
+    return reverted;
+  }
+
+  listEventRelations(eventId: string): EventRelation[] {
+    if (!this.requireSession().memory.getEvent(eventId)) throw new AppError("ENTITY_NOT_FOUND", "The event no longer exists.");
+    return this.requireSession().memory.listEventRelations(eventId);
+  }
+
+  refreshRelationSuggestions(): EventRelation[] {
+    const memory = this.requireSession().memory;
+    const now = new Date().toISOString();
+    const events = memory.searchEvents({ status: "confirmed", limit: 200 });
+    for (const suggestion of relationSuggestions(events, (id) => memory.resolveCanonicalPersonId(id), now)) {
+      const normalized = suggestion.kind !== "precedes" && suggestion.sourceEventId > suggestion.targetEventId
+        ? {
+            ...suggestion, sourceEventId: suggestion.targetEventId, targetEventId: suggestion.sourceEventId,
+            sourceRevision: suggestion.targetRevision, targetRevision: suggestion.sourceRevision
+          }
+        : suggestion;
+      memory.upsertEventRelation(normalized);
+    }
+    return memory.listEventRelations();
+  }
+
+  createEventRelation(input: CreateRelationInput): EventRelation {
+    const memory = this.requireSession().memory;
+    const source = memory.getEvent(input.sourceEventId);
+    const target = memory.getEvent(input.targetEventId);
+    if (!source || !target) throw new AppError("ENTITY_NOT_FOUND", "One of the events no longer exists.");
+    if (source.id === target.id) throw new AppError("VALIDATION_FAILED", "An event cannot relate to itself.");
+    let sourceEventId = source.id;
+    let targetEventId = target.id;
+    if (input.kind !== "precedes" && sourceEventId > targetEventId) [sourceEventId, targetEventId] = [targetEventId, sourceEventId];
+    const sourceEvent = memory.getEvent(sourceEventId)!;
+    const targetEvent = memory.getEvent(targetEventId)!;
+    const now = new Date().toISOString();
+    return memory.upsertEventRelation({
+      id: randomUUID(), sourceEventId, targetEventId, kind: input.kind, status: "confirmed", origin: "user",
+      basis: [{ kind: "source", label: "用户手工关联", personIds: [], eventIds: [sourceEventId, targetEventId],
+        sourceRefs: [...new Set([...sourceEvent.sourceRefs, ...targetEvent.sourceRefs])] }],
+      sourceRevision: sourceEvent.currentRevision, targetRevision: targetEvent.currentRevision,
+      createdAt: now, updatedAt: now
+    });
+  }
+
+  confirmEventRelation(id: string): EventRelation {
+    const memory = this.requireSession().memory;
+    const relation = memory.getEventRelation(id);
+    if (!relation) throw new AppError("ENTITY_NOT_FOUND", "The event relation no longer exists.");
+    if (relation.status === "rejected") throw new AppError("RELATION_STATE_CONFLICT", "A rejected relation must be recreated manually.");
+    return memory.updateEventRelationStatus(id, "confirmed", new Date().toISOString());
+  }
+
+  rejectEventRelation(id: string): EventRelation {
+    const memory = this.requireSession().memory;
+    const relation = memory.getEventRelation(id);
+    if (!relation) throw new AppError("ENTITY_NOT_FOUND", "The event relation no longer exists.");
+    return memory.updateEventRelationStatus(id, "rejected", new Date().toISOString());
+  }
+
+  removeEventRelation(id: string): void {
+    const memory = this.requireSession().memory;
+    const relation = memory.getEventRelation(id);
+    if (!relation) throw new AppError("ENTITY_NOT_FOUND", "The event relation no longer exists.");
+    if (relation.origin !== "user") throw new AppError("RELATION_STATE_CONFLICT", "Algorithm suggestions must be rejected instead of deleted.");
+    memory.deleteEventRelation(id);
+  }
+
+  queryTimeline(query: TimelineQuery): TimelineResult {
+    const memory = this.requireSession().memory;
+    const search: EventSearchQuery = {
+      limit: 200, ...(query.from ? { from: query.from } : {}), ...(query.to ? { to: query.to } : {})
+    };
+    if (query.status) search.status = query.status;
+    if (query.personId) search.personIds = memory.listIdentityPersonIds(query.personId);
+    const events = memory.searchEvents(search).filter(({ status }) =>
+      query.includeArchived || query.status === "archived" || status !== "archived");
+    return buildTimeline(events, query);
+  }
+
+  async unifiedSearch(query: UnifiedSearchQuery): Promise<UnifiedSearchHit[]> {
+    const memory = this.requireSession().memory;
+    const limit = Math.min(100, Math.max(1, query.limit ?? 50));
+    const keyword = memory.searchUnifiedKeyword({ ...query, limit: Math.max(limit, 100) });
+    const enabled = memory.getSetting<boolean>("search.semantic_enabled") ?? false;
+    const active = memory.listEmbeddingGenerations().find(({ state }) => state === "active");
+    if (!query.semantic || !enabled || !this.embeddingAdapter || !active || !query.text.trim()
+      || active.adapterIdentity !== this.embeddingAdapter.identity || active.adapterVersion !== this.embeddingAdapter.version) {
+      return keyword.slice(0, limit).map((hit, index) => ({ ...hit, combinedScore: 0.7 / (61 + index) }));
+    }
+    const [queryVector] = await this.embeddingAdapter.embed([query.text]);
+    if (!queryVector || queryVector.length !== this.embeddingAdapter.dimensions) {
+      return keyword.slice(0, limit).map((hit, index) => ({ ...hit, combinedScore: 0.7 / (61 + index) }));
+    }
+    const eligible = new Map(memory.searchUnifiedKeyword({ ...query, text: "", semantic: false, limit: 200 })
+      .map((hit) => [`${hit.kind}:${hit.id}`, hit]));
+    const semantic = memory.listEmbeddings(active.id).flatMap(({ document, vector }) => {
+      const base = eligible.get(`${document.kind}:${document.id}`);
+      if (!base) return [];
+      return [{ ...base, semanticScore: cosineSimilarity(queryVector, vector), combinedScore: 0 }];
+    }).sort((a, b) => (b.semanticScore ?? 0) - (a.semanticScore ?? 0));
+    return reciprocalRankFusion(keyword, semantic, limit);
+  }
+
+  getEmbeddingStatus(): EmbeddingIndexStatus {
+    const memory = this.requireSession().memory;
+    const enabled = memory.getSetting<boolean>("search.semantic_enabled") ?? false;
+    const generations = memory.listEmbeddingGenerations();
+    const active = generations.find(({ state }) => state === "active");
+    const building = generations.find(({ state }) => state === "building");
+    const failed = generations.find(({ state }) => state === "failed");
+    if (!this.embeddingAdapter) return { available: false, enabled, documentCount: 0, state: "unavailable" };
+    return {
+      available: true, enabled, adapterIdentity: this.embeddingAdapter.identity,
+      adapterVersion: this.embeddingAdapter.version, dimensions: this.embeddingAdapter.dimensions,
+      ...(active ? { activeGenerationId: active.id } : {}), documentCount: active?.documentCount ?? 0,
+      state: !enabled ? "disabled" : building ? "building" : active ? "ready" : failed ? "failed" : "empty",
+      ...(failed?.lastError && !active ? { lastError: failed.lastError } : {})
+    };
+  }
+
+  setSemanticEnabled(enabled: boolean): EmbeddingIndexStatus {
+    this.requireSession().memory.setSetting("search.semantic_enabled", enabled, new Date().toISOString());
+    return this.getEmbeddingStatus();
+  }
+
+  rebuildEmbeddings(): Job {
+    if (!this.embeddingAdapter) throw new AppError("EMBEDDING_UNAVAILABLE", "No local embedding adapter is configured.");
+    const session = this.requireSession();
+    const now = new Date().toISOString();
+    const generation: EmbeddingGeneration = {
+      id: randomUUID(), adapterIdentity: this.embeddingAdapter.identity, adapterVersion: this.embeddingAdapter.version,
+      dimensions: this.embeddingAdapter.dimensions, state: "building", documentCount: 0, createdAt: now
+    };
+    session.memory.createEmbeddingGeneration(generation);
+    return session.jobs.enqueue("search.embedding-rebuild", { generationId: generation.id }, now, 1);
+  }
+
+  async runEmbeddingRebuild(generationId: string, context: JobHandlerContext): Promise<void> {
+    if (!this.embeddingAdapter) throw new AppError("EMBEDDING_UNAVAILABLE", "No local embedding adapter is configured.");
+    const memory = this.requireSession().memory;
+    const generation = memory.listEmbeddingGenerations().find(({ id }) => id === generationId);
+    if (!generation || generation.state !== "building") throw new AppError("VALIDATION_FAILED", "The embedding generation is unavailable.");
+    const documents = memory.listSearchDocuments();
+    try {
+      const batchSize = 32;
+      for (let index = 0; index < documents.length; index += batchSize) {
+        if (context.signal.aborted) throw new Error("Embedding rebuild interrupted.");
+        const batch = documents.slice(index, index + batchSize);
+        const vectors = await this.embeddingAdapter.embed(batch.map(({ content }) => content));
+        if (vectors.length !== batch.length || vectors.some(({ length }) => length !== this.embeddingAdapter!.dimensions)) {
+          throw new Error("The embedding adapter returned an incompatible vector batch.");
+        }
+        batch.forEach((document, vectorIndex) => memory.putEmbedding(generationId, document, vectors[vectorIndex]!));
+        context.reportProgress(documents.length ? Math.min(0.99, (index + batch.length) / documents.length) : 0.99);
+      }
+      memory.activateEmbeddingGeneration(generationId, documents.length, new Date().toISOString());
+      context.reportProgress(1);
+    } catch (error) {
+      memory.failEmbeddingGeneration(generationId, error instanceof Error ? error.message : "Embedding rebuild failed.");
+      throw error;
+    }
+  }
+
+  listReviews(): ReviewRun[] {
+    return this.requireSession().memory.listReviews().map((review) => this.reviewWithStale(review));
+  }
+
+  getReview(id: string): ReviewRun {
+    const review = this.requireSession().memory.getReview(id);
+    if (!review) throw new AppError("ENTITY_NOT_FOUND", "The review no longer exists.");
+    return this.reviewWithStale(review);
+  }
+
+  generateReview(input: ReviewGenerateInput): ReviewRun {
+    if (input.from > input.to) throw new AppError("VALIDATION_FAILED", "The review start must not be after its end.");
+    const memory = this.requireSession().memory;
+    const events = memory.searchEvents({ status: "confirmed", from: input.from, to: input.to, limit: 200 });
+    const relations = memory.listEventRelations(undefined, true).filter(({ sourceEventId, targetEventId, status }) =>
+      status !== "rejected" && events.some(({ id }) => id === sourceEventId) && events.some(({ id }) => id === targetEventId));
+    const people = new Map(memory.listPeople(true).map((person) => [person.id, person]));
+    const participantIds = [...new Set(events.flatMap(({ participants }) => participants.map(({ personId }) => personId)))];
+    const canonicalPeople = new Map(participantIds.map((id) => [id, memory.resolveCanonicalPersonId(id)]));
+    const inputHash = this.reviewInputHash(events, relations, canonicalPeople);
+    const now = new Date().toISOString();
+    const review: ReviewRun = {
+      id: randomUUID(), from: input.from, to: input.to,
+      generatorIdentity: REVIEW_GENERATOR_IDENTITY, generatorVersion: REVIEW_GENERATOR_VERSION, inputHash,
+      patterns: buildReviewPatterns(events, relations, (id) => canonicalPeople.get(id) ?? id, people),
+      eventIds: events.map(({ id }) => id), sourceRefs: [...new Set(events.flatMap(({ sourceRefs }) => sourceRefs))],
+      createdAt: now, stale: false
+    };
+    return memory.saveReview(review);
+  }
+
+  getSourceReference(id: string): SourceReferenceDetail {
+    const detail = this.requireSession().memory.getSourceReference(id);
+    if (!detail) throw new AppError("ENTITY_NOT_FOUND", "The source record no longer exists.");
+    return detail;
+  }
+
+  setClarificationPriority(id: string, priority: Clarification["priority"]): Clarification {
+    return this.requireSession().memory.setClarificationPriority(id, priority, new Date().toISOString());
   }
 
   listClarifications(eventId?: string): Clarification[] {
@@ -706,7 +1219,13 @@ export class GrudgeVaultApplication {
     return run;
   }
 
-  private commitNewEvent(fields: EventWriteFields, reason: string, now: string, extras: EventCommitExtras = {}): Event {
+  private commitNewEvent(
+    fields: EventWriteFields,
+    reason: string,
+    now: string,
+    extras: EventCommitExtras = {},
+    actor: EventRevision["actor"] = "user"
+  ): Event {
     const id = randomUUID();
     const clarifications = (extras.clarifications ?? []).map((item) => ({ ...item, eventId: id }));
     const normalized = normalizeEventFields(fields);
@@ -716,15 +1235,20 @@ export class GrudgeVaultApplication {
     };
     const revision: EventRevision = {
       id: randomUUID(), eventId: id, revision: 1, previousRevision: 0, snapshot: event,
-      actor: "user", reason: reason.trim() || "Event created", sourceRefs: event.sourceRefs, createdAt: now
+      actor, reason: reason.trim() || "Event created", sourceRefs: event.sourceRefs, createdAt: now
     };
     return this.requireSession().memory.commitEvent(event, revision, { ...extras, clarifications });
   }
 
-  private commitRevision(current: Event, fields: EventWriteFields, reason: string): Event {
+  private commitRevision(
+    current: Event,
+    fields: EventWriteFields,
+    reason: string,
+    actor: EventRevision["actor"] = "user"
+  ): Event {
     const now = new Date().toISOString();
     const next = this.eventWithFields(current, fields, now);
-    return this.requireSession().memory.commitEvent(next, this.revisionFor(current, next, reason, next.sourceRefs, now));
+    return this.requireSession().memory.commitEvent(next, this.revisionFor(current, next, reason, next.sourceRefs, now, actor));
   }
 
   private eventWithFields(current: Event, fields: EventWriteFields, now: string, clarificationDelta = 0): Event {
@@ -737,10 +1261,17 @@ export class GrudgeVaultApplication {
     };
   }
 
-  private revisionFor(current: Event, next: Event, reason: string, sourceRefs: string[], now: string): EventRevision {
+  private revisionFor(
+    current: Event,
+    next: Event,
+    reason: string,
+    sourceRefs: string[],
+    now: string,
+    actor: EventRevision["actor"] = "user"
+  ): EventRevision {
     return {
       id: randomUUID(), eventId: next.id, revision: next.currentRevision,
-      previousRevision: current.currentRevision, snapshot: next, actor: "user",
+      previousRevision: current.currentRevision, snapshot: next, actor,
       reason: reason.trim() || "Event updated", sourceRefs: [...new Set(sourceRefs)], createdAt: now
     };
   }
@@ -766,6 +1297,29 @@ export class GrudgeVaultApplication {
   private manualSource(content: string, now: string): { source: Source; item: SourceItem } {
     const source: Source = { id: randomUUID(), kind: "manual", name: "Manual entry", createdAt: now };
     return { source, item: { id: randomUUID(), sourceId: source.id, content, recordedAt: now, assetRefs: [] } };
+  }
+
+  private reviewInputHash(
+    events: Event[], relations: EventRelation[], canonicalPeople: Map<string, string>
+  ): string {
+    const input = {
+      events: events.map(({ id, currentRevision }) => ({ id, currentRevision })).sort((a, b) => a.id.localeCompare(b.id)),
+      relations: relations.map(({ id, status, sourceRevision, targetRevision }) => ({ id, status, sourceRevision, targetRevision }))
+        .sort((a, b) => a.id.localeCompare(b.id)),
+      people: [...canonicalPeople.entries()].sort(([left], [right]) => left.localeCompare(right))
+    };
+    return createHash("sha256").update(JSON.stringify(input)).digest("hex");
+  }
+
+  private reviewWithStale(review: ReviewRun): ReviewRun {
+    const memory = this.requireSession().memory;
+    const events = memory.searchEvents({ status: "confirmed", from: review.from, to: review.to, limit: 200 });
+    const eventIds = new Set(events.map(({ id }) => id));
+    const relations = memory.listEventRelations(undefined, true).filter(({ sourceEventId, targetEventId, status }) =>
+      status !== "rejected" && eventIds.has(sourceEventId) && eventIds.has(targetEventId));
+    const participantIds = [...new Set(events.flatMap(({ participants }) => participants.map(({ personId }) => personId)))];
+    const canonical = new Map(participantIds.map((id) => [id, memory.resolveCanonicalPersonId(id)]));
+    return { ...review, stale: review.inputHash !== this.reviewInputHash(events, relations, canonical) };
   }
 
   private requireSession(): WorkspaceSession {

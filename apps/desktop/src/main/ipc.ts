@@ -1,9 +1,11 @@
 import { dialog, ipcMain, type BrowserWindow, type IpcMainInvokeEvent } from "electron";
 import { z, ZodError, type ZodType } from "zod";
 import type { GrudgeVaultApplication, JobRunner, WorkspaceManagerPort } from "@grudge-vault/application";
-import type { EventSearchQuery, Person } from "@grudge-vault/domain";
+import type { AgentHarness } from "@grudge-vault/agent-harness";
+import type { EventSearchQuery, Person, TimelineQuery, UnifiedSearchQuery } from "@grudge-vault/domain";
 import type {
-  CandidateMergeInput, ClarificationAnswerInput, CreateEventInput, SendMessageInput,
+  AgentSendInput, AgentSettingsUpdateInput, CandidateMergeInput, ClarificationAnswerInput, CreateEventInput,
+  CreateRelationInput, PersonAliasInput, PersonMergeInput, ReviewGenerateInput, SendMessageInput,
   StartBackfillInput, UpdateEventInput
 } from "@grudge-vault/shared";
 import { AppError, toSerializedError, type IpcResult } from "@grudge-vault/shared";
@@ -72,10 +74,42 @@ const candidateMergeSchema = z.object({
   candidateEventId: idSchema, candidateExpectedRevision: z.number().int().positive(),
   targetEventId: idSchema, targetExpectedRevision: z.number().int().positive()
 }).refine((value) => value.candidateEventId !== value.targetEventId, { message: "A candidate cannot merge into itself." });
+const personAliasSchema = z.object({ personId: idSchema, value: z.string().trim().min(1).max(120), sourceRefs: sourceRefsSchema.optional() });
+const personMergeSchema = z.object({
+  sourcePersonId: idSchema, targetPersonId: idSchema, suggestionId: idSchema.optional()
+}).refine((value) => value.sourcePersonId !== value.targetPersonId, { message: "A person cannot merge into itself." });
+const relationSchema = z.object({
+  sourceEventId: idSchema, targetEventId: idSchema,
+  kind: z.enum(["similar", "precedes", "same_topic", "same_case"])
+}).refine((value) => value.sourceEventId !== value.targetEventId, { message: "An event cannot relate to itself." });
+const timelineSchema = z.object({
+  personId: idSchema.optional(), status: z.enum(["candidate", "confirmed", "archived"]).optional(),
+  from: z.iso.date().optional(), to: z.iso.date().optional(), includeArchived: z.boolean().optional()
+}).refine((value) => !value.from || !value.to || value.from <= value.to, { message: "Invalid date range." });
+const unifiedSearchSchema = z.object({
+  text: z.string().trim().max(500), kinds: z.array(z.enum(["event", "journal_entry", "transcript"])).max(3).optional(),
+  personId: idSchema.optional(), status: z.enum(["candidate", "confirmed", "archived"]).optional(),
+  from: z.iso.date().optional(), to: z.iso.date().optional(), semantic: z.boolean().optional(),
+  limit: z.number().int().min(1).max(100).optional()
+}).refine((value) => !value.from || !value.to || value.from <= value.to, { message: "Invalid date range." });
+const reviewSchema = z.object({ from: z.iso.date(), to: z.iso.date() })
+  .refine((value) => value.from <= value.to, { message: "Invalid date range." });
+const agentEndpointSchema = z.object({
+  baseUrl: z.string().trim().url().max(2_000), model: z.string().trim().min(1).max(200),
+  apiKey: z.string().trim().min(1).max(10_000).optional(), clearCredential: z.boolean().optional()
+});
+const agentCategoriesSchema = z.array(z.enum([
+  "conversation_text", "event_fields", "source_excerpt", "asset_metadata", "transcript_excerpt"
+])).max(5);
+const agentSettingsSchema = z.object({
+  mode: z.enum(["private", "enhanced"]), privateEndpoint: agentEndpointSchema.optional(),
+  enhancedEndpoint: agentEndpointSchema.optional(), consentedDataCategories: agentCategoriesSchema.optional()
+});
 
 interface IpcDependencies {
   window: BrowserWindow;
   application: GrudgeVaultApplication;
+  agent: AgentHarness;
   workspaces: WorkspaceManagerPort;
   restartRunner(): void;
   getRunner(): JobRunner | undefined;
@@ -145,6 +179,21 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     conversationId: idSchema, content: z.string().trim().min(1).max(100_000), createDraft: z.boolean()
   }), (input) => dependencies.application.sendMessage(input as SendMessageInput));
 
+  add("agent:send", z.object({
+    conversationId: idSchema, content: z.string().trim().min(1).max(100_000)
+  }), (input) => dependencies.agent.send(input as AgentSendInput));
+  add("agent:resume", z.object({ runId: idSchema, disclosureId: idSchema }), ({ runId, disclosureId }) =>
+    dependencies.agent.resume(runId, disclosureId));
+  add("agent:cancel", idSchema, (id) => dependencies.agent.cancel(id));
+  add("agent:list-runs", idSchema, (id) => dependencies.agent.listRuns(id));
+  add("agent:get-run", idSchema, (id) => dependencies.agent.getRun(id));
+  add("agent:approve-action", idSchema, (id) => dependencies.agent.approveAction(id));
+  add("agent:reject-action", idSchema, (id) => dependencies.agent.rejectAction(id));
+  add("agent:get-settings", emptySchema, () => dependencies.agent.getSettings());
+  add("agent:update-settings", agentSettingsSchema, (input) =>
+    dependencies.agent.updateSettings(input as AgentSettingsUpdateInput));
+  add("agent:clear-credential", z.enum(["private", "enhanced"]), (mode) => dependencies.agent.clearCredential(mode));
+
   add("events:search", searchSchema, (query) => dependencies.application.searchEvents(query as EventSearchQuery));
   add("events:get", idSchema, (id) => dependencies.application.getEvent(id));
   add("events:create", createEventSchema, (input) => dependencies.application.createEvent(input as CreateEventInput));
@@ -156,11 +205,40 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   add("events:revisions", idSchema, (id) => dependencies.application.listEventRevisions(id));
 
   add("people:list", z.boolean().optional(), (includeArchived) => dependencies.application.listPeople(includeArchived));
+  add("people:list-identities", emptySchema, () => dependencies.application.listPersonIdentities());
   add("people:create", z.object({ displayName: titleSchema, notes: z.string().trim().max(5_000).optional() }),
     ({ displayName, notes }) => dependencies.application.createPerson(displayName, notes));
   add("people:update", z.object({ id: idSchema, displayName: titleSchema, notes: z.string().trim().max(5_000).optional() }),
     (person) => dependencies.application.updatePerson(person as Pick<Person, "id" | "displayName" | "notes">));
   add("people:archive", idSchema, (id) => dependencies.application.archivePerson(id));
+  add("people:get", idSchema, (id) => dependencies.application.getPersonIdentity(id));
+  add("people:add-alias", personAliasSchema, (input) => dependencies.application.addPersonAlias(input as PersonAliasInput));
+  add("people:deactivate-alias", idSchema, (id) => dependencies.application.deactivatePersonAlias(id));
+  add("people:merge-suggestions", emptySchema, () => dependencies.application.listPersonMergeSuggestions());
+  add("people:reject-merge-suggestion", idSchema, (id) => dependencies.application.rejectPersonMergeSuggestion(id));
+  add("people:merge", personMergeSchema, (input) => dependencies.application.mergePeople(input as PersonMergeInput));
+  add("people:revert-merge", idSchema, (id) => dependencies.application.revertPersonMerge(id));
+
+  add("relations:list", idSchema, (id) => dependencies.application.listEventRelations(id));
+  add("relations:refresh", emptySchema, () => dependencies.application.refreshRelationSuggestions());
+  add("relations:create", relationSchema, (input) => dependencies.application.createEventRelation(input as CreateRelationInput));
+  add("relations:confirm", idSchema, (id) => dependencies.application.confirmEventRelation(id));
+  add("relations:reject", idSchema, (id) => dependencies.application.rejectEventRelation(id));
+  add("relations:remove", idSchema, (id) => dependencies.application.removeEventRelation(id));
+
+  add("timeline:query", timelineSchema, (input) => dependencies.application.queryTimeline(input as TimelineQuery));
+  add("search:query", unifiedSearchSchema, (input) => dependencies.application.unifiedSearch(input as UnifiedSearchQuery));
+  add("search:embedding-status", emptySchema, () => dependencies.application.getEmbeddingStatus());
+  add("search:semantic-enabled", z.boolean(), (enabled) => dependencies.application.setSemanticEnabled(enabled));
+  add("search:rebuild-embeddings", emptySchema, () => {
+    const job = dependencies.application.rebuildEmbeddings();
+    dependencies.getRunner()?.wake();
+    return job;
+  });
+  add("reviews:list", emptySchema, () => dependencies.application.listReviews());
+  add("reviews:get", idSchema, (id) => dependencies.application.getReview(id));
+  add("reviews:generate", reviewSchema, (input) => dependencies.application.generateReview(input as ReviewGenerateInput));
+  add("sources:get-reference", idSchema, (id) => dependencies.application.getSourceReference(id));
 
   add("clarifications:list", idSchema.optional(), (eventId) => dependencies.application.listClarifications(eventId));
   add("clarifications:answer", z.object({
@@ -168,6 +246,9 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   }), (input) => dependencies.application.answerClarification(input as ClarificationAnswerInput));
   add("clarifications:dismiss", idRevisionSchema, ({ id, expectedRevision }) =>
     dependencies.application.dismissClarification(id, expectedRevision));
+  add("clarifications:priority", z.object({
+    id: idSchema, priority: z.enum(["normal", "important", "rights_related"])
+  }), ({ id, priority }) => dependencies.application.setClarificationPriority(id, priority));
 
   add("assets:import-paths", pathsSchema, async (paths) => {
     const imported = [];

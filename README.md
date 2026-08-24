@@ -90,7 +90,7 @@ Day One 官方说明 macOS 支持通过 `File → Export` 导出 JSON，ZIP 可�
 - 全文搜索、人物关联和时间线回顾；
 - 基于工具调用的 Agent 检索与结构化分析。
 
-Case Binder、本地模型、多源自动同步和主动周期回顾将在基础闭环稳定后逐步加入。阶段顺序用于表达依赖关系，可根据真实使用反馈调整，不作为僵硬范围合同。
+Case Binder、内置本地模型、多源自动同步和主动周期回顾将在基础闭环稳定后逐步加入。阶段顺序用于表达依赖关系，可根据真实使用反馈调整，不作为僵硬范围合同。
 
 ## 建议实现基线
 
@@ -114,7 +114,7 @@ Case Binder、本地模型、多源自动同步和主动周期回顾将在基础
 
 ## 当前状态
 
-Phase 2 Alpha 已完成 Day One 历史回填闭环，并保留 Phase 1 的事件记录能力：
+Phase 4 First Useful Beta 已完成以 Chat 为统一入口的 Harness Agent，并保留 Phase 1—3 的记录、历史回填、关联与回顾能力：
 
 - Electron + React + TypeScript Monorepo 与安全的 Main / Preload / Renderer 边界；
 - 可创建、打开并自动恢复最近的本地工作区，支持中英文切换；
@@ -130,6 +130,19 @@ Phase 2 Alpha 已完成 Day One 历史回填闭环，并保留 Phase 1 的事件
 - Entry UUID / 稳定指纹幂等导入、追加式 SourceVersion 与逐条错误报告；
 - 可按导入批次、日期和标签限定的可恢复 Backfill，支持暂停、恢复和取消；
 - 离线确定性候选检测、来源段落定位，以及确认、忽略和无字段覆盖的合并审阅；
+- 人物别名、保守重复建议、非破坏性 canonical identity 合并与撤回；
+- 带算法版本和具体依据的事件关系建议、确认、拒绝与手工关联；
+- Event、当前 Day One SourceVersion 和未来 Transcript 契约的统一 FTS5 搜索；
+- 可插拔本地 Embedding Adapter、原子 generation 重建、RRF 混合排序与无模型降级；
+- People、Timeline、Search 和 Review 视图，以及可跳回 Event/Source 的引用；
+- 月度、季度和自定义区间的确定性回顾、过期标记与全局待补全优先级；
+- 默认完全离线的确定性 Private Agent，以及仅允许 loopback 的可选本地 OpenAI 兼容端点；
+- 默认关闭的 Enhanced Agent、HTTPS 端点约束、上下文脱敏、按新增数据类别重新确认与外发哈希审计；
+- 版本化 Tool Registry、Intent Router、受限 Context Builder、标准非流式函数调用循环与确定性失败降级；
+- Agent Run、工具调用、引用、待确认写入和模型调用审计的 SQLite v5 持久化；
+- 结构化事实、争议/未知、解释、情绪、利益、风险和可逆行动选项，以及 Event/Source/Asset 引用跳转；
+- 写入提案批准/拒绝、expected revision 冲突保护、`actor: agent` 修订和单条明确 Clarification 的对话内回答；
+- Workspace Key 派生边界内的 AES-256-GCM API 凭证加密，Renderer 只获得 `credentialConfigured` 状态；
 - lint、typecheck、unit/integration/E2E、生产构建与三平台 CI 打包基线。
 
 快速启动：
@@ -139,6 +152,6 @@ pnpm install
 pnpm dev
 ```
 
-当前版本尚不包含 Import Folder 监听、超大 ZIP 专项优化、OCR/ASR、语义检索、人物合并、外部模型和 Harness Agent；这些功能按[分阶段开发计划](docs/DEVELOPMENT_PLAN.md)继续交付。SQLite 中的事件、消息和 Day One 来源正文仍是本地未加密元数据；原始 ZIP 与二进制媒体已加密。
+当前版本尚不包含 Import Folder 监听、超大 ZIP 专项优化、OCR/ASR、内置 Embedding/LLM 模型、Case 或 Evidence 工具；这些功能按[分阶段开发计划](docs/DEVELOPMENT_PLAN.md)继续交付。应用不会分发或下载模型：Private 可连接用户已有的 loopback OpenAI 兼容服务，Enhanced 仅在用户配置 HTTPS 兼容端点并确认本次新增外发类别后启用。未注入 Embedding Adapter 时语义检索显示为不可用并完整回退关键词检索。SQLite 中的事件、消息、Day One 来源正文、Agent 派生结果和可选向量仍是本地未加密元数据；原始 ZIP 与二进制媒体已加密。
 
 > Grudge Vault 可以帮助整理材料和准备问题，但涉及法律结论时，应结合所在地、事发时点与具体事实核验有效规则，并在需要时咨询专业人士。

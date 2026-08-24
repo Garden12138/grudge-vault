@@ -1,0 +1,949 @@
+import { createHash, randomUUID } from "node:crypto";
+import { z } from "zod";
+import {
+  parseConservativeTemporalValue,
+  type GrudgeVaultApplication
+} from "@grudge-vault/application";
+import type {
+  AgentAction,
+  AgentCitation,
+  AgentDataCategory,
+  AgentIntent,
+  AgentModelCallAudit,
+  AgentModelSettings,
+  AgentRun,
+  AgentToolCall,
+  Event,
+  ExternalContextDisclosure,
+  GroundedAgentClaim,
+  Message,
+  SourceReferenceDetail,
+  StrategyAnalysis,
+  StrategyOption,
+  UnifiedSearchHit
+} from "@grudge-vault/domain";
+import {
+  AppError,
+  type AgentSendInput,
+  type AgentSendResult,
+  type AgentSettingsUpdateInput,
+  type EventWriteFields,
+  type UpdateEventInput
+} from "@grudge-vault/shared";
+
+export const AGENT_TOOL_SCHEMA_VERSION = 1;
+export const AGENT_RESPONSE_VERSION = 1;
+export const AGENT_REDACTION_POLICY_VERSION = 1;
+export const MAX_AGENT_MODEL_ROUNDS = 4;
+export const MAX_AGENT_TOOL_CALLS = 8;
+export const MAX_AGENT_CONTEXT_BYTES = 64 * 1024;
+export const MAX_AGENT_RESPONSE_BYTES = 2 * 1024 * 1024;
+
+const idSchema = z.string().trim().min(1).max(200);
+const textSchema = z.string().trim().min(1).max(20_000);
+
+export interface RegisteredAgentTool {
+  name: string;
+  version: number;
+  description: string;
+  intents: AgentIntent[];
+  write: boolean;
+  schema: z.ZodType;
+  jsonSchema: Record<string, unknown>;
+}
+
+export class AgentToolRegistry {
+  private readonly tools = new Map<string, RegisteredAgentTool>();
+
+  register(input: Omit<RegisteredAgentTool, "jsonSchema">): void {
+    if (this.tools.has(input.name)) throw new Error(`Agent tool ${input.name} is already registered.`);
+    this.tools.set(input.name, { ...input, jsonSchema: z.toJSONSchema(input.schema) as Record<string, unknown> });
+  }
+
+  definitions(intent: AgentIntent): RegisteredAgentTool[] {
+    return [...this.tools.values()].filter(({ intents }) => intents.includes(intent));
+  }
+
+  parse(intent: AgentIntent, name: string, value: unknown): { tool: RegisteredAgentTool; input: unknown } {
+    const tool = this.tools.get(name);
+    if (!tool || !tool.intents.includes(intent)) {
+      throw new AppError("AGENT_TOOL_FAILED", `Tool ${name} is not available for this Agent intent.`);
+    }
+    const result = tool.schema.safeParse(value);
+    if (!result.success) throw new AppError("AGENT_TOOL_FAILED", `Tool ${name} received invalid arguments.`);
+    return { tool, input: result.data };
+  }
+}
+
+export function createDefaultAgentToolRegistry(): AgentToolRegistry {
+  const registry = new AgentToolRegistry();
+  const add = (name: string, description: string, intents: AgentIntent[], write: boolean, schema: z.ZodType) =>
+    registry.register({ name, version: 1, description, intents, write, schema });
+  add("record_source", "Confirm that the current conversation message is preserved as a local source.", ["record"], false, z.object({}));
+  add("propose_event", "Propose a candidate Event for user approval.", ["record"], true, z.object({
+    title: z.string().trim().min(1).max(120), narrative: textSchema,
+    occurredAtText: z.string().trim().max(200).optional()
+  }));
+  add("update_event", "Propose a revision to an existing Event for user approval.", ["record", "clarify"], true, z.object({
+    eventRef: idSchema, expectedRevision: z.number().int().positive(),
+    narrative: z.string().trim().max(100_000).optional(), fact: z.string().trim().max(10_000).optional()
+  }));
+  add("answer_clarification", "Propose an answer to an open Clarification.", ["clarify"], true, z.object({
+    clarificationRef: idSchema, expectedRevision: z.number().int().positive(), answer: textSchema
+  }));
+  add("add_asset", "Propose linking an existing Asset to an Event.", ["record"], true, z.object({
+    eventRef: idSchema, assetRef: idSchema, expectedRevision: z.number().int().positive()
+  }));
+  add("search_events", "Search Event and Source memory.", ["retrieve", "review", "strategy"], false, z.object({ query: textSchema }));
+  add("get_event", "Read one Event and its structured fields.", ["retrieve", "review", "strategy", "clarify"], false,
+    z.object({ eventRef: idSchema }));
+  add("get_sources", "Read bounded excerpts for known Source references.", ["retrieve", "review", "strategy"], false,
+    z.object({ sourceRefs: z.array(idSchema).min(1).max(8) }));
+  add("get_person_history", "Read the timeline for one canonical Person.", ["retrieve", "review", "strategy"], false,
+    z.object({ personRef: idSchema }));
+  add("find_related_events", "Read accepted and suggested relations for an Event.", ["retrieve", "review", "strategy"], false,
+    z.object({ eventRef: idSchema }));
+  add("build_timeline", "Build a filtered local Event timeline.", ["review", "strategy"], false, z.object({
+    from: z.iso.date().optional(), to: z.iso.date().optional(), personRef: idSchema.optional()
+  }));
+  add("list_clarifications", "List open Clarifications.", ["clarify", "review", "strategy"], false,
+    z.object({ eventRef: idSchema.optional() }));
+  add("summarize_period", "Generate a deterministic, source-linked period Review.", ["review", "strategy"], false,
+    z.object({ from: z.iso.date(), to: z.iso.date() }));
+  add("analyze_event", "Build a fact/unknown/interpretation/interest analysis from local memory.", ["strategy"], false,
+    z.object({ eventRefs: z.array(idSchema).min(1).max(8) }));
+  add("compare_options", "Validate a structured set of possible actions without choosing for the user.", ["strategy"], false,
+    z.object({ options: z.array(z.object({ title: z.string().trim().min(1).max(120), description: textSchema })).min(2).max(6) }));
+  add("create_action_plan", "Create a reversible sequence of proposed next steps.", ["strategy"], false,
+    z.object({ steps: z.array(z.string().trim().min(1).max(500)).min(1).max(10) }));
+  return registry;
+}
+
+export function exportAgentToolSchemasV1(intent?: AgentIntent): Array<{
+  name: string;
+  version: 1;
+  description: string;
+  intents: AgentIntent[];
+  write: boolean;
+  schema: Record<string, unknown>;
+}> {
+  const registry = createDefaultAgentToolRegistry();
+  const tools = intent ? registry.definitions(intent) : (["record", "retrieve", "review", "clarify", "strategy"] as const)
+    .flatMap((value) => registry.definitions(value))
+    .filter((tool, index, all) => all.findIndex(({ name }) => name === tool.name) === index);
+  return tools.map(({ name, description, intents, write, jsonSchema }) => ({
+    name, version: 1, description, intents, write, schema: jsonSchema
+  }));
+}
+
+export function routeAgentIntent(content: string): AgentIntent {
+  const text = content.normalize("NFKC").toLocaleLowerCase("en-US");
+  if (/补全|澄清|回答.*问题|clarif|fill.*gap|answer.*question/.test(text)) return "clarify";
+  if (/复盘|回顾|月度|季度|这一年|timeline|review|summar/.test(text)) return "review";
+  if (/策略|怎么办|行动|选项|风险|利弊|归属|strategy|option|risk|what should/.test(text)) return "strategy";
+  if (/^(?:请)?(?:记录|记下)|^record\b|保存.*事件|发生了|remember|save.*event/.test(text)) return "record";
+  if (/查找|检索|查询|历史|retrieve|search|find|history/.test(text)) return "retrieve";
+  return "retrieve";
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function redactExternalText(content: string, personNames: string[] = []): string {
+  let output = content;
+  personNames.sort((a, b) => b.length - a.length).forEach((name, index) => {
+    if (name.trim()) output = output.replace(new RegExp(escapeRegExp(name), "giu"), `Person-${index + 1}`);
+  });
+  return output
+    .replace(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g, "[email]")
+    .replace(/(?:\+?\d[\d\s().-]{7,}\d)/g, "[phone-or-account]")
+    .replace(/(?:[A-Za-z]:[\\/]|\/Users\/|\/home\/)[^\s]+/g, "[local-path]")
+    .replace(/\b[^\s/\\]+\.(?:pdf|docx?|xlsx?|pptx?|jpe?g|png|gif|webp|heic|mp3|m4a|wav|mp4|mov|zip|json|txt|md)\b/giu,
+      "[file-name]")
+    .replace(/\b\d{8,}\b/g, "[account]");
+}
+
+function truncateUtf8(value: string, byteLimit: number): string {
+  if (Buffer.byteLength(value, "utf8") <= byteLimit) return value;
+  let low = 0;
+  let high = value.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(value.slice(0, middle), "utf8") <= byteLimit) low = middle;
+    else high = middle - 1;
+  }
+  return value.slice(0, low);
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+interface ChatToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+}
+
+const chatCompletionSchema = z.object({
+  model: z.string().optional(),
+  choices: z.array(z.object({ message: z.object({
+    role: z.literal("assistant"), content: z.string().nullable().optional(),
+    tool_calls: z.array(z.object({
+      id: z.string(), type: z.literal("function"), function: z.object({ name: z.string(), arguments: z.string() })
+    })).optional()
+  }) })).min(1),
+  usage: z.object({ prompt_tokens: z.number().int().nonnegative().optional(), completion_tokens: z.number().int().nonnegative().optional() }).optional()
+});
+
+export interface AgentModelAdapterRequest {
+  baseUrl: string;
+  model: string;
+  apiKey?: string;
+  system: string;
+  user: string;
+  tools: RegisteredAgentTool[];
+  executeTool(name: string, input: unknown, providerCallId: string): Promise<unknown>;
+}
+
+export interface AgentModelAdapterResult {
+  text?: string;
+  model: string;
+  promptTokens?: number;
+  completionTokens?: number;
+}
+
+export interface AgentModelAdapterPort {
+  readonly identity: string;
+  readonly version: number;
+  run(input: AgentModelAdapterRequest): Promise<AgentModelAdapterResult>;
+}
+
+type FetchResponse = Awaited<ReturnType<typeof globalThis.fetch>>;
+
+async function readBoundedResponse(response: FetchResponse): Promise<string> {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_AGENT_RESPONSE_BYTES) {
+    throw new AppError("AGENT_MODEL_UNAVAILABLE", "The model response exceeded the local safety limit.");
+  }
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      total += value.byteLength;
+      if (total > MAX_AGENT_RESPONSE_BYTES) {
+        await reader.cancel();
+        throw new AppError("AGENT_MODEL_UNAVAILABLE", "The model response exceeded the local safety limit.");
+      }
+      chunks.push(value);
+    }
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return new globalThis.TextDecoder().decode(bytes);
+}
+
+export class OpenAiCompatibleChatAdapter implements AgentModelAdapterPort {
+  readonly identity = "openai-compatible.chat-completions";
+  readonly version = 1;
+
+  constructor(
+    private readonly fetcher: typeof globalThis.fetch = globalThis.fetch,
+    private readonly requestTimeoutMs = 60_000
+  ) {}
+
+  async run(input: AgentModelAdapterRequest): Promise<AgentModelAdapterResult> {
+    const messages: Array<Record<string, unknown>> = [
+      { role: "system", content: input.system }, { role: "user", content: input.user }
+    ];
+    let toolCalls = 0;
+    let promptTokens: number | undefined;
+    let completionTokens: number | undefined;
+    let returnedModel = input.model;
+    for (let round = 0; round < MAX_AGENT_MODEL_ROUNDS; round += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+      let response: FetchResponse;
+      try {
+        response = await this.fetcher(`${input.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+          method: "POST", redirect: "error", signal: controller.signal,
+          headers: {
+            "content-type": "application/json",
+            ...(input.apiKey ? { authorization: `Bearer ${input.apiKey}` } : {})
+          },
+          body: JSON.stringify({
+            model: input.model, messages, stream: false, tool_choice: "auto",
+            tools: input.tools.map((tool) => ({
+              type: "function", function: { name: tool.name, description: tool.description, parameters: tool.jsonSchema }
+            }))
+          })
+        });
+      } catch (cause) {
+        throw new AppError("AGENT_MODEL_UNAVAILABLE", "The configured model endpoint could not be reached.", true, { cause });
+      } finally {
+        clearTimeout(timeout);
+      }
+      if (!response.ok) throw new AppError("AGENT_MODEL_UNAVAILABLE", `The model endpoint returned HTTP ${response.status}.`, response.status >= 500 || response.status === 429);
+      let value: z.infer<typeof chatCompletionSchema>;
+      try {
+        value = chatCompletionSchema.parse(JSON.parse(await readBoundedResponse(response)));
+      } catch (cause) {
+        if (cause instanceof AppError) throw cause;
+        throw new AppError("AGENT_MODEL_UNAVAILABLE", "The model endpoint returned an invalid Chat Completions response.", false, { cause });
+      }
+      returnedModel = value.model ?? returnedModel;
+      promptTokens = value.usage?.prompt_tokens ?? promptTokens;
+      completionTokens = value.usage?.completion_tokens ?? completionTokens;
+      const message = value.choices[0]!.message;
+      const calls = (message.tool_calls ?? []) as ChatToolCall[];
+      if (calls.length === 0) {
+        return {
+          model: returnedModel,
+          ...(message.content ? { text: message.content } : {}),
+          ...(promptTokens !== undefined ? { promptTokens } : {}),
+          ...(completionTokens !== undefined ? { completionTokens } : {})
+        };
+      }
+      toolCalls += calls.length;
+      if (toolCalls > MAX_AGENT_TOOL_CALLS) throw new AppError("AGENT_TOOL_FAILED", "The model exceeded the Agent tool-call limit.");
+      messages.push({ role: "assistant", content: message.content ?? null, tool_calls: calls });
+      for (const call of calls) {
+        let argumentsValue: unknown;
+        try { argumentsValue = JSON.parse(call.function.arguments); }
+        catch (cause) { throw new AppError("AGENT_TOOL_FAILED", "The model returned invalid tool arguments.", false, { cause }); }
+        const output = await input.executeTool(call.function.name, argumentsValue, call.id);
+        messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(output) });
+      }
+    }
+    throw new AppError("AGENT_TOOL_FAILED", "The model exceeded the Agent round limit.");
+  }
+}
+
+interface AgentSnapshot {
+  context: string;
+  contextHash: string;
+  categories: AgentDataCategory[];
+  categoryCounts: Partial<Record<AgentDataCategory, number>>;
+  events: Event[];
+  sources: SourceReferenceDetail[];
+  hits: UnifiedSearchHit[];
+  citations: AgentCitation[];
+  aliases: Map<string, string>;
+  personNames: string[];
+}
+
+function eventCitation(event: Event): AgentCitation {
+  return { id: `citation:event:${event.id}`, kind: "event", targetId: event.id, label: event.title, available: true };
+}
+
+function sourceCitation(source: SourceReferenceDetail): AgentCitation {
+  return {
+    id: `citation:source:${source.sourceItemId}`, kind: source.kind === "transcript" ? "transcript" : "source",
+    targetId: source.sourceItemId, label: source.title, excerpt: source.excerpt.slice(0, 240), available: true
+  };
+}
+
+function claim(
+  text: string,
+  citationIds: string[],
+  kind?: NonNullable<GroundedAgentClaim["kind"]>
+): GroundedAgentClaim {
+  return { id: randomUUID(), text, citationIds: [...new Set(citationIds)], ...(kind ? { kind } : {}) };
+}
+
+function eventClaimCitations(event: Event, citationByTarget: Map<string, AgentCitation>, sourceRefs: string[] = []): string[] {
+  const sourceCitations = sourceRefs.map((id) => citationByTarget.get(id)?.id).filter((id): id is string => Boolean(id));
+  return sourceCitations.length ? sourceCitations : [citationByTarget.get(event.id)?.id].filter((id): id is string => Boolean(id));
+}
+
+function buildDeterministicAnalysis(app: GrudgeVaultApplication, snapshot: AgentSnapshot): StrategyAnalysis {
+  const citationByTarget = new Map(snapshot.citations.map((citation) => [citation.targetId, citation]));
+  const confirmedFacts: GroundedAgentClaim[] = [];
+  const disputedOrUnknown: GroundedAgentClaim[] = [];
+  const interpretations: GroundedAgentClaim[] = [];
+  const emotions: GroundedAgentClaim[] = [];
+  const interests: GroundedAgentClaim[] = [];
+  const historicalPatterns: GroundedAgentClaim[] = [];
+  const risks: GroundedAgentClaim[] = [];
+  const suggestedQuestions: string[] = [];
+  for (const event of snapshot.events) {
+    for (const item of event.facts) {
+      const target = item.kind === "fact.confirmed" ? confirmedFacts : disputedOrUnknown;
+      target.push(claim(item.text, eventClaimCitations(event, citationByTarget, item.sourceRefs), item.kind));
+    }
+    for (const item of event.interpretations) interpretations.push(claim(
+      item.text, eventClaimCitations(event, citationByTarget, item.sourceRefs), item.kind
+    ));
+    for (const item of event.emotions) emotions.push(claim(
+      item.label, eventClaimCitations(event, citationByTarget, item.sourceRefs), "emotion"
+    ));
+    for (const item of event.interests) interests.push(claim(item.description ? `${item.label}: ${item.description}` : item.label,
+      eventClaimCitations(event, citationByTarget, item.sourceRefs)));
+    const detail = app.getEvent(event.id);
+    for (const clarification of detail.clarifications.filter(({ status }) => status === "open")) suggestedQuestions.push(clarification.question);
+    if (detail.clarifications.some(({ status }) => status === "open")) {
+      risks.push(claim(`事件“${event.title}”仍有待补全信息。`, eventClaimCitations(event, citationByTarget)));
+    }
+    const relations = app.listEventRelations(event.id).filter(({ status }) => status !== "rejected");
+    for (const relation of relations.slice(0, 3)) {
+      historicalPatterns.push(claim(
+        relation.basis.map(({ label }) => label).join("；") || `存在 ${relation.kind} 关系。`,
+        eventClaimCitations(event, citationByTarget, relation.basis.flatMap(({ sourceRefs }) => sourceRefs))
+      ));
+    }
+  }
+  const materials = snapshot.sources.map((source) => claim(source.title, [sourceCitation(source).id]));
+  const baseCitationIds = snapshot.citations.slice(0, 4).map(({ id }) => id);
+  const options: StrategyOption[] = snapshot.events.length ? [
+    {
+      id: randomUUID(), title: "先补全未知信息", description: "逐项回答待补全问题，再判断后续行动。",
+      benefits: ["减少基于缺失信息做决定的风险"], costs: ["需要额外时间核对"], risks: [],
+      unknowns: suggestedQuestions.slice(0, 4), reversible: true, citationIds: baseCitationIds
+    },
+    {
+      id: randomUUID(), title: "整理并保留现有来源", description: "先确认相关记录和原始材料仍可访问。",
+      benefits: ["提高后续沟通和复盘的可核验性"], costs: ["需要检查来源完整性"],
+      risks: ["材料可能仍不足以支持所有解释"], unknowns: [], reversible: true, citationIds: baseCitationIds
+    },
+    {
+      id: randomUUID(), title: "准备一次事实导向的沟通", description: "只使用已确认事实、争议点和明确问题组织沟通。",
+      benefits: ["降低事实与判断混写"], costs: ["需要准备并选择合适时机"],
+      risks: ["对方反应仍不可预测"], unknowns: ["沟通对象与期望结果需要用户决定"], reversible: true, citationIds: baseCitationIds
+    }
+  ] : [];
+  return {
+    confirmedFacts, disputedOrUnknown,
+    materials, interpretations, emotions, interests,
+    historicalPatterns: [...new Map(historicalPatterns.map((item) => [item.text, item])).values()],
+    risks, options,
+    actionPlan: snapshot.events.length ? [
+      "先打开引用，核对事实、未知项和材料是否完整。",
+      ...(suggestedQuestions.length ? ["逐项回答仍然开放的待补全问题。"] : []),
+      "比较可逆选项，再由用户选择是否采取行动。"
+    ] : [],
+    suggestedQuestions: [...new Set(suggestedQuestions)]
+  };
+}
+
+function deterministicResponse(intent: AgentIntent, snapshot: AgentSnapshot, actions: AgentAction[], english: boolean): string {
+  if (english) {
+    if (intent === "record") return actions.length ? "I preserved your message and prepared a candidate Event for approval." : "I preserved your message as a local source.";
+    if (intent === "clarify" && actions.some(({ status }) => status === "approved")) return "I saved this direct answer to the single clarification that was shown, with your message as its source.";
+    if (snapshot.events.length === 0) return "I could not find a matching local Event. I have not filled in any missing details.";
+    if (intent === "strategy") return `I found ${snapshot.events.length} grounded Event(s). The analysis separates facts, unknowns, interpretations, risks, and reversible options.`;
+    if (intent === "review") return `I found ${snapshot.events.length} Event(s) for this review. Every factual item below links back to local memory.`;
+    return `I found ${snapshot.events.length} matching Event(s) with source-linked citations.`;
+  }
+  if (intent === "record") return actions.length ? "我已保存原始消息，并准备了一条待确认的候选事件。" : "我已将这条消息保存为本地来源。";
+  if (intent === "clarify" && actions.some(({ status }) => status === "approved")) return "我已把这条直接回复写入刚才明确展示的单个待补全问题，并保留了原始消息作为依据。";
+  if (snapshot.events.length === 0) return "没有找到匹配的本地事件；我没有补造缺失信息。";
+  if (intent === "strategy") return `找到 ${snapshot.events.length} 条有依据的事件。下面将事实、未知、解释、风险和可逆行动选项分开呈现。`;
+  if (intent === "review") return `找到 ${snapshot.events.length} 条用于本次回顾的事件；下列事实均可跳回本地来源。`;
+  return `找到 ${snapshot.events.length} 条匹配事件，并附上可跳转的本地引用。`;
+}
+
+export interface AgentHarnessOptions {
+  modelAdapter?: AgentModelAdapterPort;
+}
+
+export class AgentHarness {
+  private readonly registry = createDefaultAgentToolRegistry();
+  private readonly modelAdapter: AgentModelAdapterPort;
+
+  constructor(private readonly application: GrudgeVaultApplication, options: AgentHarnessOptions = {}) {
+    this.modelAdapter = options.modelAdapter ?? new OpenAiCompatibleChatAdapter();
+  }
+
+  async send(input: AgentSendInput): Promise<AgentSendResult> {
+    const userMessage = this.application.recordConversationMessage(input.conversationId, "user", input.content);
+    let intent = routeAgentIntent(input.content);
+    const previousRun = this.application.listAgentRuns(input.conversationId).at(-1);
+    const recentMessages = this.application.listMessages(input.conversationId);
+    if (intent === "retrieve" && previousRun?.assistantMessageId === recentMessages.at(-2)?.id &&
+      previousRun?.analysis?.suggestedQuestions.length === 1) intent = "clarify";
+    const settings = this.application.getAgentSettings();
+    const snapshot = await this.buildSnapshot(input.conversationId, input.content, intent);
+    const endpoint = settings.mode === "private" ? settings.privateEndpoint : settings.enhancedEndpoint;
+    const missing = settings.mode === "enhanced" && endpoint
+      ? snapshot.categories.filter((category) => !settings.consentedDataCategories.includes(category)) : [];
+    const now = new Date().toISOString();
+    const disclosure: ExternalContextDisclosure | undefined = settings.mode === "enhanced" && endpoint ? {
+      id: randomUUID(), runId: "", policyVersion: AGENT_REDACTION_POLICY_VERSION,
+      categories: snapshot.categories, categoryCounts: snapshot.categoryCounts, contextHash: snapshot.contextHash,
+      required: missing.length > 0, createdAt: now
+    } : undefined;
+    let run: AgentRun = {
+      id: randomUUID(), conversationId: input.conversationId, userMessageId: userMessage.id, intent,
+      mode: settings.mode, status: disclosure?.required ? "awaiting_consent" : "running",
+      ...(endpoint ? { modelIdentity: this.modelAdapter.identity, modelVersion: this.modelAdapter.version } : {}),
+      toolSchemaVersion: AGENT_TOOL_SCHEMA_VERSION, contextHash: snapshot.contextHash,
+      responseVersion: AGENT_RESPONSE_VERSION, citations: snapshot.citations, toolCalls: [], actions: [], createdAt: now
+    };
+    if (disclosure) run = { ...run, disclosure: { ...disclosure, runId: run.id } };
+    run = this.application.saveAgentRun(run);
+    if (run.status === "awaiting_consent") return { run, userMessage };
+    return this.execute(run, userMessage, snapshot, settings);
+  }
+
+  async resume(runId: string, disclosureId: string): Promise<AgentSendResult> {
+    let run = this.application.getAgentRun(runId);
+    if (run.status !== "awaiting_consent" || !run.disclosure || run.disclosure.id !== disclosureId) {
+      throw new AppError("AGENT_RUN_STATE_CONFLICT", "This Agent run is not waiting for that disclosure.");
+    }
+    const acceptedAt = new Date().toISOString();
+    run = this.application.saveAgentRun({
+      ...run, status: "running", disclosure: { ...run.disclosure, acceptedAt }
+    });
+    const settings = this.application.getAgentSettings();
+    this.application.updateAgentSettings({
+      mode: settings.mode,
+      consentedDataCategories: [...new Set([...settings.consentedDataCategories, ...run.disclosure!.categories])]
+    });
+    const userMessage = this.application.listMessages(run.conversationId).find(({ id }) => id === run.userMessageId);
+    if (!userMessage?.content) throw new AppError("ENTITY_NOT_FOUND", "The Agent user message no longer exists.");
+    const snapshot = await this.buildSnapshot(run.conversationId, userMessage.content, run.intent);
+    const refreshedSettings = this.application.getAgentSettings();
+    const newlyRequired = snapshot.categories.filter(
+      (category) => !refreshedSettings.consentedDataCategories.includes(category)
+    );
+    if (refreshedSettings.mode === "enhanced" && newlyRequired.length > 0) {
+      const disclosure: ExternalContextDisclosure = {
+        id: randomUUID(), runId: run.id, policyVersion: AGENT_REDACTION_POLICY_VERSION,
+        categories: snapshot.categories, categoryCounts: snapshot.categoryCounts,
+        contextHash: snapshot.contextHash, required: true, createdAt: new Date().toISOString()
+      };
+      run = this.application.saveAgentRun({ ...run, status: "awaiting_consent", disclosure });
+      return { run, userMessage };
+    }
+    return this.execute(run, userMessage, snapshot, refreshedSettings);
+  }
+
+  cancel(runId: string): AgentRun {
+    const run = this.application.getAgentRun(runId);
+    if (!["awaiting_consent", "running"].includes(run.status)) {
+      throw new AppError("AGENT_RUN_STATE_CONFLICT", "Only an unfinished Agent run can be cancelled.");
+    }
+    const now = new Date().toISOString();
+    return this.application.saveAgentRun({
+      ...run, status: "cancelled", completedAt: now,
+      ...(run.disclosure && !run.disclosure.acceptedAt ? { disclosure: { ...run.disclosure, rejectedAt: now } } : {})
+    });
+  }
+
+  listRuns(conversationId: string): AgentRun[] { return this.application.listAgentRuns(conversationId); }
+  getRun(runId: string): AgentRun { return this.application.getAgentRun(runId); }
+  getSettings(): AgentModelSettings { return this.application.getAgentSettings(); }
+  updateSettings(input: AgentSettingsUpdateInput): AgentModelSettings { return this.application.updateAgentSettings(input); }
+  clearCredential(mode: AgentModelSettings["mode"]): AgentModelSettings { return this.application.clearAgentCredential(mode); }
+
+  approveAction(actionId: string): AgentAction {
+    const run = this.findRunByAction(actionId);
+    const action = run.actions.find(({ id }) => id === actionId)!;
+    if (action.status !== "pending") throw new AppError("AGENT_ACTION_CONFLICT", "This Agent action is no longer pending.");
+    const sourceRef = this.application.listMessages(run.conversationId).find(({ id }) => id === run.userMessageId)?.sourceItemId;
+    if (!sourceRef) throw new AppError("ENTITY_NOT_FOUND", "The source message for this Agent action no longer exists.");
+    const now = new Date().toISOString();
+    let nextAction: AgentAction;
+    try {
+      let result: Event;
+      if (action.toolName === "propose_event") {
+        result = this.application.proposeAgentEvent(action.payload as EventWriteFields, sourceRef);
+      } else if (action.toolName === "update_event" || action.toolName === "add_asset") {
+        result = this.application.updateEventFromAgent(action.payload as UpdateEventInput, sourceRef);
+      } else if (action.toolName === "answer_clarification") {
+        const input = action.payload as { clarificationId: string; answer: string; expectedRevision: number };
+        result = this.application.answerClarificationFromAgent(input.clarificationId, input.answer, input.expectedRevision, sourceRef);
+      } else throw new AppError("AGENT_TOOL_FAILED", "The stored Agent action uses an unsupported tool.");
+      nextAction = { ...action, status: "approved", resultRefs: [result.id], resolvedAt: now };
+    } catch (error) {
+      const code = error instanceof AppError ? error.code : "INTERNAL_ERROR";
+      nextAction = {
+        ...action, status: code === "EVENT_REVISION_CONFLICT" ? "stale" : "failed",
+        errorCode: code, resolvedAt: now
+      };
+    }
+    const toolCalls = run.toolCalls.map((call) => call.id === action.toolCallId ? {
+      ...call, status: nextAction.status === "approved" ? "succeeded" as const : "failed" as const,
+      outputRefs: nextAction.resultRefs, finishedAt: now,
+      ...(nextAction.errorCode ? { errorCode: nextAction.errorCode } : {})
+    } : call);
+    this.application.saveAgentRun({
+      ...run, toolCalls, actions: run.actions.map((value) => value.id === actionId ? nextAction : value)
+    });
+    return nextAction;
+  }
+
+  rejectAction(actionId: string): AgentAction {
+    const run = this.findRunByAction(actionId);
+    const action = run.actions.find(({ id }) => id === actionId)!;
+    if (action.status !== "pending") throw new AppError("AGENT_ACTION_CONFLICT", "This Agent action is no longer pending.");
+    const next = { ...action, status: "rejected" as const, resolvedAt: new Date().toISOString() };
+    this.application.saveAgentRun({
+      ...run, actions: run.actions.map((value) => value.id === actionId ? next : value),
+      toolCalls: run.toolCalls.map((call) => call.id === action.toolCallId ? {
+        ...call, status: "failed" as const, errorCode: "AGENT_ACTION_CONFLICT", finishedAt: next.resolvedAt
+      } : call)
+    });
+    return next;
+  }
+
+  private findRunByAction(actionId: string): AgentRun {
+    for (const conversation of this.application.listConversations()) {
+      const run = this.application.listAgentRuns(conversation.id).find(({ actions }) => actions.some(({ id }) => id === actionId));
+      if (run) return run;
+    }
+    throw new AppError("ENTITY_NOT_FOUND", "The Agent action no longer exists.");
+  }
+
+  private async execute(
+    initialRun: AgentRun,
+    userMessage: Message,
+    snapshot: AgentSnapshot,
+    settings: AgentModelSettings
+  ): Promise<AgentSendResult> {
+    let run = initialRun;
+    const now = new Date().toISOString();
+    const initialCall: AgentToolCall = {
+      id: randomUUID(), runId: run.id, sequence: 0,
+      toolName: run.intent === "record" ? "record_source" : "search_events", toolVersion: 1,
+      inputHash: sha256(userMessage.content ?? ""), inputRefs: [userMessage.sourceItemId],
+      outputRefs: snapshot.events.map(({ id }) => id), status: "succeeded", startedAt: now, finishedAt: now
+    };
+    run = { ...run, status: "running", toolCalls: [initialCall], citations: snapshot.citations };
+    const endpoint = settings.mode === "private" ? settings.privateEndpoint : settings.enhancedEndpoint;
+    if (run.intent === "record" && userMessage.content && !endpoint) run = this.addRecordProposal(run, userMessage.content);
+    if (run.intent === "clarify" && userMessage.content) run = this.answerDisplayedClarification(run, userMessage);
+    this.application.saveAgentRun(run);
+
+    let modelText: string | undefined;
+    let degradedError: string | undefined;
+    if (endpoint) {
+      const audit: AgentModelCallAudit = {
+        id: randomUUID(), runId: run.id, sequence: this.application.listAgentModelCallAudits(run.id).length,
+        endpointOrigin: new URL(endpoint.baseUrl).origin, model: endpoint.model,
+        categories: snapshot.categories, contextHash: snapshot.contextHash, status: "running",
+        startedAt: new Date().toISOString()
+      };
+      this.application.saveAgentModelCallAudit(audit);
+      try {
+        const credential = this.application.getAgentCredential(settings.mode);
+        const result = await this.modelAdapter.run({
+          baseUrl: endpoint.baseUrl, model: endpoint.model, ...(credential ? { apiKey: credential } : {}),
+          system: "Use only the registered tools. Keep unknowns unknown. Never present an uncited claim as a confirmed fact. Offer options; do not decide for the user.",
+          user: snapshot.context, tools: this.registry.definitions(run.intent),
+          executeTool: async (name, value, providerCallId) => {
+            const executed = await this.executeModelTool(run, snapshot, name, value, providerCallId);
+            run = executed.run;
+            this.application.saveAgentRun(run);
+            return executed.output;
+          }
+        });
+        modelText = result.text?.trim();
+        this.application.saveAgentModelCallAudit({
+          ...audit, status: "succeeded", finishedAt: new Date().toISOString(),
+          ...(result.promptTokens !== undefined ? { promptTokens: result.promptTokens } : {}),
+          ...(result.completionTokens !== undefined ? { completionTokens: result.completionTokens } : {})
+        });
+      } catch (error) {
+        degradedError = error instanceof AppError ? error.code : "INTERNAL_ERROR";
+        this.application.saveAgentModelCallAudit({
+          ...audit, status: "failed", errorCode: degradedError, finishedAt: new Date().toISOString()
+        });
+      }
+    }
+    const analysis = buildDeterministicAnalysis(this.application, snapshot);
+    if (modelText) analysis.interpretations.push(claim(modelText, [], "interpretation.agent"));
+    if (run.intent === "record" && userMessage.content && degradedError && run.actions.length === 0) {
+      run = this.addRecordProposal(run, userMessage.content);
+    }
+    const english = !/[\p{Script=Han}]/u.test(userMessage.content ?? "");
+    const responseText = modelText || deterministicResponse(run.intent, snapshot, run.actions, english);
+    const assistantMessage = this.application.recordConversationMessage(run.conversationId, "assistant", responseText);
+    run = this.application.saveAgentRun({
+      ...run, assistantMessageId: assistantMessage.id, status: "succeeded", responseText, analysis,
+      citations: snapshot.citations, completedAt: new Date().toISOString(),
+      ...(degradedError ? { errorCode: degradedError } : {})
+    });
+    return { run, userMessage, assistantMessage };
+  }
+
+  private addRecordProposal(run: AgentRun, content: string): AgentRun {
+    const title = content.split(/[。！？.!?\n]/, 1)[0]?.trim().slice(0, 120) || content.slice(0, 120);
+    const fields: EventWriteFields = {
+      title, status: "candidate", occurredAt: parseConservativeTemporalValue(content), narrative: content,
+      facts: [], interpretations: [], emotions: [], interests: [], participants: [], sourceRefs: [], assetRefs: []
+    };
+    const call: AgentToolCall = {
+      id: randomUUID(), runId: run.id, sequence: run.toolCalls.length, toolName: "propose_event", toolVersion: 1,
+      inputHash: sha256(JSON.stringify(fields)), inputRefs: [run.userMessageId], outputRefs: [], status: "proposed",
+      startedAt: new Date().toISOString()
+    };
+    const action: AgentAction = {
+      id: randomUUID(), runId: run.id, toolCallId: call.id, toolName: call.toolName, toolVersion: 1,
+      summary: `创建候选事件：${title}`, payload: fields, status: "pending", resultRefs: [], createdAt: call.startedAt
+    };
+    return { ...run, toolCalls: [...run.toolCalls, call], actions: [...run.actions, action] };
+  }
+
+  private answerDisplayedClarification(run: AgentRun, userMessage: Message): AgentRun {
+    const previousRun = this.application.listAgentRuns(run.conversationId)
+      .filter(({ id }) => id !== run.id).at(-1);
+    const question = previousRun?.analysis?.suggestedQuestions.length === 1
+      ? previousRun.analysis.suggestedQuestions[0] : undefined;
+    if (!question || previousRun?.assistantMessageId !== this.application.listMessages(run.conversationId).at(-2)?.id) return run;
+    const open = this.application.listClarifications().filter((item) => item.status === "open" && item.question === question);
+    if (open.length !== 1) return run;
+    const clarification = open[0]!;
+    const event = this.application.getEvent(clarification.eventId).event;
+    const now = new Date().toISOString();
+    const result = this.application.answerClarificationFromAgent(
+      clarification.id, userMessage.content!, event.currentRevision, userMessage.sourceItemId
+    );
+    const call: AgentToolCall = {
+      id: randomUUID(), runId: run.id, sequence: run.toolCalls.length,
+      toolName: "answer_clarification", toolVersion: 1,
+      inputHash: sha256(userMessage.content!), inputRefs: [clarification.id, userMessage.sourceItemId],
+      outputRefs: [result.id], status: "succeeded", startedAt: now, finishedAt: now
+    };
+    const action: AgentAction = {
+      id: randomUUID(), runId: run.id, toolCallId: call.id, toolName: call.toolName, toolVersion: 1,
+      summary: "回答一条当前明确展示的待补全问题", payload: {
+        clarificationId: clarification.id, expectedRevision: event.currentRevision
+      }, expectedRevision: event.currentRevision, status: "approved", resultRefs: [result.id],
+      createdAt: now, resolvedAt: now
+    };
+    return { ...run, toolCalls: [...run.toolCalls, call], actions: [...run.actions, action] };
+  }
+
+  private async executeModelTool(
+    run: AgentRun,
+    snapshot: AgentSnapshot,
+    name: string,
+    rawInput: unknown,
+    providerCallId: string
+  ): Promise<{ run: AgentRun; output: unknown }> {
+    const { tool, input } = this.registry.parse(run.intent, name, rawInput);
+    const now = new Date().toISOString();
+    const call: AgentToolCall = {
+      id: randomUUID(), runId: run.id, sequence: run.toolCalls.length, toolName: name, toolVersion: tool.version,
+      inputHash: sha256(JSON.stringify(input)), inputRefs: [], outputRefs: [], status: tool.write ? "proposed" : "running",
+      startedAt: now
+    };
+    if (run.toolCalls.length >= MAX_AGENT_TOOL_CALLS + 1) throw new AppError("AGENT_TOOL_FAILED", "The Agent tool-call limit was exceeded.");
+    const resolve = (ref: string): string => {
+      const resolved = snapshot.aliases.get(ref);
+      if (!resolved) throw new AppError("AGENT_TOOL_FAILED", `Reference ${ref} is not available in this Agent run.`);
+      return resolved;
+    };
+    let output: unknown;
+    let action: AgentAction | undefined;
+    const value = input as Record<string, unknown>;
+    if (name === "search_events") {
+      const hits = await this.application.unifiedSearch({ text: String(value.query), semantic: false, limit: 8 });
+      output = hits.map((hit, index) => {
+        const ref = `search_result_${index + 1}`;
+        const target = hit.eventId ?? hit.sourceItemId;
+        if (target) snapshot.aliases.set(ref, target);
+        return {
+          ref, title: redactExternalText(hit.title, snapshot.personNames),
+          excerpt: redactExternalText(hit.excerpt, snapshot.personNames).slice(0, 1000)
+        };
+      });
+      call.outputRefs = hits.flatMap((hit) => [hit.eventId, hit.sourceItemId]).filter((id): id is string => Boolean(id));
+    } else if (name === "get_event" || name === "analyze_event") {
+      const refs = name === "get_event" ? [String(value.eventRef)] : value.eventRefs as string[];
+      const events = refs.slice(0, 8).map((ref) => this.application.getEvent(resolve(ref)).event);
+      output = events.map((event) => ({
+        ref: [...snapshot.aliases.entries()].find(([, id]) => id === event.id)?.[0] ?? "event",
+        title: redactExternalText(event.title, snapshot.personNames),
+        facts: event.facts.slice(0, 8).map(({ kind, text }) => ({
+          kind, text: redactExternalText(text, snapshot.personNames).slice(0, 1000)
+        })),
+        interpretations: event.interpretations.slice(0, 8)
+          .map(({ text }) => redactExternalText(text, snapshot.personNames).slice(0, 1000)),
+        interests: event.interests.slice(0, 8)
+          .map(({ label }) => redactExternalText(label, snapshot.personNames).slice(0, 1000))
+      }));
+      call.outputRefs = events.map(({ id }) => id);
+    } else if (name === "get_sources") {
+      const sources = (value.sourceRefs as string[]).map((ref) => this.application.getSourceReference(resolve(ref)));
+      output = sources.map((source) => ({
+        title: redactExternalText(source.title, snapshot.personNames),
+        excerpt: redactExternalText(source.excerpt, snapshot.personNames).slice(0, 1000)
+      }));
+      call.outputRefs = sources.map(({ sourceItemId }) => sourceItemId);
+    } else if (name === "get_person_history") {
+      const detail = this.application.getPersonIdentity(resolve(String(value.personRef)));
+      output = { person: "Person", events: detail.events.slice(0, 8).map(({ title, occurredAt }) => ({
+        title: redactExternalText(title, snapshot.personNames), occurredAt
+      })) };
+      call.outputRefs = detail.events.slice(0, 8).map(({ id }) => id);
+    } else if (name === "find_related_events") {
+      const relations = this.application.listEventRelations(resolve(String(value.eventRef))).slice(0, 8);
+      output = relations.map(({ kind, status, basis }) => ({
+        kind, status, basis: basis.map(({ label }) => redactExternalText(label, snapshot.personNames))
+      }));
+      call.outputRefs = relations.flatMap(({ sourceEventId, targetEventId }) => [sourceEventId, targetEventId]);
+    } else if (name === "build_timeline") {
+      const timeline = this.application.queryTimeline({
+        ...(value.from ? { from: String(value.from) } : {}), ...(value.to ? { to: String(value.to) } : {}),
+        ...(value.personRef ? { personId: resolve(String(value.personRef)) } : {})
+      });
+      const events = timeline.groups.flatMap(({ label, events }) => events.map((event) => ({ label, event }))).slice(0, 8);
+      output = events.map(({ label, event }) => ({
+        label, title: redactExternalText(event.title, snapshot.personNames)
+      }));
+      call.outputRefs = events.map(({ event }) => event.id);
+    } else if (name === "list_clarifications") {
+      const clarifications = this.application.listClarifications(value.eventRef ? resolve(String(value.eventRef)) : undefined);
+      output = clarifications.filter(({ status }) => status === "open").slice(0, 8).map((item, index) => ({
+        ref: `clarification_${index + 1}`, question: redactExternalText(item.question, snapshot.personNames), priority: item.priority
+      }));
+      clarifications.slice(0, 8).forEach((item, index) => snapshot.aliases.set(`clarification_${index + 1}`, item.id));
+      call.outputRefs = clarifications.slice(0, 8).map(({ id }) => id);
+    } else if (name === "summarize_period") {
+      const review = this.application.generateReview({ from: String(value.from), to: String(value.to) });
+      output = review.patterns.slice(0, 8).map(({ title, summary }) => ({
+        title: redactExternalText(title, snapshot.personNames), summary: redactExternalText(summary, snapshot.personNames)
+      }));
+      call.outputRefs = [...review.eventIds, ...review.sourceRefs];
+    } else if (name === "compare_options" || name === "create_action_plan" || name === "record_source") {
+      output = { accepted: true, value };
+    } else {
+      let payload: unknown;
+      let summary: string;
+      let expectedRevision: number | undefined;
+      if (name === "propose_event") {
+        const narrative = String(value.narrative);
+        payload = {
+          title: String(value.title), status: "candidate", occurredAt: parseConservativeTemporalValue(String(value.occurredAtText ?? narrative)),
+          narrative, facts: [], interpretations: [], emotions: [], interests: [], participants: [], sourceRefs: [], assetRefs: []
+        } satisfies EventWriteFields;
+        summary = `创建候选事件：${String(value.title)}`;
+      } else if (name === "update_event") {
+        const event = this.application.getEvent(resolve(String(value.eventRef))).event;
+        expectedRevision = Number(value.expectedRevision);
+        payload = {
+          ...event, eventId: event.id, expectedRevision,
+          ...(value.narrative ? { narrative: String(value.narrative) } : {}),
+          facts: value.fact ? [...event.facts, {
+            id: randomUUID(), kind: "fact.unknown" as const, text: String(value.fact), sourceRefs: []
+          }] : event.facts,
+          reason: "Agent update approved by user"
+        } satisfies UpdateEventInput;
+        summary = `更新事件：${event.title}`;
+      } else if (name === "answer_clarification") {
+        const clarificationId = resolve(String(value.clarificationRef));
+        expectedRevision = Number(value.expectedRevision);
+        payload = { clarificationId, answer: String(value.answer), expectedRevision };
+        summary = "回答一条待补全问题";
+      } else if (name === "add_asset") {
+        const event = this.application.getEvent(resolve(String(value.eventRef))).event;
+        const assetId = resolve(String(value.assetRef));
+        expectedRevision = Number(value.expectedRevision);
+        payload = {
+          ...event, eventId: event.id, expectedRevision,
+          assetRefs: [...new Set([...event.assetRefs, assetId])], reason: "Agent asset link approved by user"
+        } satisfies UpdateEventInput;
+        summary = `关联材料到事件：${event.title}`;
+      } else throw new AppError("AGENT_TOOL_FAILED", `Tool ${name} has no executor.`);
+      action = {
+        id: randomUUID(), runId: run.id, toolCallId: call.id, toolName: name, toolVersion: tool.version,
+        summary, payload, status: "pending", resultRefs: [], createdAt: now,
+        ...(expectedRevision ? { expectedRevision } : {})
+      };
+      output = { proposed: true, actionId: action.id, summary, providerCallId };
+    }
+    const finishedAt = new Date().toISOString();
+    const completedCall = { ...call, status: tool.write ? "proposed" as const : "succeeded" as const, finishedAt };
+    return {
+      run: {
+        ...run, toolCalls: [...run.toolCalls, completedCall],
+        ...(action ? { actions: [...run.actions, action] } : {})
+      },
+      output
+    };
+  }
+
+  private async buildSnapshot(conversationId: string, content: string, intent: AgentIntent): Promise<AgentSnapshot> {
+    let hits: UnifiedSearchHit[] = [];
+    try { hits = await this.application.unifiedSearch({ text: content, semantic: false, limit: 8 }); }
+    catch { hits = []; }
+    const eventsById = new Map<string, Event>();
+    for (const hit of hits) {
+      const eventId = hit.eventId ?? (hit.kind === "event" ? hit.id : undefined);
+      if (eventId) {
+        try { eventsById.set(eventId, this.application.getEvent(eventId).event); } catch { /* stale search hit */ }
+      }
+    }
+    if (eventsById.size === 0 && ["review", "strategy", "clarify"].includes(intent)) {
+      for (const event of this.application.searchEvents({ status: "confirmed", limit: 8 })) eventsById.set(event.id, event);
+    }
+    const events = [...eventsById.values()].slice(0, 8);
+    const sources: SourceReferenceDetail[] = [];
+    for (const sourceRef of [...new Set(events.flatMap(({ sourceRefs }) => sourceRefs))].slice(0, 8)) {
+      try { sources.push(this.application.getSourceReference(sourceRef)); } catch { /* source removed */ }
+    }
+    const assets = this.application.listAssets().filter(({ id }) => events.some(({ assetRefs }) => assetRefs.includes(id))).slice(0, 8);
+    const people = this.application.listPeople();
+    const names = people.map(({ displayName }) => displayName);
+    const messages = this.application.listMessages(conversationId).slice(0, -1).slice(-12);
+    const aliases = new Map<string, string>();
+    events.forEach((event, index) => aliases.set(`event_${index + 1}`, event.id));
+    sources.forEach((source, index) => aliases.set(`source_${index + 1}`, source.sourceItemId));
+    assets.forEach((asset, index) => aliases.set(`asset_${index + 1}`, asset.id));
+    people.forEach((person, index) => aliases.set(`person_${index + 1}`, person.id));
+    const external = {
+      message: redactExternalText(content, names).slice(0, 20_000),
+      recentConversation: messages.map(({ role, content: messageContent }) => ({
+        role, content: redactExternalText(messageContent ?? "", names).slice(0, 1000)
+      })),
+      events: events.map((event, index) => ({
+        ref: `event_${index + 1}`, title: redactExternalText(event.title, names), occurredAt: event.occurredAt,
+        facts: event.facts.map(({ kind, text }) => ({ kind, text: redactExternalText(text, names).slice(0, 1000) })),
+        interpretations: event.interpretations.map(({ text }) => redactExternalText(text, names).slice(0, 1000)),
+        emotions: event.emotions.map(({ label, intensity }) => ({ label: redactExternalText(label, names), intensity })),
+        interests: event.interests.map(({ label }) => redactExternalText(label, names))
+      })),
+      sources: sources.map((source, index) => ({
+        ref: `source_${index + 1}`, kind: source.kind,
+        excerpt: redactExternalText(source.excerpt, names).slice(0, 1000)
+      })),
+      assets: assets.map((asset, index) => ({ ref: `asset_${index + 1}`, mimeType: asset.mimeType, byteSize: asset.byteSize }))
+    };
+    const context = truncateUtf8(JSON.stringify(external), MAX_AGENT_CONTEXT_BYTES);
+    const categories: AgentDataCategory[] = ["conversation_text"];
+    if (events.length) categories.push("event_fields");
+    if (sources.some(({ kind }) => kind === "transcript")) categories.push("transcript_excerpt");
+    if (sources.some(({ kind }) => kind !== "transcript")) categories.push("source_excerpt");
+    if (assets.length) categories.push("asset_metadata");
+    const categoryCounts: Partial<Record<AgentDataCategory, number>> = {
+      conversation_text: messages.length + 1,
+      ...(events.length ? { event_fields: events.length } : {}),
+      ...(sources.filter(({ kind }) => kind !== "transcript").length ? {
+        source_excerpt: sources.filter(({ kind }) => kind !== "transcript").length
+      } : {}),
+      ...(sources.filter(({ kind }) => kind === "transcript").length ? {
+        transcript_excerpt: sources.filter(({ kind }) => kind === "transcript").length
+      } : {}),
+      ...(assets.length ? { asset_metadata: assets.length } : {})
+    };
+    const citations: AgentCitation[] = [
+      ...events.map(eventCitation), ...sources.map(sourceCitation),
+      ...assets.map((asset): AgentCitation => ({
+        id: `citation:asset:${asset.id}`, kind: "asset", targetId: asset.id,
+        label: asset.originalFileName, available: true
+      }))
+    ];
+    return {
+      context, contextHash: sha256(context), categories, categoryCounts,
+      events, sources, hits, citations, aliases, personNames: names
+    };
+  }
+}

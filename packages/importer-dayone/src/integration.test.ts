@@ -12,7 +12,7 @@ import {
 } from "@grudge-vault/application";
 import { EncryptedObjectVault } from "@grudge-vault/object-vault";
 import {
-  runMigrations, SqliteAssetRepository, SqliteDayOneRepository,
+  runMigrations, SqliteAgentRepository, SqliteAssetRepository, SqliteDayOneRepository,
   SqliteJobRepository, SqliteMemoryRepository
 } from "@grudge-vault/persistence-sqlite";
 import { DayOneZipImporter } from "./index";
@@ -55,7 +55,7 @@ describe("Day One application integration", () => {
         formatVersion: 1, createdAt: "2026-08-24T00:00:00.000Z", updatedAt: "2026-08-24T00:00:00.000Z"
       },
       key: Buffer.alloc(32, 7), assets: new SqliteAssetRepository(database), jobs: new SqliteJobRepository(database),
-      memory, dayOne: new SqliteDayOneRepository(database, memory), vault,
+      memory, agents: new SqliteAgentRepository(database), dayOne: new SqliteDayOneRepository(database, memory), vault,
       async backupDatabase() {}, async close() {}
     };
     const manager: WorkspaceManagerPort = {

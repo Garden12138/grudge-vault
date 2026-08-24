@@ -1,14 +1,25 @@
 import type {
+  AgentExecutionMode,
+  AgentModelCallAudit,
+  AgentModelSettings,
+  AgentRun,
   Clarification,
   Conversation,
   Event,
   EventDetail,
+  EventRelation,
   EventRevision,
   EventSearchQuery,
   Message,
   Person,
+  PersonAlias,
+  PersonMergeRecord,
+  PersonMergeSuggestion,
+  ReviewRun,
+  SearchDocument,
   Source,
   SourceItem,
+  SourceReferenceDetail,
   TemporalValue
 } from "@grudge-vault/domain";
 import type { EventWriteFields } from "@grudge-vault/shared";
@@ -37,9 +48,65 @@ export interface MemoryRepositoryPort {
   getPerson(id: string): Person | undefined;
   createPerson(person: Person): Person;
   updatePerson(person: Person): Person;
+  listPersonAliases(personId?: string, includeInactive?: boolean): PersonAlias[];
+  createPersonAlias(alias: PersonAlias): PersonAlias;
+  deactivatePersonAlias(id: string, now: string): PersonAlias;
+  listPersonMergeSuggestions(): PersonMergeSuggestion[];
+  upsertPersonMergeSuggestion(suggestion: PersonMergeSuggestion): PersonMergeSuggestion;
+  updatePersonMergeSuggestion(id: string, status: PersonMergeSuggestion["status"], now: string, mergeRecordId?: string): PersonMergeSuggestion;
+  listPersonMergeRecords(includeReverted?: boolean): PersonMergeRecord[];
+  createPersonMerge(record: PersonMergeRecord): PersonMergeRecord;
+  revertPersonMerge(id: string, now: string): PersonMergeRecord;
+  resolveCanonicalPersonId(id: string): string;
+  listIdentityPersonIds(id: string): string[];
+
+  listEventRelations(eventId?: string, includeRejected?: boolean): EventRelation[];
+  getEventRelation(id: string): EventRelation | undefined;
+  upsertEventRelation(relation: EventRelation): EventRelation;
+  updateEventRelationStatus(id: string, status: EventRelation["status"], now: string): EventRelation;
+  deleteEventRelation(id: string): void;
+
+  searchUnifiedKeyword(query: import("@grudge-vault/domain").UnifiedSearchQuery): import("@grudge-vault/domain").UnifiedSearchHit[];
+  listSearchDocuments(): SearchDocument[];
+  upsertSearchDocument(document: SearchDocument, now: string): void;
+  getSourceReference(id: string): SourceReferenceDetail | undefined;
+
+  getSetting<T>(key: string): T | undefined;
+  setSetting(key: string, value: unknown, now: string): void;
+  listEmbeddingGenerations(): import("@grudge-vault/domain").EmbeddingGeneration[];
+  createEmbeddingGeneration(generation: import("@grudge-vault/domain").EmbeddingGeneration): void;
+  putEmbedding(generationId: string, document: SearchDocument, vector: Float32Array): void;
+  activateEmbeddingGeneration(id: string, documentCount: number, now: string): void;
+  failEmbeddingGeneration(id: string, error: string): void;
+  listEmbeddings(generationId: string): Array<{ document: SearchDocument; vector: Float32Array }>;
+
+  listReviews(): ReviewRun[];
+  getReview(id: string): ReviewRun | undefined;
+  saveReview(review: ReviewRun): ReviewRun;
 
   listClarifications(eventId?: string): Clarification[];
   getClarification(id: string): Clarification | undefined;
+  setClarificationPriority(id: string, priority: Clarification["priority"], now: string): Clarification;
+}
+
+export interface AgentCredentialEnvelope {
+  algorithm: "aes-256-gcm";
+  version: 1;
+  iv: string;
+  authTag: string;
+  ciphertext: string;
+}
+
+export interface AgentRepositoryPort {
+  listRuns(conversationId: string): AgentRun[];
+  getRun(id: string): AgentRun | undefined;
+  saveRun(run: AgentRun): AgentRun;
+  listModelCallAudits(runId: string): AgentModelCallAudit[];
+  saveModelCallAudit(audit: AgentModelCallAudit): AgentModelCallAudit;
+  getSettings(): AgentModelSettings | undefined;
+  saveSettings(settings: AgentModelSettings, now: string): AgentModelSettings;
+  getCredential(mode: AgentExecutionMode): AgentCredentialEnvelope | undefined;
+  saveCredential(mode: AgentExecutionMode, envelope: AgentCredentialEnvelope | undefined, now: string): void;
 }
 
 export interface EventDraftProposal extends EventWriteFields {

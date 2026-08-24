@@ -72,3 +72,31 @@ Built-in preview is limited to a 64 MiB allowlist of common image, audio, video,
 Importer tests use the checked-in synthetic fixture and dynamically generated adversarial ZIPs. Compatibility sign-off against two real exports remains conditional on contributors supplying repository-safe, de-identified fixtures with platform, Day One version, export options, and redaction notes; unredacted exports must never be committed.
 
 Default archive limits are 20 GiB for the ZIP, 100,000 entries, 20 GiB per entry, 100 GiB total expanded bytes, and a 200:1 per-entry compression ratio. The importer rejects absolute/traversal paths, normalized duplicates, symbolic links, encrypted entries, and unsupported compression before parsing journal content.
+
+## Phase 3 acceptance path
+
+1. Create two confirmed Events involving separately created identities for the same person. Add an alias, inspect the conservative duplicate suggestion, confirm the merge, and verify that the People timeline shows both Events.
+2. Inspect the stored Event revisions and confirm that their original participant IDs were not rewritten. Revert the identity merge and verify that both People projections separate again with aliases intact.
+3. Refresh related-event suggestions. Inspect the shared-person/topic/time basis and algorithm version, confirm one relation, reject another, refresh again, and verify that both decisions survive.
+4. Use **Unified search** to find an Event and a Day One entry. Open both results and follow their Event/Source links back to the current record and SourceVersion excerpt. Keyword search must work while semantic search is unavailable or disabled.
+5. Open **Timeline**, filter by canonical Person and date range, and confirm exact/month/range Events sort into calendar groups while relative and unknown values remain separate.
+6. Generate monthly, quarterly, and custom-range Reviews. Every pattern must list supporting Event revisions and Source references. Change an Event, relation, or identity merge and confirm that the older Review becomes stale before regeneration.
+7. Change Clarification priorities in the global inbox and verify ordering as rights-related, important, then normal.
+8. Create and restore a `.gvbackup`; confirm that aliases, active merges, relation decisions, source indexes, Review runs, and semantic-search settings survive.
+
+The production build intentionally ships without an Embedding Adapter. When an adapter is injected, `search.embedding-rebuild` writes a new vector generation in batches and activates it only after success. A failed rebuild must retain the former active generation. Transcript search documents are accepted by the index contract, but OCR/ASR and Transcript production remain later work.
+
+## Phase 4 acceptance path
+
+1. Open **Chat** and confirm the composer defaults to **Agent**, while **Quick record** still creates a Phase 1 candidate immediately and **Save source** only preserves the Message/SourceItem.
+2. With no model endpoint configured, ask the Private Agent to retrieve a person history, review a period, and compare options. Confirm that no network adapter is invoked, every factual section has a valid local Event/Source/Asset citation, and unknowns remain separate from confirmed facts.
+3. Ask the Agent to record an event. Confirm that the original user Message is already durable, the candidate is only a pending action, rejection writes nothing, and approval creates an `actor: agent` revision linked to that Message SourceItem.
+4. Prepare an Event edit through an injected model adapter, change the Event separately, then approve the old proposal. It must become `stale` without overwriting the newer revision.
+5. Ask for open Clarifications. A plain reply may immediately answer only the single Clarification explicitly shown in the preceding Agent response; ambiguous or model-proposed updates remain approval cards.
+6. Configure a Private endpoint and verify that non-loopback addresses are rejected. Configure Enhanced and verify that HTTP, userinfo, query strings, fragments, and redirects are rejected.
+7. Enable Enhanced with an injected fake adapter. Inspect the disclosure summary, allow it, and confirm that names, contact/account patterns, local paths, and filenames are redacted; no Asset binary or complete raw Source is sent. Adding a newly used data category must show the confirmation again.
+8. Confirm that API credentials never return through IPC, are AES-256-GCM encrypted with the Workspace Key in SQLite, and can be cleared independently for Private and Enhanced.
+9. Force timeout, rate-limit, invalid JSON, invalid tool arguments, guessed IDs, response-size, tool-count, and round-count failures. The raw Message must remain, the run must retain an error code and hashed audit record, and the UI must return a deterministic response while normal search/editing continues.
+10. Create and restore a `.gvbackup`; confirm that Agent settings, encrypted credentials, runs, structured analyses, citations, actions, disclosures, and external-call audits survive.
+
+Automated Adapter tests use injected `fetch`/model doubles and never contact a real service. Release verification must use Node 24 and pnpm 11.23 for lint, typecheck, unit/integration, E2E, and production build; validation under another runtime is informative but is not release sign-off.

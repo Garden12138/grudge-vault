@@ -128,6 +128,8 @@
 
 ## 6. Phase 3：关联、检索与回顾
 
+> 实施状态：Beta Foundation 已于 2026-08-24 落地。可插拔 Embedding 索引闭环已完成，但默认不分发模型；Transcript 生产仍等待后续 OCR/ASR 能力。
+
 ### 目标
 
 把孤立 Event 组织成可理解的长期记忆，让用户看见时间、人物和重复模式。
@@ -158,6 +160,8 @@
 
 ## 7. Phase 4：Harness Agent 与策略分析
 
+> 实施状态：First Useful Beta 已于 2026-08-24 落地。默认确定性 Private 路径完全离线；可选本地/Enhanced 模型仅通过用户配置的 OpenAI Chat Completions 兼容端点接入，不分发内置模型。
+
 ### 目标
 
 让对话成为统一操作入口：Agent 能记录、检索、补全和回顾，并基于可引用的本地记忆提供结构化分析与行动选项。
@@ -165,7 +169,7 @@
 ### 主要工作
 
 - 建立 Tool Registry、版本化 Schema 和 Agent Run Log；
-- 实现 Record、Retrieve、Review 和 Strategy 工具组；
+- 实现 Record、Retrieve、Review、Clarify 和 Strategy 工具组；
 - 建立 Intent Router 与按需 Context Builder；
 - 让 Agent 回答引用 Event、Source、Asset 和 Transcript；
 - 实现“事实 / 争议 / 未知 / 解释 / 情绪”分析模板；
@@ -173,6 +177,8 @@
 - 支持通过对话逐项回答 Clarification；
 - 实现 Private / Enhanced 模型配置与最小上下文脱敏；
 - 建立固定情景评测，跟踪事实混淆、无依据补全和错误工具调用。
+
+首版协议固定为非流式 Chat Completions 函数调用。Private 端点只允许 `localhost`、`127.0.0.1` 或 `::1`；Enhanced base URL 只允许不含 userinfo、query、fragment 的 HTTPS 地址。外发请求禁用重定向并受 4 次模型往返、8 次工具调用、60 秒单次超时、2 MiB 响应和 64 KiB 脱敏上下文限制。Case、Evidence、OCR/ASR 与模型分发不进入本阶段。
 
 ### 纵向演示
 

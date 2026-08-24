@@ -3,9 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import type { Event, EventRevision, Source, SourceItem } from "@grudge-vault/domain";
+import type { AgentRun, Event, EventRevision, Source, SourceItem } from "@grudge-vault/domain";
 import {
-  DEFAULT_MIGRATIONS, SqliteJobRepository, SqliteMemoryRepository, openDatabase, runMigrations
+  DEFAULT_MIGRATIONS, SqliteAgentRepository, SqliteJobRepository, SqliteMemoryRepository, openDatabase, runMigrations
 } from "./index";
 
 function sampleEvent(overrides: Partial<Event> = {}): Event {
@@ -38,7 +38,7 @@ describe("SQLite foundation", () => {
       runMigrations(database);
       expect(database.pragma("journal_mode", { simple: true })).toBe("wal");
       expect(database.pragma("foreign_keys", { simple: true })).toBe(1);
-      expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 3 });
+      expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 5 });
       expect(database.prepare("SELECT count(*) AS count FROM pragma_module_list WHERE name = 'fts5'").get()).toEqual({ count: 1 });
       database.close();
     } finally {
@@ -59,7 +59,7 @@ describe("SQLite foundation", () => {
     runMigrations(database, [DEFAULT_MIGRATIONS[0]!]);
     expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 1 });
     runMigrations(database);
-    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 3 });
+    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 5 });
     expect(database.prepare("SELECT name FROM sqlite_master WHERE name = 'events'").get()).toEqual({ name: "events" });
     database.close();
   });
@@ -79,6 +79,101 @@ describe("SQLite foundation", () => {
       "backfill_runs", "candidate_extractions", "import_issues", "import_run_entries",
       "import_runs", "journal_entries", "source_version_assets", "source_versions"
     ]);
+    database.close();
+  });
+
+  it("upgrades a Phase 2 database with reversible identity, relation, search, and review storage", () => {
+    const database = new Database(":memory:");
+    runMigrations(database, DEFAULT_MIGRATIONS.slice(0, 3));
+    runMigrations(database);
+    const tables = database.prepare(`
+      SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name IN (
+        'person_aliases', 'person_merge_suggestions', 'person_merge_records', 'event_relations',
+        'source_search_documents', 'fts_sources', 'workspace_settings', 'embedding_generations',
+        'embeddings', 'analysis_runs'
+      ) ORDER BY name
+    `).all() as Array<{ name: string }>;
+    expect(tables.map(({ name }) => name)).toEqual([
+      "analysis_runs", "embedding_generations", "embeddings", "event_relations", "fts_sources",
+      "person_aliases", "person_merge_records", "person_merge_suggestions", "source_search_documents",
+      "workspace_settings"
+    ]);
+    database.close();
+  });
+
+  it("upgrades a Phase 3 database with Agent runs, actions, settings, credentials, and external-call audits", () => {
+    const database = new Database(":memory:");
+    runMigrations(database, DEFAULT_MIGRATIONS.slice(0, 4));
+    runMigrations(database);
+    const tables = database.prepare(`
+      SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (
+        'agent_runs', 'agent_tool_calls', 'agent_actions', 'external_context_disclosures',
+        'agent_model_settings', 'agent_credentials', 'agent_model_calls'
+      ) ORDER BY name
+    `).all() as Array<{ name: string }>;
+    expect(tables.map(({ name }) => name)).toEqual([
+      "agent_actions", "agent_credentials", "agent_model_calls", "agent_model_settings",
+      "agent_runs", "agent_tool_calls", "external_context_disclosures"
+    ]);
+    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 5 });
+    database.close();
+  });
+
+  it("round-trips structured Agent state without storing model prompts or source bodies in audit rows", () => {
+    const database = new Database(":memory:");
+    database.pragma("foreign_keys = ON");
+    runMigrations(database);
+    const memory = new SqliteMemoryRepository(database);
+    const agents = new SqliteAgentRepository(database);
+    const now = "2026-08-24T00:00:00.000Z";
+    memory.createConversation({
+      id: "conversation-1", sourceId: "source-1", title: "Inbox", createdAt: now, updatedAt: now
+    }, { id: "source-1", kind: "chat", name: "Inbox", createdAt: now });
+    memory.appendMessage({
+      id: "message-1", conversationId: "conversation-1", sourceItemId: "source-item-1",
+      role: "user", content: "private prompt body", createdAt: now
+    }, { id: "source-item-1", sourceId: "", content: "private prompt body", recordedAt: now, assetRefs: [] });
+    const run: AgentRun = {
+      id: "run-1", conversationId: "conversation-1", userMessageId: "message-1", intent: "record",
+      mode: "enhanced", status: "awaiting_consent", modelIdentity: "fake", modelVersion: 1,
+      toolSchemaVersion: 1, contextHash: "a".repeat(64), responseVersion: 1,
+      citations: [{ id: "citation-1", kind: "source", targetId: "source-item-1", label: "Message", available: true }],
+      toolCalls: [{
+        id: "call-1", runId: "run-1", sequence: 0, toolName: "propose_event", toolVersion: 1,
+        inputHash: "b".repeat(64), inputRefs: ["source-item-1"], outputRefs: [], status: "proposed", startedAt: now
+      }],
+      actions: [{
+        id: "action-1", runId: "run-1", toolCallId: "call-1", toolName: "propose_event", toolVersion: 1,
+        summary: "Create candidate", payload: { title: "Candidate" }, status: "pending", resultRefs: [], createdAt: now
+      }],
+      disclosure: {
+        id: "disclosure-1", runId: "run-1", policyVersion: 1, categories: ["conversation_text"],
+        categoryCounts: { conversation_text: 1 }, contextHash: "a".repeat(64), required: true, createdAt: now
+      }, createdAt: now
+    };
+    agents.saveRun(run);
+    agents.saveModelCallAudit({
+      id: "audit-1", runId: run.id, sequence: 0, endpointOrigin: "https://model.example", model: "fake",
+      categories: ["conversation_text"], contextHash: run.contextHash, status: "failed",
+      errorCode: "AGENT_MODEL_UNAVAILABLE", startedAt: now, finishedAt: now
+    });
+    agents.saveSettings({
+      mode: "enhanced", enhancedEndpoint: {
+        baseUrl: "https://model.example/v1", model: "fake", credentialConfigured: true
+      }, consentPolicyVersion: 1, consentedDataCategories: ["conversation_text"]
+    }, now);
+    agents.saveCredential("enhanced", {
+      algorithm: "aes-256-gcm", version: 1, iv: "iv", authTag: "tag", ciphertext: "encrypted"
+    }, now);
+
+    expect(agents.getRun(run.id)).toEqual(run);
+    expect(agents.listModelCallAudits(run.id)[0]).toMatchObject({
+      endpointOrigin: "https://model.example", status: "failed", errorCode: "AGENT_MODEL_UNAVAILABLE"
+    });
+    expect(agents.getSettings()?.consentedDataCategories).toEqual(["conversation_text"]);
+    expect(agents.getCredential("enhanced")?.ciphertext).toBe("encrypted");
+    const auditColumns = database.prepare("PRAGMA table_info(agent_model_calls)").all() as Array<{ name: string }>;
+    expect(auditColumns.map(({ name }) => name)).not.toEqual(expect.arrayContaining(["prompt", "body", "source_text"]));
     database.close();
   });
 

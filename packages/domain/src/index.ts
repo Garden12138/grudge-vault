@@ -254,6 +254,41 @@ export interface Person {
   updatedAt: IsoDateTime;
 }
 
+export interface PersonAlias {
+  id: EntityId;
+  personId: EntityId;
+  value: string;
+  normalizedValue: string;
+  sourceRefs: EntityId[];
+  status: "active" | "inactive";
+  createdAt: IsoDateTime;
+  updatedAt: IsoDateTime;
+}
+
+export interface PersonMergeSuggestion {
+  id: EntityId;
+  personAId: EntityId;
+  personBId: EntityId;
+  score: number;
+  basis: string[];
+  algorithmIdentity: string;
+  algorithmVersion: number;
+  status: "pending" | "confirmed" | "rejected";
+  mergeRecordId?: EntityId;
+  createdAt: IsoDateTime;
+  updatedAt: IsoDateTime;
+}
+
+export interface PersonMergeRecord {
+  id: EntityId;
+  sourcePersonId: EntityId;
+  targetPersonId: EntityId;
+  suggestionId?: EntityId;
+  status: "active" | "reverted";
+  createdAt: IsoDateTime;
+  revertedAt?: IsoDateTime;
+}
+
 export interface EventParticipant {
   personId: EntityId;
   role?: string;
@@ -281,6 +316,163 @@ export interface Event {
   completeness: CompletenessSummary;
   currentRevision: number;
   updatedAt: IsoDateTime;
+}
+
+export interface PersonIdentityDetail {
+  canonicalPerson: Person;
+  identities: Person[];
+  aliases: PersonAlias[];
+  events: Event[];
+  activeMerges: PersonMergeRecord[];
+}
+
+export type EventRelationKind = "similar" | "precedes" | "same_topic" | "same_case";
+
+export interface RelationBasis {
+  kind: "person" | "topic" | "text" | "time" | "source";
+  label: string;
+  personIds: EntityId[];
+  eventIds: EntityId[];
+  sourceRefs: EntityId[];
+}
+
+export interface EventRelation {
+  id: EntityId;
+  sourceEventId: EntityId;
+  targetEventId: EntityId;
+  kind: EventRelationKind;
+  status: "suggested" | "confirmed" | "rejected";
+  origin: "algorithm" | "user";
+  score?: number;
+  basis: RelationBasis[];
+  algorithmIdentity?: string;
+  algorithmVersion?: number;
+  sourceRevision: number;
+  targetRevision: number;
+  createdAt: IsoDateTime;
+  updatedAt: IsoDateTime;
+}
+
+export interface TimelineQuery {
+  personId?: EntityId;
+  status?: Event["status"];
+  from?: string;
+  to?: string;
+  includeArchived?: boolean;
+}
+
+export interface TimelineGroup {
+  key: string;
+  label: string;
+  events: Event[];
+}
+
+export interface TimelineResult {
+  query: TimelineQuery;
+  groups: TimelineGroup[];
+  total: number;
+}
+
+export type UnifiedSearchKind = "event" | "journal_entry" | "transcript";
+
+export interface UnifiedSearchQuery {
+  text: string;
+  kinds?: UnifiedSearchKind[];
+  personId?: EntityId;
+  status?: Event["status"];
+  from?: string;
+  to?: string;
+  semantic?: boolean;
+  limit?: number;
+}
+
+export interface UnifiedSearchHit {
+  kind: UnifiedSearchKind;
+  id: EntityId;
+  title: string;
+  excerpt: string;
+  occurredAt?: string;
+  eventId?: EntityId;
+  sourceItemId?: EntityId;
+  sourceRefs: EntityId[];
+  keywordScore?: number;
+  semanticScore?: number;
+  combinedScore: number;
+}
+
+export interface SearchDocument {
+  kind: UnifiedSearchKind;
+  id: EntityId;
+  title: string;
+  content: string;
+  contentHash: string;
+  occurredAt?: string;
+  eventId?: EntityId;
+  sourceItemId?: EntityId;
+  sourceRefs: EntityId[];
+}
+
+export interface SourceReferenceDetail {
+  sourceItemId: EntityId;
+  kind: "journal_entry" | "message" | "manual" | "transcript";
+  title: string;
+  excerpt: string;
+  recordedAt: IsoDateTime;
+  sourceVersion?: number;
+  contentHash?: string;
+  conversationId?: EntityId;
+  messageId?: EntityId;
+  eventIds: EntityId[];
+  assetIds: EntityId[];
+}
+
+export interface ReviewPattern {
+  id: EntityId;
+  kind: "person" | "topic" | "relation" | "time_cluster";
+  title: string;
+  summary: string;
+  eventIds: EntityId[];
+  eventRevisionRefs: Array<{ eventId: EntityId; revision: number }>;
+  personIds: EntityId[];
+  sourceRefs: EntityId[];
+}
+
+export interface ReviewRun {
+  id: EntityId;
+  from: string;
+  to: string;
+  generatorIdentity: string;
+  generatorVersion: number;
+  inputHash: string;
+  patterns: ReviewPattern[];
+  eventIds: EntityId[];
+  sourceRefs: EntityId[];
+  createdAt: IsoDateTime;
+  stale: boolean;
+}
+
+export interface EmbeddingIndexStatus {
+  available: boolean;
+  enabled: boolean;
+  adapterIdentity?: string;
+  adapterVersion?: number;
+  dimensions?: number;
+  activeGenerationId?: EntityId;
+  documentCount: number;
+  state: "unavailable" | "disabled" | "empty" | "building" | "ready" | "failed";
+  lastError?: string;
+}
+
+export interface EmbeddingGeneration {
+  id: EntityId;
+  adapterIdentity: string;
+  adapterVersion: number;
+  dimensions: number;
+  state: "building" | "active" | "superseded" | "failed";
+  documentCount: number;
+  lastError?: string;
+  createdAt: IsoDateTime;
+  activatedAt?: IsoDateTime;
 }
 
 export interface EventRevision {
@@ -320,6 +512,7 @@ export interface EventSearchQuery {
   text?: string;
   status?: Event["status"];
   personId?: EntityId;
+  personIds?: EntityId[];
   from?: string;
   to?: string;
   limit?: number;
@@ -340,4 +533,153 @@ export interface Job {
   lastError?: string;
   createdAt: IsoDateTime;
   updatedAt: IsoDateTime;
+}
+
+export type AgentIntent = "record" | "retrieve" | "review" | "clarify" | "strategy";
+export type AgentExecutionMode = "private" | "enhanced";
+export type AgentDataCategory =
+  | "conversation_text"
+  | "event_fields"
+  | "source_excerpt"
+  | "asset_metadata"
+  | "transcript_excerpt";
+
+export interface AgentCitation {
+  id: EntityId;
+  kind: "event" | "source" | "asset" | "transcript";
+  targetId: EntityId;
+  label: string;
+  excerpt?: string;
+  available: boolean;
+}
+
+export interface GroundedAgentClaim {
+  id: EntityId;
+  text: string;
+  citationIds: EntityId[];
+  kind?: "fact.confirmed" | "fact.disputed" | "fact.unknown" | "interpretation.user" | "interpretation.agent" | "emotion";
+}
+
+export interface StrategyOption {
+  id: EntityId;
+  title: string;
+  description: string;
+  benefits: string[];
+  costs: string[];
+  risks: string[];
+  unknowns: string[];
+  reversible: boolean;
+  citationIds: EntityId[];
+}
+
+export interface StrategyAnalysis {
+  confirmedFacts: GroundedAgentClaim[];
+  disputedOrUnknown: GroundedAgentClaim[];
+  materials: GroundedAgentClaim[];
+  interpretations: GroundedAgentClaim[];
+  emotions: GroundedAgentClaim[];
+  interests: GroundedAgentClaim[];
+  historicalPatterns: GroundedAgentClaim[];
+  risks: GroundedAgentClaim[];
+  options: StrategyOption[];
+  actionPlan: string[];
+  suggestedQuestions: string[];
+}
+
+export interface ExternalContextDisclosure {
+  id: EntityId;
+  runId: EntityId;
+  policyVersion: number;
+  categories: AgentDataCategory[];
+  categoryCounts: Partial<Record<AgentDataCategory, number>>;
+  contextHash: string;
+  required: boolean;
+  acceptedAt?: IsoDateTime;
+  rejectedAt?: IsoDateTime;
+  createdAt: IsoDateTime;
+}
+
+export interface AgentToolCall {
+  id: EntityId;
+  runId: EntityId;
+  sequence: number;
+  toolName: string;
+  toolVersion: number;
+  inputHash: string;
+  inputRefs: EntityId[];
+  outputRefs: EntityId[];
+  status: "running" | "succeeded" | "failed" | "proposed";
+  errorCode?: string;
+  startedAt: IsoDateTime;
+  finishedAt?: IsoDateTime;
+}
+
+export interface AgentAction {
+  id: EntityId;
+  runId: EntityId;
+  toolCallId: EntityId;
+  toolName: string;
+  toolVersion: number;
+  summary: string;
+  payload: unknown;
+  expectedRevision?: number;
+  status: "pending" | "approved" | "rejected" | "stale" | "failed";
+  resultRefs: EntityId[];
+  createdAt: IsoDateTime;
+  resolvedAt?: IsoDateTime;
+  errorCode?: string;
+}
+
+export interface AgentRun {
+  id: EntityId;
+  conversationId: EntityId;
+  userMessageId: EntityId;
+  assistantMessageId?: EntityId;
+  intent: AgentIntent;
+  mode: AgentExecutionMode;
+  status: "awaiting_consent" | "running" | "succeeded" | "failed" | "cancelled";
+  modelIdentity?: string;
+  modelVersion?: number;
+  toolSchemaVersion: number;
+  contextHash: string;
+  responseVersion: number;
+  responseText?: string;
+  analysis?: StrategyAnalysis;
+  citations: AgentCitation[];
+  toolCalls: AgentToolCall[];
+  actions: AgentAction[];
+  disclosure?: ExternalContextDisclosure;
+  errorCode?: string;
+  createdAt: IsoDateTime;
+  completedAt?: IsoDateTime;
+}
+
+export interface AgentModelCallAudit {
+  id: EntityId;
+  runId: EntityId;
+  sequence: number;
+  endpointOrigin: string;
+  model: string;
+  categories: AgentDataCategory[];
+  contextHash: string;
+  status: "running" | "succeeded" | "failed";
+  promptTokens?: number;
+  completionTokens?: number;
+  errorCode?: string;
+  startedAt: IsoDateTime;
+  finishedAt?: IsoDateTime;
+}
+
+export interface AgentEndpointSettings {
+  baseUrl: string;
+  model: string;
+  credentialConfigured: boolean;
+}
+
+export interface AgentModelSettings {
+  mode: AgentExecutionMode;
+  privateEndpoint?: AgentEndpointSettings;
+  enhancedEndpoint?: AgentEndpointSettings;
+  consentPolicyVersion: number;
+  consentedDataCategories: AgentDataCategory[];
 }

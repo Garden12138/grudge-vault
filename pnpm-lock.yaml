@@ -94,6 +94,9 @@ importers:
         specifier: 13.0.3
         version: 13.0.3
     devDependencies:
+      '@grudge-vault/agent-harness':
+        specifier: workspace:*
+        version: link:../../packages/agent-harness
       '@grudge-vault/application':
         specifier: workspace:*
         version: link:../../packages/application
@@ -112,6 +115,21 @@ importers:
       '@grudge-vault/shared':
         specifier: workspace:*
         version: link:../../packages/shared
+
+  packages/agent-harness:
+    dependencies:
+      '@grudge-vault/application':
+        specifier: workspace:*
+        version: link:../application
+      '@grudge-vault/domain':
+        specifier: workspace:*
+        version: link:../domain
+      '@grudge-vault/shared':
+        specifier: workspace:*
+        version: link:../shared
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
 
   packages/application:
     dependencies:

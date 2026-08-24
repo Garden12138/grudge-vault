@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type {
-  Asset, BackfillRun, CandidateDetail, CandidateSummary, Conversation, Event, EventDetail,
-  EventRevision, ImportRun, ImportRunDetail, Job, Message, Person, StatementKind,
-  TemporalValue, Workspace
+  AgentAction, AgentModelSettings, AgentRun, Asset, BackfillRun, CandidateDetail, CandidateSummary, Conversation, Event, EventDetail,
+  EmbeddingIndexStatus, EventRelation, EventRevision, ImportRun, ImportRunDetail, Job, Message, Person,
+  PersonIdentityDetail, PersonMergeSuggestion, ReviewRun, SourceReferenceDetail, StatementKind,
+  TemporalValue, TimelineResult, UnifiedSearchHit, Workspace
 } from "@grudge-vault/domain";
 import type { EventWriteFields, IpcResult } from "@grudge-vault/shared";
 import { detectLanguage, translator, type Language } from "./i18n";
 
-type View = "chat" | "events" | "backfill" | "vault" | "settings";
+type View = "chat" | "events" | "search" | "timeline" | "people" | "review" | "backfill" | "vault" | "settings";
 
 interface EventForm {
   title: string;
@@ -151,11 +152,21 @@ export function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [newConversationTitle, setNewConversationTitle] = useState("");
   const [messageText, setMessageText] = useState("");
-  const [createDraft, setCreateDraft] = useState(true);
+  const [composerMode, setComposerMode] = useState<"agent" | "quick" | "source">("agent");
   const [lastDraft, setLastDraft] = useState<Event>();
+  const [agentRuns, setAgentRuns] = useState<AgentRun[]>([]);
+  const [pendingAgentRun, setPendingAgentRun] = useState<AgentRun>();
+  const [agentSettings, setAgentSettings] = useState<AgentModelSettings>();
+  const [agentMode, setAgentMode] = useState<AgentModelSettings["mode"]>("private");
+  const [agentPrivateBaseUrl, setAgentPrivateBaseUrl] = useState("");
+  const [agentPrivateModel, setAgentPrivateModel] = useState("");
+  const [agentEnhancedBaseUrl, setAgentEnhancedBaseUrl] = useState("https://api.openai.com/v1");
+  const [agentEnhancedModel, setAgentEnhancedModel] = useState("");
+  const [agentApiKey, setAgentApiKey] = useState("");
 
   const [events, setEvents] = useState<Event[]>([]);
   const [people, setPeople] = useState<Person[]>([]);
+  const [personIdentities, setPersonIdentities] = useState<PersonIdentityDetail[]>([]);
   const [selectedEventId, setSelectedEventId] = useState<string>();
   const [eventDetail, setEventDetail] = useState<EventDetail>();
   const [revisions, setRevisions] = useState<EventRevision[]>([]);
@@ -182,6 +193,31 @@ export function App() {
   const [backfillBatchSize, setBackfillBatchSize] = useState("25");
   const [mergeTargetId, setMergeTargetId] = useState("");
 
+  const [unifiedQuery, setUnifiedQuery] = useState("");
+  const [unifiedHits, setUnifiedHits] = useState<UnifiedSearchHit[]>([]);
+  const [semanticSearch, setSemanticSearch] = useState(false);
+  const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingIndexStatus>();
+  const [timeline, setTimeline] = useState<TimelineResult>();
+  const [timelinePerson, setTimelinePerson] = useState("");
+  const [timelineFrom, setTimelineFrom] = useState("");
+  const [timelineTo, setTimelineTo] = useState("");
+  const [selectedPerson, setSelectedPerson] = useState<PersonIdentityDetail>();
+  const [mergeSuggestions, setMergeSuggestions] = useState<PersonMergeSuggestion[]>([]);
+  const [aliasValue, setAliasValue] = useState("");
+  const [relations, setRelations] = useState<EventRelation[]>([]);
+  const [relationTargetId, setRelationTargetId] = useState("");
+  const [relationKind, setRelationKind] = useState<EventRelation["kind"]>("similar");
+  const [reviews, setReviews] = useState<ReviewRun[]>([]);
+  const [selectedReview, setSelectedReview] = useState<ReviewRun>();
+  const today = new Date().toISOString().slice(0, 10);
+  const [reviewFrom, setReviewFrom] = useState(`${today.slice(0, 7)}-01`);
+  const [reviewTo, setReviewTo] = useState(today);
+  const [globalClarifications, setGlobalClarifications] = useState<import("@grudge-vault/domain").Clarification[]>([]);
+  const [sourceDetail, setSourceDetail] = useState<SourceReferenceDetail>();
+  const agentRunByAssistantMessage = useMemo(() => new Map(
+    agentRuns.filter(({ assistantMessageId }) => Boolean(assistantMessageId)).map((run) => [run.assistantMessageId!, run])
+  ), [agentRuns]);
+
   const searchEvents = useCallback(async () => {
     const result = await window.grudgeVault.events.search({
       ...(queryText.trim() ? { text: queryText.trim() } : {}),
@@ -195,10 +231,13 @@ export function App() {
   }, [queryFrom, queryPerson, queryStatus, queryText, queryTo]);
 
   const refreshLists = useCallback(async () => {
-    const [conversationResult, eventResult, peopleResult, assetResult, jobResult, importResult, backfillResult, candidateResult] = await Promise.all([
+    const [conversationResult, eventResult, peopleResult, assetResult, jobResult, importResult, backfillResult, candidateResult,
+      embeddingResult, reviewResult, clarificationResult, identityResult, agentSettingsResult] = await Promise.all([
       window.grudgeVault.conversations.list(), window.grudgeVault.events.search({}),
       window.grudgeVault.people.list(), window.grudgeVault.assets.list(), window.grudgeVault.jobs.list(),
-      window.grudgeVault.imports.list(), window.grudgeVault.backfill.list(), window.grudgeVault.candidates.list()
+      window.grudgeVault.imports.list(), window.grudgeVault.backfill.list(), window.grudgeVault.candidates.list(),
+      window.grudgeVault.search.getEmbeddingStatus(), window.grudgeVault.reviews.list(), window.grudgeVault.clarifications.list(),
+      window.grudgeVault.people.listIdentities(), window.grudgeVault.agent.getSettings()
     ]);
     if (conversationResult.ok) {
       setConversations(conversationResult.data);
@@ -215,6 +254,24 @@ export function App() {
     } else setError(importResult.error.message);
     if (backfillResult.ok) setBackfillRuns(backfillResult.data); else setError(backfillResult.error.message);
     if (candidateResult.ok) setCandidates(candidateResult.data); else setError(candidateResult.error.message);
+    if (embeddingResult.ok) {
+      setEmbeddingStatus(embeddingResult.data);
+      setSemanticSearch(embeddingResult.data.enabled);
+    } else setError(embeddingResult.error.message);
+    if (reviewResult.ok) {
+      setReviews(reviewResult.data);
+      setSelectedReview((current) => current ? reviewResult.data.find(({ id }) => id === current.id) : reviewResult.data[0]);
+    } else setError(reviewResult.error.message);
+    if (clarificationResult.ok) setGlobalClarifications(clarificationResult.data); else setError(clarificationResult.error.message);
+    if (identityResult.ok) setPersonIdentities(identityResult.data); else setError(identityResult.error.message);
+    if (agentSettingsResult.ok) {
+      const settings = agentSettingsResult.data;
+      setAgentSettings(settings); setAgentMode(settings.mode);
+      setAgentPrivateBaseUrl(settings.privateEndpoint?.baseUrl ?? "");
+      setAgentPrivateModel(settings.privateEndpoint?.model ?? "");
+      setAgentEnhancedBaseUrl(settings.enhancedEndpoint?.baseUrl ?? "https://api.openai.com/v1");
+      setAgentEnhancedModel(settings.enhancedEndpoint?.model ?? "");
+    } else setError(agentSettingsResult.error.message);
   }, []);
 
   const refresh = useCallback(async () => {
@@ -229,9 +286,16 @@ export function App() {
   useEffect(() => { document.documentElement.lang = language; }, [language]);
   useEffect(() => window.grudgeVault.jobs.onChanged(() => void refreshLists()), [refreshLists]);
   useEffect(() => {
-    if (!selectedConversationId) return setMessages([]);
-    void window.grudgeVault.conversations.listMessages(selectedConversationId).then((result) => {
-      if (result.ok) setMessages(result.data); else setError(result.error.message);
+    if (!selectedConversationId) { setMessages([]); setAgentRuns([]); setPendingAgentRun(undefined); return; }
+    void Promise.all([
+      window.grudgeVault.conversations.listMessages(selectedConversationId),
+      window.grudgeVault.agent.listRuns(selectedConversationId)
+    ]).then(([messageResult, runResult]) => {
+      if (messageResult.ok) setMessages(messageResult.data); else setError(messageResult.error.message);
+      if (runResult.ok) {
+        setAgentRuns(runResult.data);
+        setPendingAgentRun(runResult.data.find(({ status }) => status === "awaiting_consent"));
+      } else setError(runResult.error.message);
     });
   }, [selectedConversationId]);
   useEffect(() => {
@@ -252,14 +316,16 @@ export function App() {
 
   const openEvent = async (id: string, preserveForm = false) => {
     setSelectedEventId(id); setBusy(true);
-    const [detailResult, revisionResult] = await Promise.all([
-      window.grudgeVault.events.get(id), window.grudgeVault.events.listRevisions(id)
+    const [detailResult, revisionResult, relationResult] = await Promise.all([
+      window.grudgeVault.events.get(id), window.grudgeVault.events.listRevisions(id),
+      window.grudgeVault.relations.listForEvent(id)
     ]);
     setBusy(false);
     if (!detailResult.ok) return setError(detailResult.error.message);
     setEventDetail(detailResult.data);
     if (!preserveForm) setEventForm(eventToForm(detailResult.data.event));
     if (revisionResult.ok) setRevisions(revisionResult.data);
+    if (relationResult.ok) setRelations(relationResult.data);
     setView("events");
   };
 
@@ -272,11 +338,34 @@ export function App() {
     setSelectedConversationId(result.data.id);
   };
 
+  const refreshAgentConversation = async () => {
+    if (!selectedConversationId) return;
+    const [messageResult, runResult] = await Promise.all([
+      window.grudgeVault.conversations.listMessages(selectedConversationId),
+      window.grudgeVault.agent.listRuns(selectedConversationId)
+    ]);
+    if (messageResult.ok) setMessages(messageResult.data); else setError(messageResult.error.message);
+    if (runResult.ok) {
+      setAgentRuns(runResult.data);
+      setPendingAgentRun(runResult.data.find(({ status }) => status === "awaiting_consent"));
+    } else setError(runResult.error.message);
+  };
+
   const sendMessage = async () => {
     if (!selectedConversationId || !messageText.trim()) return;
     setBusy(true); setError(undefined); setLastDraft(undefined);
+    if (composerMode === "agent") {
+      const result = await window.grudgeVault.agent.send({ conversationId: selectedConversationId, content: messageText });
+      setBusy(false);
+      if (!result.ok) return setError(result.error.message);
+      setMessageText("");
+      if (result.data.run.status === "awaiting_consent") setPendingAgentRun(result.data.run);
+      await refreshAgentConversation();
+      await refreshLists();
+      return;
+    }
     const result = await window.grudgeVault.conversations.send({
-      conversationId: selectedConversationId, content: messageText, createDraft
+      conversationId: selectedConversationId, content: messageText, createDraft: composerMode === "quick"
     });
     setBusy(false);
     if (!result.ok) return setError(result.error.message);
@@ -285,6 +374,59 @@ export function App() {
     if (result.data.draft) setLastDraft(result.data.draft);
     if (result.data.draftError) setNotice(t("draftFailed"));
     await refreshLists();
+  };
+
+  const resumeAgentRun = async () => {
+    const run = pendingAgentRun;
+    if (!run?.disclosure) return;
+    setBusy(true); setError(undefined);
+    const result = await window.grudgeVault.agent.resume(run.id, run.disclosure.id);
+    setBusy(false);
+    if (!result.ok) return setError(result.error.message);
+    setPendingAgentRun(undefined);
+    await refreshAgentConversation(); await refreshLists();
+  };
+
+  const cancelAgentRun = async () => {
+    if (!pendingAgentRun) return;
+    const result = await window.grudgeVault.agent.cancel(pendingAgentRun.id);
+    if (!result.ok) return setError(result.error.message);
+    setPendingAgentRun(undefined); await refreshAgentConversation();
+  };
+
+  const resolveAgentAction = async (action: AgentAction, approve: boolean) => {
+    const result = approve
+      ? await window.grudgeVault.agent.approveAction(action.id)
+      : await window.grudgeVault.agent.rejectAction(action.id);
+    if (!result.ok) return setError(result.error.message);
+    await refreshAgentConversation(); await refreshLists();
+  };
+
+  const saveAgentSettings = async () => {
+    setBusy(true); setError(undefined);
+    const endpoint = agentMode === "private"
+      ? (agentPrivateBaseUrl.trim() && agentPrivateModel.trim() ? {
+          privateEndpoint: {
+            baseUrl: agentPrivateBaseUrl, model: agentPrivateModel,
+            ...(agentApiKey.trim() ? { apiKey: agentApiKey } : {})
+          }
+        } : {})
+      : {
+          enhancedEndpoint: {
+            baseUrl: agentEnhancedBaseUrl, model: agentEnhancedModel,
+            ...(agentApiKey.trim() ? { apiKey: agentApiKey } : {})
+          }
+        };
+    const result = await window.grudgeVault.agent.updateSettings({ mode: agentMode, ...endpoint });
+    setBusy(false);
+    if (!result.ok) return setError(result.error.message);
+    setAgentSettings(result.data); setAgentApiKey(""); setNotice(t("agentSettingsSaved"));
+  };
+
+  const clearAgentCredential = async () => {
+    const result = await window.grudgeVault.agent.clearCredential(agentMode);
+    if (!result.ok) return setError(result.error.message);
+    setAgentSettings(result.data); setNotice(t("credentialCleared"));
   };
 
   const createManualEvent = async () => {
@@ -445,6 +587,139 @@ export function App() {
     if (!result.ok) setError(result.error.message); else await refreshLists();
   };
 
+  const runUnifiedSearch = async () => {
+    const result = await window.grudgeVault.search.query({ text: unifiedQuery, semantic: semanticSearch, limit: 50 });
+    if (!result.ok) setError(result.error.message); else setUnifiedHits(result.data);
+  };
+
+  const toggleSemanticSearch = async (enabled: boolean) => {
+    const result = await window.grudgeVault.search.setSemanticEnabled(enabled);
+    if (!result.ok) return setError(result.error.message);
+    setSemanticSearch(enabled); setEmbeddingStatus(result.data);
+  };
+
+  const openSource = async (sourceItemId: string) => {
+    const result = await window.grudgeVault.sources.getReference(sourceItemId);
+    if (!result.ok) setError(result.error.message); else setSourceDetail(result.data);
+  };
+
+  const loadTimeline = async () => {
+    const result = await window.grudgeVault.timeline.query({
+      ...(timelinePerson ? { personId: timelinePerson } : {}),
+      ...(timelineFrom ? { from: timelineFrom } : {}), ...(timelineTo ? { to: timelineTo } : {})
+    });
+    if (!result.ok) setError(result.error.message); else setTimeline(result.data);
+  };
+
+  const openPerson = async (id: string) => {
+    const result = await window.grudgeVault.people.get(id);
+    if (!result.ok) setError(result.error.message); else setSelectedPerson(result.data);
+  };
+
+  const loadMergeSuggestions = async () => {
+    const result = await window.grudgeVault.people.listMergeSuggestions();
+    if (!result.ok) setError(result.error.message); else setMergeSuggestions(result.data);
+  };
+
+  const addAlias = async () => {
+    if (!selectedPerson || !aliasValue.trim()) return;
+    const result = await window.grudgeVault.people.addAlias({ personId: selectedPerson.canonicalPerson.id, value: aliasValue });
+    if (!result.ok) return setError(result.error.message);
+    setAliasValue("");
+    await openPerson(selectedPerson.canonicalPerson.id);
+    await loadMergeSuggestions();
+  };
+
+  const mergePeople = async (suggestion: PersonMergeSuggestion) => {
+    const result = await window.grudgeVault.people.merge({
+      sourcePersonId: suggestion.personAId, targetPersonId: suggestion.personBId, suggestionId: suggestion.id
+    });
+    if (!result.ok) return setError(result.error.message);
+    await refreshLists(); await loadMergeSuggestions(); await openPerson(result.data.targetPersonId);
+  };
+
+  const rejectPersonMerge = async (id: string) => {
+    const result = await window.grudgeVault.people.rejectMergeSuggestion(id);
+    if (!result.ok) setError(result.error.message); else await loadMergeSuggestions();
+  };
+
+  const revertPersonMerge = async (id: string) => {
+    const result = await window.grudgeVault.people.revertMerge(id);
+    if (!result.ok) return setError(result.error.message);
+    await refreshLists(); await loadMergeSuggestions();
+    if (selectedPerson) await openPerson(selectedPerson.canonicalPerson.id);
+  };
+
+  const refreshRelations = async () => {
+    const result = await window.grudgeVault.relations.refreshSuggestions();
+    if (!result.ok) return setError(result.error.message);
+    if (eventDetail) {
+      const related = await window.grudgeVault.relations.listForEvent(eventDetail.event.id);
+      if (related.ok) setRelations(related.data);
+    }
+  };
+
+  const createRelation = async () => {
+    if (!eventDetail || !relationTargetId) return;
+    const result = await window.grudgeVault.relations.create({
+      sourceEventId: eventDetail.event.id, targetEventId: relationTargetId, kind: relationKind
+    });
+    if (!result.ok) return setError(result.error.message);
+    setRelationTargetId("");
+    const related = await window.grudgeVault.relations.listForEvent(eventDetail.event.id);
+    if (related.ok) setRelations(related.data);
+  };
+
+  const decideRelation = async (relation: EventRelation, action: "confirm" | "reject" | "remove") => {
+    const result = await window.grudgeVault.relations[action](relation.id);
+    if (!result.ok) return setError(result.error.message);
+    if (!eventDetail) return;
+    const related = await window.grudgeVault.relations.listForEvent(eventDetail.event.id);
+    if (related.ok) setRelations(related.data);
+  };
+
+  const generateReview = async () => {
+    const result = await window.grudgeVault.reviews.generate({ from: reviewFrom, to: reviewTo });
+    if (!result.ok) return setError(result.error.message);
+    setSelectedReview(result.data);
+    await refreshLists();
+  };
+
+  const setReviewPreset = (preset: "month" | "quarter") => {
+    const now = new Date();
+    const year = now.getFullYear();
+    const startMonth = preset === "month" ? now.getMonth() : Math.floor(now.getMonth() / 3) * 3;
+    const endMonth = preset === "month" ? now.getMonth() : startMonth + 2;
+    const pad = (value: number) => String(value).padStart(2, "0");
+    setReviewFrom(`${year}-${pad(startMonth + 1)}-01`);
+    setReviewTo(`${year}-${pad(endMonth + 1)}-${pad(new Date(year, endMonth + 1, 0).getDate())}`);
+  };
+
+  const changeClarificationPriority = async (
+    id: string, priority: import("@grudge-vault/domain").Clarification["priority"]
+  ) => {
+    const result = await window.grudgeVault.clarifications.setPriority(id, priority);
+    if (!result.ok) setError(result.error.message); else await refreshLists();
+  };
+
+  const answerGlobalClarification = async (item: import("@grudge-vault/domain").Clarification) => {
+    const answer = window.prompt(t("answerPrompt"));
+    if (!answer?.trim()) return;
+    const detail = await window.grudgeVault.events.get(item.eventId);
+    if (!detail.ok) return setError(detail.error.message);
+    const result = await window.grudgeVault.clarifications.answer({
+      clarificationId: item.id, answer, expectedRevision: detail.data.event.currentRevision
+    });
+    if (!result.ok) setError(result.error.message); else await refreshLists();
+  };
+
+  const dismissGlobalClarification = async (item: import("@grudge-vault/domain").Clarification) => {
+    const detail = await window.grudgeVault.events.get(item.eventId);
+    if (!detail.ok) return setError(detail.error.message);
+    const result = await window.grudgeVault.clarifications.dismiss(item.id, detail.data.event.currentRevision);
+    if (!result.ok) setError(result.error.message); else await refreshLists();
+  };
+
   const previewAsset = async (assetId: string) => {
     setError(undefined);
     const result = await window.grudgeVault.assets.preview(assetId);
@@ -487,8 +762,15 @@ export function App() {
     <aside className="app-sidebar">
       <div className="brand"><p className="eyebrow">GRUDGE VAULT</p><h1>{t("appName")}</h1></div>
       <nav>
-        {(["chat", "events", "backfill", "vault", "settings"] as View[]).map((item) =>
-          <button key={item} className={view === item ? "active" : ""} onClick={() => setView(item)}>{t(item)}</button>)}
+        {(["chat", "events", "search", "timeline", "people", "review", "backfill", "vault", "settings"] as View[]).map((item) =>
+          <button key={item} className={view === item ? "active" : ""} onClick={() => {
+            setView(item);
+            if (item === "timeline") void loadTimeline();
+            if (item === "people") {
+              void loadMergeSuggestions();
+              if (!selectedPerson && personIdentities[0]) void openPerson(personIdentities[0].canonicalPerson.id);
+            }
+          }}>{t(item)}</button>)}
       </nav>
       <div className="workspace-card"><strong>{workspace.name}</strong><span>{workspace.rootPath}</span><em>{t("encryptedLocally")}</em></div>
     </aside>
@@ -516,15 +798,61 @@ export function App() {
         </aside>
         <section className="chat-main panel">
           {!selectedConversationId ? <div className="empty">{t("noConversation")}</div> : <>
-            <div className="message-list">{messages.length === 0 ? <div className="empty">{t("noMessages")}</div> : messages.map((message) =>
-              <article className="message-bubble" key={message.id}><p>{message.content ?? t("sourceDeleted")}</p>
-                <span>{new Date(message.createdAt).toLocaleString(language)}</span></article>)}</div>
+            <div className="message-list">{messages.length === 0 ? <div className="empty">{t("noMessages")}</div> : messages.map((message) => {
+              const run = agentRunByAssistantMessage.get(message.id);
+              return <article className={`message-bubble ${message.role}`} key={message.id}>
+                <p>{message.content ?? t("sourceDeleted")}</p>
+                <span>{new Date(message.createdAt).toLocaleString(language)}</span>
+                {run && <div className="agent-turn">
+                  <div className="agent-run-meta"><em>{run.intent}</em><em className={`status ${run.status}`}>{run.status}</em>
+                    {run.errorCode && <span>{t("agentFallback")}: {run.errorCode}</span>}</div>
+                  {run.analysis && <div className="agent-analysis">{[
+                    [t("confirmedFacts"), run.analysis.confirmedFacts],
+                    [t("unknownFacts"), run.analysis.disputedOrUnknown],
+                    [t("interpretations"), run.analysis.interpretations],
+                    [t("emotions"), run.analysis.emotions],
+                    [t("interests"), run.analysis.interests],
+                    [t("historicalPatterns"), run.analysis.historicalPatterns],
+                    [t("risks"), run.analysis.risks]
+                  ].map(([label, items]) => Array.isArray(items) && items.length > 0 && <section key={String(label)}>
+                    <h4>{String(label)}</h4>{items.map((item) => <p key={item.id}>
+                      {item.kind === "interpretation.agent" ? `${t("agentInterpretation")}: ${item.text}` : item.text}
+                    </p>)}
+                  </section>)}
+                  {run.analysis.options.length > 0 && <section><h4>{t("actionOptions")}</h4>
+                    <div className="agent-options">{run.analysis.options.map((option) => <article key={option.id}>
+                      <strong>{option.title}</strong><p>{option.description}</p>
+                      <span>{t("benefits")}: {option.benefits.join(" · ")}</span>
+                      <span>{t("risks")}: {option.risks.join(" · ") || t("unknown")}</span>
+                    </article>)}</div></section>}
+                  {(run.analysis.actionPlan ?? []).length > 0 && <section><h4>{t("actionPlan")}</h4><ol>
+                    {(run.analysis.actionPlan ?? []).map((step) => <li key={step}>{step}</li>)}</ol></section>}</div>}
+                  {run.citations.length > 0 && <div className="agent-citations"><strong>{t("citations")}</strong>
+                    {run.citations.map((citation) => <button key={citation.id} disabled={!citation.available} onClick={() => {
+                      if (citation.kind === "event") void openEvent(citation.targetId);
+                      else if (citation.kind === "asset") void previewAsset(citation.targetId);
+                      else void openSource(citation.targetId);
+                    }}>{citation.label}{citation.available ? "" : ` · ${t("invalidCitation")}`}</button>)}</div>}
+                  {run.actions.map((action) => <div className={`agent-action ${action.status}`} key={action.id}>
+                    <strong>{action.summary}</strong><em>{action.status}</em>
+                    {action.status === "pending" && <div className="row-actions permanent">
+                      <button className="primary" onClick={() => void resolveAgentAction(action, true)}>{t("approveAction")}</button>
+                      <button onClick={() => void resolveAgentAction(action, false)}>{t("reject")}</button>
+                    </div>}
+                  </div>)}
+                </div>}
+              </article>;
+            })}</div>
             {lastDraft && <div className="draft-card"><div><strong>{t("draftCreated")}</strong><span>{lastDraft.title}</span></div>
               <button onClick={() => void openEvent(lastDraft.id)}>{t("openEvent")}</button></div>}
             <div className="composer"><textarea aria-label={t("messagePlaceholder")} placeholder={t("messagePlaceholder")}
               value={messageText} onChange={(event) => setMessageText(event.target.value)} />
-              <div><label className="check"><input type="checkbox" checked={createDraft} onChange={(event) => setCreateDraft(event.target.checked)} />{t("createDraft")}</label>
-                <button className="primary" disabled={busy || !messageText.trim()} onClick={() => void sendMessage()}>{t("send")}</button></div></div>
+              <div><div className="composer-modes">
+                <button className={composerMode === "agent" ? "active" : ""} onClick={() => setComposerMode("agent")}>{t("agentMode")}</button>
+                <button className={composerMode === "quick" ? "active" : ""} onClick={() => setComposerMode("quick")}>{t("quickRecord")}</button>
+                <button className={composerMode === "source" ? "active" : ""} onClick={() => setComposerMode("source")}>{t("saveSource")}</button>
+              </div><button className="primary" disabled={busy || !messageText.trim()} onClick={() => void sendMessage()}>
+                  {composerMode === "agent" ? t("askAgent") : t("send")}</button></div></div>
           </>}
         </section>
       </div>}
@@ -589,10 +917,143 @@ export function App() {
             <section className="subsection"><h3>{t("clarifications")}</h3><div className="mini-list">{eventDetail.clarifications.map((item) => <article key={item.id}>
               <div><strong>{item.question}</strong><span>{item.reason}</span></div><em className={`status ${item.status}`}>{item.status}</em>
               {item.status === "open" && <><button onClick={() => void answerClarification(item.id)}>{t("answer")}</button><button onClick={() => void dismissClarification(item.id)}>{t("dismiss")}</button></>}</article>)}</div></section>
+            <section className="subsection"><div className="subsection-heading"><h3>{t("sourceRecord")}</h3></div>
+              <div className="chip-list">{eventDetail.event.sourceRefs.map((sourceRef) =>
+                <button key={sourceRef} onClick={() => void openSource(sourceRef)}>{t("openSource")} · {sourceRef.slice(0, 8)}</button>)}</div></section>
+            <section className="subsection"><div className="subsection-heading"><h3>{t("relatedEvents")}</h3>
+              <button onClick={() => void refreshRelations()}>{t("refreshSuggestions")}</button></div>
+              <div className="inline-create"><select aria-label={t("relationKind")} value={relationKind}
+                onChange={(event) => setRelationKind(event.target.value as EventRelation["kind"])}>
+                <option value="similar">{t("similar")}</option><option value="precedes">{t("precedes")}</option>
+                <option value="same_topic">{t("sameTopic")}</option><option value="same_case">{t("sameCase")}</option></select>
+                <select aria-label={t("mergeTarget")} value={relationTargetId} onChange={(event) => setRelationTargetId(event.target.value)}>
+                  <option value="">{t("mergeTarget")}</option>{events.filter(({ id }) => id !== eventDetail.event.id).map((item) =>
+                    <option key={item.id} value={item.id}>{item.title}</option>)}</select>
+                <button disabled={!relationTargetId} onClick={() => void createRelation()}>{t("createRelation")}</button></div>
+              <div className="mini-list">{relations.length === 0 ? <p className="muted">{t("noRelations")}</p> : relations.map((relation) => {
+                const otherId = relation.sourceEventId === eventDetail.event.id ? relation.targetEventId : relation.sourceEventId;
+                const other = events.find(({ id }) => id === otherId);
+                return <article key={relation.id}><div><strong>{other?.title ?? otherId}</strong>
+                  <span>{relation.kind} · {relation.algorithmIdentity ? `${relation.algorithmIdentity} v${relation.algorithmVersion} · ` : ""}
+                    {relation.basis.map(({ label }) => label).join("；")}</span></div>
+                  <em className={`status ${relation.status}`}>{relation.status}</em>
+                  <button onClick={() => void openEvent(otherId)}>{t("openEvent")}</button>
+                  {relation.status === "suggested" && <><button onClick={() => void decideRelation(relation, "confirm")}>{t("confirm")}</button>
+                    <button onClick={() => void decideRelation(relation, "reject")}>{t("reject")}</button></>}
+                  {relation.origin === "algorithm" && relation.status === "confirmed" &&
+                    <button onClick={() => void decideRelation(relation, "reject")}>{t("reject")}</button>}
+                  {relation.origin === "user" && <button onClick={() => void decideRelation(relation, "remove")}>{t("delete")}</button>}</article>;
+              })}</div></section>
             <section className="subsection"><h3>{t("revisions")}</h3><div className="revision-list">{revisions.map((revision) => <article key={revision.id}>
               <strong>{t("revision")} {revision.revision}</strong><span>{revision.reason} · {new Date(revision.createdAt).toLocaleString(language)}</span></article>)}</div></section>
           </>}
         </section>
+      </div>}
+
+      {view === "search" && <div className="phase-three-grid single">
+        <section className="panel phase-three-panel">
+          <div className="section-heading"><div><p className="eyebrow">FTS5 + OPTIONAL EMBEDDINGS</p>
+            <h2>{t("unifiedSearch")}</h2><p className="muted">{t("unifiedSearchHelp")}</p></div></div>
+          <div className="search-toolbar"><input aria-label={t("unifiedSearch")} placeholder={t("searchPlaceholder")}
+            value={unifiedQuery} onChange={(event) => setUnifiedQuery(event.target.value)}
+            onKeyDown={(event) => { if (event.key === "Enter") void runUnifiedSearch(); }} />
+            <label className="check"><input type="checkbox" disabled={!embeddingStatus?.available}
+              checked={semanticSearch && Boolean(embeddingStatus?.available)}
+              onChange={(event) => void toggleSemanticSearch(event.target.checked)} />{t("semanticSearch")}</label>
+            {embeddingStatus?.available && <button onClick={() => void window.grudgeVault.search.rebuildEmbeddings().then(async (result) => {
+              if (!result.ok) setError(result.error.message); else await refreshLists();
+            })}>{t("refresh")}</button>}
+            <button className="primary" onClick={() => void runUnifiedSearch()}>{t("search")}</button></div>
+          <p className="capability-note">{t("embeddingStatus")}: {embeddingStatus?.state ?? t("unavailable")}
+            {embeddingStatus?.adapterIdentity ? ` · ${embeddingStatus.adapterIdentity} v${embeddingStatus.adapterVersion}` : ""}</p>
+          <h3>{t("searchResults")}</h3>
+          <div className="memory-results">{unifiedHits.length === 0 ? <div className="empty compact">{t("noSearchResults")}</div> : unifiedHits.map((hit) =>
+            <article key={`${hit.kind}:${hit.id}`}><div><em className="kind-badge">{hit.kind === "event" ? t("events") : hit.kind === "journal_entry" ? t("journalEntry") : t("transcript")}</em>
+              <strong>{hit.title}</strong><p>{hit.excerpt}</p><span>{hit.occurredAt ?? t("unknown")}</span></div>
+              <div className="row-actions permanent">{hit.eventId && <button onClick={() => void openEvent(hit.eventId!)}>{t("openEvent")}</button>}
+                {(hit.sourceItemId ?? hit.sourceRefs[0]) && <button onClick={() => void openSource((hit.sourceItemId ?? hit.sourceRefs[0])!)}>{t("openSource")}</button>}</div>
+            </article>)}</div>
+        </section>
+      </div>}
+
+      {view === "timeline" && <div className="phase-three-grid single">
+        <section className="panel phase-three-panel"><div className="section-heading"><div><p className="eyebrow">CURRENT EVENT PROJECTIONS</p>
+          <h2>{t("timeline")}</h2><p className="muted">{t("timelineHelp")}</p></div></div>
+          <div className="search-toolbar"><select aria-label={t("people")} value={timelinePerson} onChange={(event) => setTimelinePerson(event.target.value)}>
+            <option value="">{t("allPeople")}</option>{people.map((person) => <option key={person.id} value={person.id}>{person.displayName}</option>)}</select>
+            <input type="date" aria-label={t("from")} value={timelineFrom} onChange={(event) => setTimelineFrom(event.target.value)} />
+            <input type="date" aria-label={t("to")} value={timelineTo} onChange={(event) => setTimelineTo(event.target.value)} />
+            <button className="primary" onClick={() => void loadTimeline()}>{t("refresh")}</button></div>
+          <div className="timeline-groups">{timeline?.groups.map((group) => <section key={group.key}><h3>{group.label}</h3>
+            {group.events.map((item) => <article key={item.id} onClick={() => void openEvent(item.id)}><span className="timeline-dot" />
+              <div><strong>{item.title}</strong><p>{item.narrative}</p><em className={`status ${item.status}`}>{t(item.status)}</em></div></article>)}</section>)}</div>
+        </section>
+      </div>}
+
+      {view === "people" && <div className="phase-three-grid people-memory">
+        <aside className="panel people-index"><div className="section-heading"><div><p className="eyebrow">CANONICAL IDENTITIES</p><h2>{t("people")}</h2></div></div>
+          <div className="event-list">{personIdentities.map((identity) => <article key={identity.canonicalPerson.id}
+            className={selectedPerson?.canonicalPerson.id === identity.canonicalPerson.id ? "selected" : ""}
+            onClick={() => void openPerson(identity.canonicalPerson.id)}><div><strong>{identity.canonicalPerson.displayName}</strong>
+              <span>{identity.identities.length > 1 ? `${identity.identities.length} ${t("identityMembers")}` : identity.canonicalPerson.notes}</span></div></article>)}</div>
+          <div className="subsection"><div className="subsection-heading"><h3>{t("mergeSuggestions")}</h3>
+            <button onClick={() => void loadMergeSuggestions()}>{t("refresh")}</button></div>
+            {mergeSuggestions.filter(({ status }) => status === "pending").length === 0 ? <p className="muted">{t("noMergeSuggestions")}</p> :
+              mergeSuggestions.filter(({ status }) => status === "pending").map((suggestion) => <article className="suggestion-card" key={suggestion.id}>
+                <strong>{people.find(({ id }) => id === suggestion.personAId)?.displayName} ↔ {people.find(({ id }) => id === suggestion.personBId)?.displayName}</strong>
+                <span>{Math.round(suggestion.score * 100)}% · {suggestion.basis.join("；")}</span><div className="row-actions permanent">
+                  <button className="primary" onClick={() => void mergePeople(suggestion)}>{t("mergePeople")}</button>
+                  <button onClick={() => void rejectPersonMerge(suggestion.id)}>{t("reject")}</button></div></article>)}</div>
+        </aside>
+        <section className="panel phase-three-panel">{!selectedPerson ? <div className="empty">{t("personIdentity")}</div> : <>
+          <div className="section-heading"><div><p className="eyebrow">{t("canonical")}</p><h2>{selectedPerson.canonicalPerson.displayName}</h2></div></div>
+          <section className="subsection"><h3>{t("identityMembers")}</h3><div className="chip-list">{selectedPerson.identities.map((person) =>
+            <span key={person.id}>{person.displayName}</span>)}</div></section>
+          <section className="subsection"><h3>{t("aliases")}</h3><div className="chip-list">{selectedPerson.aliases.map((alias) =>
+            <span className={alias.status === "inactive" ? "inactive" : ""} key={alias.id}>{alias.value}
+              {alias.status === "active" && <button aria-label={t("delete")} onClick={() => void window.grudgeVault.people.deactivateAlias(alias.id).then(async (result) => {
+                if (!result.ok) setError(result.error.message); else await openPerson(selectedPerson.canonicalPerson.id);
+              })}>×</button>}</span>)}</div>
+            <div className="inline-create"><input placeholder={t("aliasPlaceholder")} value={aliasValue} onChange={(event) => setAliasValue(event.target.value)} />
+              <button onClick={() => void addAlias()}>{t("addAlias")}</button></div></section>
+          <section className="subsection"><h3>{t("revertMerge")}</h3><div className="mini-list">{selectedPerson.activeMerges.map((merge) =>
+            <article key={merge.id}><div><strong>{people.find(({ id }) => id === merge.sourcePersonId)?.displayName} → {people.find(({ id }) => id === merge.targetPersonId)?.displayName}</strong>
+              <span>{new Date(merge.createdAt).toLocaleString(language)}</span></div><button onClick={() => void revertPersonMerge(merge.id)}>{t("revertMerge")}</button></article>)}</div></section>
+          <section className="subsection"><h3>{t("timeline")}</h3><div className="memory-results">{selectedPerson.events.map((item) =>
+            <article key={item.id} onClick={() => void openEvent(item.id)}><div><strong>{item.title}</strong><p>{item.narrative}</p></div></article>)}</div></section>
+        </>}</section>
+      </div>}
+
+      {view === "review" && <div className="phase-three-grid review-memory">
+        <aside className="panel review-controls"><div className="section-heading"><div><p className="eyebrow">TRACEABLE ANALYSIS</p><h2>{t("review")}</h2></div></div>
+          <div className="backfill-form"><label className="field"><span>{t("from")}</span><input type="date" value={reviewFrom} onChange={(event) => setReviewFrom(event.target.value)} /></label>
+            <label className="field"><span>{t("to")}</span><input type="date" value={reviewTo} onChange={(event) => setReviewTo(event.target.value)} /></label>
+            <div className="row-actions permanent"><button onClick={() => setReviewPreset("month")}>{t("monthly")}</button>
+              <button onClick={() => setReviewPreset("quarter")}>{t("quarterly")}</button></div>
+            <button className="primary" onClick={() => void generateReview()}>{t("generateReview")}</button></div>
+          <h3>{t("reviewHistory")}</h3>{reviews.length === 0 ? <p className="muted">{t("noReviews")}</p> : <div className="run-list">{reviews.map((review) =>
+            <article key={review.id} className={selectedReview?.id === review.id ? "selected" : ""} onClick={() => setSelectedReview(review)}>
+              <div><strong>{review.from} — {review.to}</strong><span>{new Date(review.createdAt).toLocaleString(language)}</span></div>
+              {review.stale && <em className="status failed">stale</em>}</article>)}</div>}
+          <section className="subsection"><h3>{t("globalClarifications")}</h3><div className="mini-list">{globalClarifications.filter(({ status }) => status === "open").map((item) =>
+            <article key={item.id}><div><strong>{item.question}</strong><span>{item.reason}</span></div>
+              <select aria-label={t("priority")} value={item.priority} onChange={(event) => void changeClarificationPriority(item.id, event.target.value as typeof item.priority)}>
+                <option value="normal">{t("normal")}</option><option value="important">{t("important")}</option><option value="rights_related">{t("rightsRelated")}</option></select>
+              <button onClick={() => void answerGlobalClarification(item)}>{t("answer")}</button>
+              <button onClick={() => void dismissGlobalClarification(item)}>{t("dismiss")}</button>
+              <button onClick={() => void openEvent(item.eventId)}>{t("openEvent")}</button></article>)}</div></section>
+        </aside>
+        <section className="panel phase-three-panel">{!selectedReview ? <div className="empty">{t("noReviews")}</div> : <>
+          <div className="section-heading"><div><p className="eyebrow">{selectedReview.generatorIdentity} v{selectedReview.generatorVersion}</p>
+            <h2>{selectedReview.from} — {selectedReview.to}</h2></div></div>
+          {selectedReview.stale && <div className="notice-banner">{t("staleReview")}</div>}
+          <h3>{t("patterns")}</h3><div className="pattern-list">{selectedReview.patterns.length === 0 ? <div className="empty compact">{t("noPatterns")}</div> :
+            selectedReview.patterns.map((pattern) => <article key={pattern.id}><em className="kind-badge">{pattern.kind}</em><h3>{pattern.title}</h3><p>{pattern.summary}</p>
+              <strong>{t("supportingEvents")}</strong><div className="chip-list">{pattern.eventIds.map((eventId) =>
+                <button key={eventId} onClick={() => void openEvent(eventId)}>{events.find(({ id }) => id === eventId)?.title ?? eventId}</button>)}</div>
+              <div className="chip-list">{pattern.sourceRefs.map((sourceRef) => <button key={sourceRef} onClick={() => void openSource(sourceRef)}>{t("openSource")} · {sourceRef.slice(0, 8)}</button>)}</div>
+            </article>)}</div>
+        </>}</section>
       </div>}
 
       {view === "backfill" && <div className="backfill-layout">
@@ -685,6 +1146,30 @@ export function App() {
         <section className="panel settings-card"><p className="eyebrow">LANGUAGE</p><h2>{t("language")}</h2>
           <div className="language-pills"><button className={language === "zh-CN" ? "active" : ""} onClick={() => setAppLanguage("zh-CN")}>{t("chinese")}</button>
             <button className={language === "en" ? "active" : ""} onClick={() => setAppLanguage("en")}>{t("english")}</button></div></section>
+        <section className="panel settings-card agent-settings-card"><p className="eyebrow">HARNESS AGENT</p><h2>{t("agentSettings")}</h2>
+          <p>{t("agentSettingsHelp")}</p>
+          <label className="field"><span>{t("agentExecutionMode")}</span><select value={agentMode}
+            onChange={(event) => setAgentMode(event.target.value as AgentModelSettings["mode"])}>
+            <option value="private">Private</option><option value="enhanced">Enhanced</option></select></label>
+          {agentMode === "private" ? <>
+            <label className="field"><span>{t("modelBaseUrl")}</span><input aria-label={t("modelBaseUrl")} value={agentPrivateBaseUrl}
+              placeholder="http://127.0.0.1:11434/v1" onChange={(event) => setAgentPrivateBaseUrl(event.target.value)} /></label>
+            <label className="field"><span>{t("modelName")}</span><input aria-label={t("modelName")} value={agentPrivateModel}
+              placeholder="local-model" onChange={(event) => setAgentPrivateModel(event.target.value)} /></label>
+          </> : <>
+            <label className="field"><span>{t("modelBaseUrl")}</span><input aria-label={t("modelBaseUrl")} value={agentEnhancedBaseUrl}
+              onChange={(event) => setAgentEnhancedBaseUrl(event.target.value)} /></label>
+            <label className="field"><span>{t("modelName")}</span><input aria-label={t("modelName")} value={agentEnhancedModel}
+              onChange={(event) => setAgentEnhancedModel(event.target.value)} /></label>
+          </>}
+          <label className="field"><span>{t("apiKey")}</span><input aria-label={t("apiKey")} type="password" value={agentApiKey}
+            placeholder={agentMode === "private" ? t("optional") : "••••••••"} onChange={(event) => setAgentApiKey(event.target.value)} /></label>
+          <p className="muted">{t("credentialStatus")}: {(agentMode === "private" ? agentSettings?.privateEndpoint : agentSettings?.enhancedEndpoint)?.credentialConfigured
+            ? t("configured") : t("notConfigured")}</p>
+          <p className="muted">{t("consentedCategories")}: {agentSettings?.consentedDataCategories.join(", ") || t("none")}</p>
+          <div className="landing-actions"><button className="primary" disabled={busy} onClick={() => void saveAgentSettings()}>{t("saveAgentSettings")}</button>
+            <button onClick={() => void clearAgentCredential()}>{t("clearCredential")}</button></div>
+        </section>
         <section className="panel settings-card"><p className="eyebrow">ENCRYPTED SNAPSHOT</p><h2>{t("backup")}</h2><p>{t("backupHelp")}</p>
           <div className="landing-actions"><button className="primary" onClick={() => void window.grudgeVault.backups.createSnapshot().then((result) => {
             if (!result.ok) setError(result.error.message); else if (result.data) setNotice(`${t("backupCreated")}: ${result.data.path}`);
@@ -701,10 +1186,33 @@ export function App() {
       </div>}
     </section>
 
+    {pendingAgentRun?.disclosure && <div className="modal-backdrop"><section className="preview-modal consent-modal">
+      <div className="section-heading"><div><p className="eyebrow">ENHANCED CONTEXT</p><h2>{t("externalContextConsent")}</h2></div></div>
+      <p>{t("externalContextHelp")}</p>
+      <div className="disclosure-list">{pendingAgentRun.disclosure.categories.map((category) => <article key={category}>
+        <strong>{category}</strong><span>{pendingAgentRun.disclosure?.categoryCounts[category] ?? 0}</span>
+      </article>)}</div>
+      <p className="muted">{t("redactionPolicy")} v{pendingAgentRun.disclosure.policyVersion} · {pendingAgentRun.disclosure.contextHash}</p>
+      <div className="landing-actions"><button className="primary" disabled={busy} onClick={() => void resumeAgentRun()}>{t("allowAndContinue")}</button>
+        <button disabled={busy} onClick={() => void cancelAgentRun()}>{t("cancel")}</button></div>
+    </section></div>}
     {preview && <div className="modal-backdrop" onClick={() => setPreview(undefined)}><section className="preview-modal" onClick={(event) => event.stopPropagation()}>
       <div className="section-heading"><h2>{preview.fileName}</h2><button onClick={() => setPreview(undefined)}>×</button></div>
       <div className="preview-content">{preview.text !== undefined ? <pre>{preview.text}</pre> : preview.mimeType.startsWith("image/") ? <img src={preview.url} alt={preview.fileName} />
         : preview.mimeType.startsWith("audio/") ? <audio controls src={preview.url} /> : preview.mimeType.startsWith("video/") ? <video controls src={preview.url} />
           : <iframe title={preview.fileName} src={preview.url} />}</div></section></div>}
+    {sourceDetail && <div className="modal-backdrop" onClick={() => setSourceDetail(undefined)}><section className="preview-modal source-modal" onClick={(event) => event.stopPropagation()}>
+      <div className="section-heading"><div><p className="eyebrow">{sourceDetail.kind}</p><h2>{sourceDetail.title}</h2></div>
+        <button onClick={() => setSourceDetail(undefined)}>×</button></div>
+      <div className="source-meta"><span>{new Date(sourceDetail.recordedAt).toLocaleString(language)}</span>
+        {sourceDetail.sourceVersion && <span>{t("sourceVersion")} {sourceDetail.sourceVersion}</span>}
+        {sourceDetail.contentHash && <code>{sourceDetail.contentHash}</code>}</div>
+      <pre className="source-body">{sourceDetail.excerpt || t("sourceDeleted")}</pre>
+      <div className="chip-list">{sourceDetail.eventIds.map((eventId) =>
+        <button key={eventId} onClick={() => { setSourceDetail(undefined); void openEvent(eventId); }}>{t("openEvent")}</button>)}</div>
+      {sourceDetail.conversationId && <div className="chip-list"><button onClick={() => {
+        setSelectedConversationId(sourceDetail.conversationId); setSourceDetail(undefined); setView("chat");
+      }}>{t("openConversation")}</button></div>}
+    </section></div>}
   </main>;
 }

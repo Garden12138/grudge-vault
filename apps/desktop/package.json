@@ -10,6 +10,7 @@
     "better-sqlite3": "13.0.3"
   },
   "devDependencies": {
+    "@grudge-vault/agent-harness": "workspace:*",
     "@grudge-vault/application": "workspace:*",
     "@grudge-vault/domain": "workspace:*",
     "@grudge-vault/importer-dayone": "workspace:*",

@@ -1,5 +1,10 @@
 import type {
   Asset,
+  AgentAction,
+  AgentDataCategory,
+  AgentExecutionMode,
+  AgentModelSettings,
+  AgentRun,
   BackfillRun,
   CandidateDetail,
   CandidateSummary,
@@ -10,15 +15,28 @@ import type {
   EventDetail,
   EventParticipant,
   EventRevision,
+  EventRelation,
+  EventRelationKind,
   EventSearchQuery,
+  EmbeddingIndexStatus,
   Interest,
   Job,
   ImportRun,
   ImportRunDetail,
   Message,
   Person,
+  PersonAlias,
+  PersonIdentityDetail,
+  PersonMergeRecord,
+  PersonMergeSuggestion,
+  ReviewRun,
+  SourceReferenceDetail,
   Statement,
   TemporalValue,
+  TimelineQuery,
+  TimelineResult,
+  UnifiedSearchHit,
+  UnifiedSearchQuery,
   Workspace
 } from "@grudge-vault/domain";
 
@@ -43,6 +61,15 @@ export const APP_ERROR_CODES = [
   "IMPORT_RUN_STATE_CONFLICT",
   "BACKFILL_STATE_CONFLICT",
   "CANDIDATE_STATE_CONFLICT",
+  "PERSON_MERGE_CONFLICT",
+  "RELATION_STATE_CONFLICT",
+  "EMBEDDING_UNAVAILABLE",
+  "AGENT_CONSENT_REQUIRED",
+  "AGENT_RUN_STATE_CONFLICT",
+  "AGENT_ACTION_CONFLICT",
+  "AGENT_MODEL_CONFIGURATION_INVALID",
+  "AGENT_MODEL_UNAVAILABLE",
+  "AGENT_TOOL_FAILED",
   "JOB_NOT_RETRYABLE",
   "VALIDATION_FAILED",
   "INTERNAL_ERROR"
@@ -154,6 +181,54 @@ export interface CandidateMergeResult {
   target: Event;
 }
 
+export interface PersonAliasInput {
+  personId: string;
+  value: string;
+  sourceRefs?: string[];
+}
+
+export interface PersonMergeInput {
+  sourcePersonId: string;
+  targetPersonId: string;
+  suggestionId?: string;
+}
+
+export interface CreateRelationInput {
+  sourceEventId: string;
+  targetEventId: string;
+  kind: EventRelationKind;
+}
+
+export interface ReviewGenerateInput {
+  from: string;
+  to: string;
+}
+
+export interface AgentSendInput {
+  conversationId: string;
+  content: string;
+}
+
+export interface AgentSendResult {
+  run: AgentRun;
+  userMessage: Message;
+  assistantMessage?: Message;
+}
+
+export interface AgentEndpointInput {
+  baseUrl: string;
+  model: string;
+  apiKey?: string;
+  clearCredential?: boolean;
+}
+
+export interface AgentSettingsUpdateInput {
+  mode: AgentExecutionMode;
+  privateEndpoint?: AgentEndpointInput;
+  enhancedEndpoint?: AgentEndpointInput;
+  consentedDataCategories?: AgentDataCategory[];
+}
+
 export interface GrudgeVaultApi {
   workspace: {
     current(): Promise<IpcResult<Workspace | null>>;
@@ -168,6 +243,18 @@ export interface GrudgeVaultApi {
     listMessages(id: string): Promise<IpcResult<Message[]>>;
     send(input: SendMessageInput): Promise<IpcResult<SendMessageResult>>;
   };
+  agent: {
+    send(input: AgentSendInput): Promise<IpcResult<AgentSendResult>>;
+    resume(runId: string, disclosureId: string): Promise<IpcResult<AgentSendResult>>;
+    cancel(runId: string): Promise<IpcResult<AgentRun>>;
+    listRuns(conversationId: string): Promise<IpcResult<AgentRun[]>>;
+    getRun(runId: string): Promise<IpcResult<AgentRun>>;
+    approveAction(actionId: string): Promise<IpcResult<AgentAction>>;
+    rejectAction(actionId: string): Promise<IpcResult<AgentAction>>;
+    getSettings(): Promise<IpcResult<AgentModelSettings>>;
+    updateSettings(input: AgentSettingsUpdateInput): Promise<IpcResult<AgentModelSettings>>;
+    clearCredential(mode: AgentExecutionMode): Promise<IpcResult<AgentModelSettings>>;
+  };
   events: {
     search(query: EventSearchQuery): Promise<IpcResult<Event[]>>;
     get(id: string): Promise<IpcResult<EventDetail>>;
@@ -179,14 +266,48 @@ export interface GrudgeVaultApi {
   };
   people: {
     list(includeArchived?: boolean): Promise<IpcResult<Person[]>>;
+    listIdentities(): Promise<IpcResult<PersonIdentityDetail[]>>;
     create(displayName: string, notes?: string): Promise<IpcResult<Person>>;
     update(person: Pick<Person, "id" | "displayName" | "notes">): Promise<IpcResult<Person>>;
     archive(id: string): Promise<IpcResult<Person>>;
+    get(id: string): Promise<IpcResult<PersonIdentityDetail>>;
+    addAlias(input: PersonAliasInput): Promise<IpcResult<PersonAlias>>;
+    deactivateAlias(id: string): Promise<IpcResult<PersonAlias>>;
+    listMergeSuggestions(): Promise<IpcResult<PersonMergeSuggestion[]>>;
+    rejectMergeSuggestion(id: string): Promise<IpcResult<PersonMergeSuggestion>>;
+    merge(input: PersonMergeInput): Promise<IpcResult<PersonMergeRecord>>;
+    revertMerge(id: string): Promise<IpcResult<PersonMergeRecord>>;
+  };
+  relations: {
+    listForEvent(eventId: string): Promise<IpcResult<EventRelation[]>>;
+    refreshSuggestions(): Promise<IpcResult<EventRelation[]>>;
+    create(input: CreateRelationInput): Promise<IpcResult<EventRelation>>;
+    confirm(id: string): Promise<IpcResult<EventRelation>>;
+    reject(id: string): Promise<IpcResult<EventRelation>>;
+    remove(id: string): Promise<IpcResult<void>>;
+  };
+  timeline: {
+    query(input: TimelineQuery): Promise<IpcResult<TimelineResult>>;
+  };
+  search: {
+    query(input: UnifiedSearchQuery): Promise<IpcResult<UnifiedSearchHit[]>>;
+    getEmbeddingStatus(): Promise<IpcResult<EmbeddingIndexStatus>>;
+    setSemanticEnabled(enabled: boolean): Promise<IpcResult<EmbeddingIndexStatus>>;
+    rebuildEmbeddings(): Promise<IpcResult<Job>>;
+  };
+  reviews: {
+    list(): Promise<IpcResult<ReviewRun[]>>;
+    get(id: string): Promise<IpcResult<ReviewRun>>;
+    generate(input: ReviewGenerateInput): Promise<IpcResult<ReviewRun>>;
+  };
+  sources: {
+    getReference(sourceItemId: string): Promise<IpcResult<SourceReferenceDetail>>;
   };
   clarifications: {
     list(eventId?: string): Promise<IpcResult<Clarification[]>>;
     answer(input: ClarificationAnswerInput): Promise<IpcResult<Event>>;
     dismiss(id: string, expectedRevision: number): Promise<IpcResult<Event>>;
+    setPriority(id: string, priority: Clarification["priority"]): Promise<IpcResult<Clarification>>;
   };
   assets: {
     importDropped(files: File[]): Promise<IpcResult<AssetImportResult[]>>;

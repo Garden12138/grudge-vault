@@ -3,14 +3,16 @@ import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
 import type {
-  AssetRepositoryPort, DayOneRepositoryPort, EventCommitExtras, JobRepositoryPort, MemoryRepositoryPort,
-  NormalizedDayOneEntry
+  AgentCredentialEnvelope, AgentRepositoryPort, AssetRepositoryPort, DayOneRepositoryPort, EventCommitExtras,
+  JobRepositoryPort, MemoryRepositoryPort, NormalizedDayOneEntry
 } from "@grudge-vault/application";
 import type {
-  Asset, BackfillRun, CandidateDetail, CandidateExtraction, CandidateSummary, Clarification,
-  Conversation, Event, EventDetail, EventRevision, EventSearchQuery, ImportIssue, ImportRun,
-  ImportRunDetail, Job, JobState, JournalEntry, Message, Person, Source, SourceItem,
-  SourceVersion, Workspace
+  AgentAction, AgentExecutionMode, AgentModelCallAudit, AgentModelSettings, AgentRun, AgentToolCall, Asset, BackfillRun,
+  CandidateDetail, CandidateExtraction, CandidateSummary, Clarification,
+  Conversation, EmbeddingGeneration, Event, EventDetail, EventRelation, EventRevision, EventSearchQuery,
+  ImportIssue, ImportRun, ImportRunDetail, Job, JobState, JournalEntry, Message, Person, PersonAlias,
+  PersonMergeRecord, PersonMergeSuggestion, ReviewRun, SearchDocument, Source, SourceItem,
+  SourceReferenceDetail, SourceVersion, UnifiedSearchHit, UnifiedSearchQuery, Workspace
 } from "@grudge-vault/domain";
 import { AppError, type CandidateMergeInput, type CandidateMergeResult } from "@grudge-vault/shared";
 
@@ -321,6 +323,251 @@ export const DEFAULT_MIGRATIONS: readonly Migration[] = [
       ) STRICT;
       CREATE INDEX candidate_extractions_review_idx ON candidate_extractions(review_state, created_at);
     `
+  },
+  {
+    version: 4,
+    name: "phase-three-relations-search-review",
+    sql: `
+      CREATE TABLE person_aliases (
+        id TEXT PRIMARY KEY,
+        person_id TEXT NOT NULL REFERENCES people(id),
+        value TEXT NOT NULL,
+        normalized_value TEXT NOT NULL,
+        source_refs_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('active', 'inactive')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE UNIQUE INDEX person_aliases_active_value_idx
+        ON person_aliases(person_id, normalized_value) WHERE status = 'active';
+
+      CREATE TABLE person_merge_suggestions (
+        id TEXT PRIMARY KEY,
+        person_a_id TEXT NOT NULL REFERENCES people(id),
+        person_b_id TEXT NOT NULL REFERENCES people(id),
+        score REAL NOT NULL CHECK(score >= 0 AND score <= 1),
+        basis_json TEXT NOT NULL,
+        algorithm_identity TEXT NOT NULL,
+        algorithm_version INTEGER NOT NULL CHECK(algorithm_version > 0),
+        status TEXT NOT NULL CHECK(status IN ('pending', 'confirmed', 'rejected')),
+        merge_record_id TEXT REFERENCES person_merge_records(id),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(person_a_id, person_b_id, algorithm_identity, algorithm_version)
+      ) STRICT;
+
+      CREATE TABLE person_merge_records (
+        id TEXT PRIMARY KEY,
+        source_person_id TEXT NOT NULL REFERENCES people(id),
+        target_person_id TEXT NOT NULL REFERENCES people(id),
+        suggestion_id TEXT REFERENCES person_merge_suggestions(id),
+        status TEXT NOT NULL CHECK(status IN ('active', 'reverted')),
+        created_at TEXT NOT NULL,
+        reverted_at TEXT,
+        CHECK(source_person_id <> target_person_id)
+      ) STRICT;
+      CREATE UNIQUE INDEX person_merge_active_source_idx
+        ON person_merge_records(source_person_id) WHERE status = 'active';
+
+      CREATE TABLE event_relations (
+        id TEXT PRIMARY KEY,
+        source_event_id TEXT NOT NULL REFERENCES events(id),
+        target_event_id TEXT NOT NULL REFERENCES events(id),
+        kind TEXT NOT NULL CHECK(kind IN ('similar', 'precedes', 'same_topic', 'same_case')),
+        status TEXT NOT NULL CHECK(status IN ('suggested', 'confirmed', 'rejected')),
+        origin TEXT NOT NULL CHECK(origin IN ('algorithm', 'user')),
+        score REAL CHECK(score IS NULL OR (score >= 0 AND score <= 1)),
+        basis_json TEXT NOT NULL,
+        algorithm_identity TEXT,
+        algorithm_version INTEGER,
+        source_revision INTEGER NOT NULL CHECK(source_revision > 0),
+        target_revision INTEGER NOT NULL CHECK(target_revision > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK(source_event_id <> target_event_id),
+        UNIQUE(source_event_id, target_event_id, kind)
+      ) STRICT;
+      CREATE INDEX event_relations_event_idx ON event_relations(source_event_id, target_event_id, status);
+
+      CREATE TABLE source_search_documents (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK(kind IN ('journal_entry', 'transcript')),
+        title TEXT NOT NULL,
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+        occurred_at TEXT,
+        event_id TEXT REFERENCES events(id),
+        source_item_id TEXT REFERENCES source_items(id),
+        source_refs_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX source_search_documents_source_idx ON source_search_documents(source_item_id, kind);
+      CREATE VIRTUAL TABLE fts_sources USING fts5(
+        document_id UNINDEXED,
+        title,
+        content,
+        tokenize = 'unicode61 remove_diacritics 2'
+      );
+
+      CREATE TABLE workspace_settings (
+        key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE embedding_generations (
+        id TEXT PRIMARY KEY,
+        adapter_identity TEXT NOT NULL,
+        adapter_version INTEGER NOT NULL CHECK(adapter_version > 0),
+        dimensions INTEGER NOT NULL CHECK(dimensions > 0),
+        state TEXT NOT NULL CHECK(state IN ('building', 'active', 'superseded', 'failed')),
+        document_count INTEGER NOT NULL CHECK(document_count >= 0),
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        activated_at TEXT
+      ) STRICT;
+      CREATE INDEX embedding_generations_state_idx ON embedding_generations(state, created_at);
+
+      CREATE TABLE embeddings (
+        generation_id TEXT NOT NULL REFERENCES embedding_generations(id) ON DELETE CASCADE,
+        document_kind TEXT NOT NULL CHECK(document_kind IN ('event', 'journal_entry', 'transcript')),
+        document_id TEXT NOT NULL,
+        content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+        vector BLOB NOT NULL,
+        PRIMARY KEY(generation_id, document_kind, document_id)
+      ) STRICT;
+
+      CREATE TABLE analysis_runs (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        processor_identity TEXT NOT NULL,
+        processor_version INTEGER NOT NULL CHECK(processor_version > 0),
+        input_hash TEXT NOT NULL CHECK(length(input_hash) = 64),
+        from_date TEXT NOT NULL,
+        to_date TEXT NOT NULL,
+        output_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX analysis_runs_type_date_idx ON analysis_runs(type, created_at);
+
+      INSERT INTO source_search_documents(
+        id, kind, title, content, content_hash, occurred_at, event_id, source_item_id, source_refs_json, updated_at
+      )
+      SELECT 'journal:' || je.source_item_id, 'journal_entry',
+        CASE WHEN length(COALESCE(sv.content, '')) > 80 THEN substr(COALESCE(sv.content, ''), 1, 80) ELSE COALESCE(sv.content, 'Day One entry') END,
+        COALESCE(sv.content, ''), sv.content_hash, je.journal_date, NULL, je.source_item_id,
+        json_array(je.source_item_id), sv.created_at
+      FROM journal_entries je JOIN source_versions sv ON sv.id = je.current_version_id;
+
+      INSERT INTO fts_sources(document_id, title, content)
+      SELECT id, title, content FROM source_search_documents;
+    `
+  },
+  {
+    version: 5,
+    name: "phase-four-agent-harness",
+    sql: `
+      CREATE TABLE agent_runs (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id),
+        user_message_id TEXT NOT NULL REFERENCES messages(id),
+        assistant_message_id TEXT REFERENCES messages(id),
+        intent TEXT NOT NULL CHECK(intent IN ('record', 'retrieve', 'review', 'clarify', 'strategy')),
+        mode TEXT NOT NULL CHECK(mode IN ('private', 'enhanced')),
+        status TEXT NOT NULL CHECK(status IN ('awaiting_consent', 'running', 'succeeded', 'failed', 'cancelled')),
+        model_identity TEXT,
+        model_version INTEGER CHECK(model_version IS NULL OR model_version > 0),
+        tool_schema_version INTEGER NOT NULL CHECK(tool_schema_version > 0),
+        context_hash TEXT NOT NULL CHECK(length(context_hash) = 64),
+        response_version INTEGER NOT NULL CHECK(response_version > 0),
+        response_text TEXT,
+        analysis_json TEXT,
+        citations_json TEXT NOT NULL,
+        error_code TEXT,
+        created_at TEXT NOT NULL,
+        completed_at TEXT
+      ) STRICT;
+      CREATE INDEX agent_runs_conversation_idx ON agent_runs(conversation_id, created_at);
+
+      CREATE TABLE agent_tool_calls (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        sequence INTEGER NOT NULL CHECK(sequence >= 0),
+        tool_name TEXT NOT NULL,
+        tool_version INTEGER NOT NULL CHECK(tool_version > 0),
+        input_hash TEXT NOT NULL CHECK(length(input_hash) = 64),
+        input_refs_json TEXT NOT NULL,
+        output_refs_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('running', 'succeeded', 'failed', 'proposed')),
+        error_code TEXT,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        UNIQUE(run_id, sequence)
+      ) STRICT;
+
+      CREATE TABLE agent_actions (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL REFERENCES agent_tool_calls(id),
+        tool_name TEXT NOT NULL,
+        tool_version INTEGER NOT NULL CHECK(tool_version > 0),
+        summary TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        expected_revision INTEGER CHECK(expected_revision IS NULL OR expected_revision > 0),
+        status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'rejected', 'stale', 'failed')),
+        result_refs_json TEXT NOT NULL,
+        error_code TEXT,
+        created_at TEXT NOT NULL,
+        resolved_at TEXT
+      ) STRICT;
+      CREATE INDEX agent_actions_status_idx ON agent_actions(status, created_at);
+
+      CREATE TABLE external_context_disclosures (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL UNIQUE REFERENCES agent_runs(id) ON DELETE CASCADE,
+        policy_version INTEGER NOT NULL CHECK(policy_version > 0),
+        categories_json TEXT NOT NULL,
+        category_counts_json TEXT NOT NULL,
+        context_hash TEXT NOT NULL CHECK(length(context_hash) = 64),
+        required INTEGER NOT NULL CHECK(required IN (0, 1)),
+        accepted_at TEXT,
+        rejected_at TEXT,
+        created_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE agent_model_settings (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        mode TEXT NOT NULL CHECK(mode IN ('private', 'enhanced')),
+        private_endpoint_json TEXT,
+        enhanced_endpoint_json TEXT,
+        consent_policy_version INTEGER NOT NULL CHECK(consent_policy_version > 0),
+        consented_categories_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE agent_credentials (
+        mode TEXT PRIMARY KEY CHECK(mode IN ('private', 'enhanced')),
+        envelope_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE agent_model_calls (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        sequence INTEGER NOT NULL CHECK(sequence >= 0),
+        endpoint_origin TEXT NOT NULL,
+        model TEXT NOT NULL,
+        categories_json TEXT NOT NULL,
+        context_hash TEXT NOT NULL CHECK(length(context_hash) = 64),
+        status TEXT NOT NULL CHECK(status IN ('running', 'succeeded', 'failed')),
+        prompt_tokens INTEGER CHECK(prompt_tokens IS NULL OR prompt_tokens >= 0),
+        completion_tokens INTEGER CHECK(completion_tokens IS NULL OR completion_tokens >= 0),
+        error_code TEXT,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        UNIQUE(run_id, sequence)
+      ) STRICT;
+    `
   }
 ];
 
@@ -583,6 +830,71 @@ function mapPerson(row: Record<string, unknown>): Person {
   return value;
 }
 
+function mapPersonAlias(row: Record<string, unknown>): PersonAlias {
+  return {
+    id: String(row.id), personId: String(row.person_id), value: String(row.value),
+    normalizedValue: String(row.normalized_value), sourceRefs: JSON.parse(String(row.source_refs_json)) as string[],
+    status: row.status as PersonAlias["status"], createdAt: String(row.created_at), updatedAt: String(row.updated_at)
+  };
+}
+
+function mapPersonMergeSuggestion(row: Record<string, unknown>): PersonMergeSuggestion {
+  const value: PersonMergeSuggestion = {
+    id: String(row.id), personAId: String(row.person_a_id), personBId: String(row.person_b_id),
+    score: Number(row.score), basis: JSON.parse(String(row.basis_json)) as string[],
+    algorithmIdentity: String(row.algorithm_identity), algorithmVersion: Number(row.algorithm_version),
+    status: row.status as PersonMergeSuggestion["status"], createdAt: String(row.created_at), updatedAt: String(row.updated_at)
+  };
+  if (row.merge_record_id) value.mergeRecordId = String(row.merge_record_id);
+  return value;
+}
+
+function mapPersonMergeRecord(row: Record<string, unknown>): PersonMergeRecord {
+  const value: PersonMergeRecord = {
+    id: String(row.id), sourcePersonId: String(row.source_person_id), targetPersonId: String(row.target_person_id),
+    status: row.status as PersonMergeRecord["status"], createdAt: String(row.created_at)
+  };
+  if (row.suggestion_id) value.suggestionId = String(row.suggestion_id);
+  if (row.reverted_at) value.revertedAt = String(row.reverted_at);
+  return value;
+}
+
+function mapEventRelation(row: Record<string, unknown>): EventRelation {
+  const value: EventRelation = {
+    id: String(row.id), sourceEventId: String(row.source_event_id), targetEventId: String(row.target_event_id),
+    kind: row.kind as EventRelation["kind"], status: row.status as EventRelation["status"],
+    origin: row.origin as EventRelation["origin"], basis: JSON.parse(String(row.basis_json)) as EventRelation["basis"],
+    sourceRevision: Number(row.source_revision), targetRevision: Number(row.target_revision),
+    createdAt: String(row.created_at), updatedAt: String(row.updated_at)
+  };
+  if (row.score !== null && row.score !== undefined) value.score = Number(row.score);
+  if (row.algorithm_identity) value.algorithmIdentity = String(row.algorithm_identity);
+  if (row.algorithm_version) value.algorithmVersion = Number(row.algorithm_version);
+  return value;
+}
+
+function mapSearchDocument(row: Record<string, unknown>): SearchDocument {
+  const value: SearchDocument = {
+    kind: row.kind as SearchDocument["kind"], id: String(row.id), title: String(row.title), content: String(row.content),
+    contentHash: String(row.content_hash), sourceRefs: JSON.parse(String(row.source_refs_json)) as string[]
+  };
+  if (row.occurred_at) value.occurredAt = String(row.occurred_at);
+  if (row.event_id) value.eventId = String(row.event_id);
+  if (row.source_item_id) value.sourceItemId = String(row.source_item_id);
+  return value;
+}
+
+function mapEmbeddingGeneration(row: Record<string, unknown>): EmbeddingGeneration {
+  const value: EmbeddingGeneration = {
+    id: String(row.id), adapterIdentity: String(row.adapter_identity), adapterVersion: Number(row.adapter_version),
+    dimensions: Number(row.dimensions), state: row.state as EmbeddingGeneration["state"],
+    documentCount: Number(row.document_count), createdAt: String(row.created_at)
+  };
+  if (row.last_error) value.lastError = String(row.last_error);
+  if (row.activated_at) value.activatedAt = String(row.activated_at);
+  return value;
+}
+
 function mapEvent(row: Record<string, unknown>): Event {
   return JSON.parse(String(row.snapshot_json)) as Event;
 }
@@ -805,9 +1117,10 @@ export class SqliteMemoryRepository implements MemoryRepositoryPort {
       conditions.push("e.status = ?");
       parameters.push(query.status);
     }
-    if (query.personId) {
-      conditions.push("EXISTS (SELECT 1 FROM event_people ep WHERE ep.event_id = e.id AND ep.person_id = ?)");
-      parameters.push(query.personId);
+    const personIds = query.personIds?.length ? query.personIds : query.personId ? [query.personId] : [];
+    if (personIds.length) {
+      conditions.push(`EXISTS (SELECT 1 FROM event_people ep WHERE ep.event_id = e.id AND ep.person_id IN (${personIds.map(() => "?").join(",")}))`);
+      parameters.push(...personIds);
     }
     if (query.from) {
       conditions.push("e.occurred_to IS NOT NULL AND e.occurred_to >= ?");
@@ -932,16 +1245,447 @@ export class SqliteMemoryRepository implements MemoryRepositoryPort {
     })();
   }
 
+  listPersonAliases(personId?: string, includeInactive = false): PersonAlias[] {
+    const conditions: string[] = [];
+    const parameters: unknown[] = [];
+    if (personId) { conditions.push("person_id = ?"); parameters.push(personId); }
+    if (!includeInactive) conditions.push("status = 'active'");
+    return (this.database.prepare(`
+      SELECT * FROM person_aliases ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
+      ORDER BY value
+    `).all(...parameters) as Record<string, unknown>[]).map(mapPersonAlias);
+  }
+
+  createPersonAlias(alias: PersonAlias): PersonAlias {
+    try {
+      this.database.prepare(`
+        INSERT INTO person_aliases(id, person_id, value, normalized_value, source_refs_json, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(alias.id, alias.personId, alias.value, alias.normalizedValue, JSON.stringify(alias.sourceRefs),
+        alias.status, alias.createdAt, alias.updatedAt);
+      return alias;
+    } catch (error) {
+      throw new AppError("VALIDATION_FAILED", "That active alias already exists for this person.", false, { cause: error });
+    }
+  }
+
+  deactivatePersonAlias(id: string, now: string): PersonAlias {
+    const result = this.database.prepare(
+      "UPDATE person_aliases SET status = 'inactive', updated_at = ? WHERE id = ?"
+    ).run(now, id);
+    if (result.changes !== 1) throw new AppError("ENTITY_NOT_FOUND", "The alias no longer exists.");
+    return mapPersonAlias(this.database.prepare("SELECT * FROM person_aliases WHERE id = ?").get(id) as Record<string, unknown>);
+  }
+
+  listPersonMergeSuggestions(): PersonMergeSuggestion[] {
+    return (this.database.prepare(
+      "SELECT * FROM person_merge_suggestions ORDER BY status, score DESC, updated_at DESC"
+    ).all() as Record<string, unknown>[]).map(mapPersonMergeSuggestion);
+  }
+
+  upsertPersonMergeSuggestion(suggestion: PersonMergeSuggestion): PersonMergeSuggestion {
+    const existing = this.database.prepare(`
+      SELECT * FROM person_merge_suggestions
+      WHERE person_a_id = ? AND person_b_id = ? AND algorithm_identity = ? AND algorithm_version = ?
+    `).get(suggestion.personAId, suggestion.personBId, suggestion.algorithmIdentity, suggestion.algorithmVersion) as Record<string, unknown> | undefined;
+    if (existing) {
+      const mapped = mapPersonMergeSuggestion(existing);
+      if (mapped.status !== "pending") return mapped;
+      this.database.prepare(`
+        UPDATE person_merge_suggestions SET score = ?, basis_json = ?, updated_at = ? WHERE id = ?
+      `).run(suggestion.score, JSON.stringify(suggestion.basis), suggestion.updatedAt, mapped.id);
+      return { ...mapped, score: suggestion.score, basis: suggestion.basis, updatedAt: suggestion.updatedAt };
+    }
+    this.database.prepare(`
+      INSERT INTO person_merge_suggestions(
+        id, person_a_id, person_b_id, score, basis_json, algorithm_identity, algorithm_version,
+        status, merge_record_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(suggestion.id, suggestion.personAId, suggestion.personBId, suggestion.score, JSON.stringify(suggestion.basis),
+      suggestion.algorithmIdentity, suggestion.algorithmVersion, suggestion.status, suggestion.mergeRecordId ?? null,
+      suggestion.createdAt, suggestion.updatedAt);
+    return suggestion;
+  }
+
+  updatePersonMergeSuggestion(
+    id: string, status: PersonMergeSuggestion["status"], now: string, mergeRecordId?: string
+  ): PersonMergeSuggestion {
+    const result = this.database.prepare(`
+      UPDATE person_merge_suggestions SET status = ?, merge_record_id = COALESCE(?, merge_record_id), updated_at = ? WHERE id = ?
+    `).run(status, mergeRecordId ?? null, now, id);
+    if (result.changes !== 1) throw new AppError("ENTITY_NOT_FOUND", "The merge suggestion no longer exists.");
+    return mapPersonMergeSuggestion(this.database.prepare(
+      "SELECT * FROM person_merge_suggestions WHERE id = ?"
+    ).get(id) as Record<string, unknown>);
+  }
+
+  listPersonMergeRecords(includeReverted = false): PersonMergeRecord[] {
+    const rows = includeReverted
+      ? this.database.prepare("SELECT * FROM person_merge_records ORDER BY created_at DESC").all()
+      : this.database.prepare("SELECT * FROM person_merge_records WHERE status = 'active' ORDER BY created_at DESC").all();
+    return (rows as Record<string, unknown>[]).map(mapPersonMergeRecord);
+  }
+
+  createPersonMerge(record: PersonMergeRecord): PersonMergeRecord {
+    try {
+      this.database.prepare(`
+        INSERT INTO person_merge_records(
+          id, source_person_id, target_person_id, suggestion_id, status, created_at, reverted_at
+        ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+      `).run(record.id, record.sourcePersonId, record.targetPersonId, record.suggestionId ?? null, record.status, record.createdAt);
+      return record;
+    } catch (error) {
+      throw new AppError("PERSON_MERGE_CONFLICT", "This person already has an active identity merge.", false, { cause: error });
+    }
+  }
+
+  revertPersonMerge(id: string, now: string): PersonMergeRecord {
+    const result = this.database.prepare(`
+      UPDATE person_merge_records SET status = 'reverted', reverted_at = ? WHERE id = ? AND status = 'active'
+    `).run(now, id);
+    if (result.changes !== 1) throw new AppError("PERSON_MERGE_CONFLICT", "The identity merge is no longer active.");
+    return mapPersonMergeRecord(this.database.prepare(
+      "SELECT * FROM person_merge_records WHERE id = ?"
+    ).get(id) as Record<string, unknown>);
+  }
+
+  resolveCanonicalPersonId(id: string): string {
+    let current = id;
+    const visited = new Set<string>();
+    while (true) {
+      if (visited.has(current)) throw new AppError("PERSON_MERGE_CONFLICT", "The person identity graph contains a cycle.");
+      visited.add(current);
+      const row = this.database.prepare(`
+        SELECT target_person_id FROM person_merge_records WHERE source_person_id = ? AND status = 'active'
+      `).get(current) as { target_person_id: string } | undefined;
+      if (!row) return current;
+      current = row.target_person_id;
+    }
+  }
+
+  listIdentityPersonIds(id: string): string[] {
+    const canonical = this.resolveCanonicalPersonId(id);
+    const people = this.listPeople(true).map(({ id: personId }) => personId);
+    return people.filter((personId) => this.resolveCanonicalPersonId(personId) === canonical);
+  }
+
+  listEventRelations(eventId?: string, includeRejected = false): EventRelation[] {
+    const conditions: string[] = [];
+    const parameters: unknown[] = [];
+    if (eventId) {
+      conditions.push("(source_event_id = ? OR target_event_id = ?)");
+      parameters.push(eventId, eventId);
+    }
+    if (!includeRejected) conditions.push("status <> 'rejected'");
+    return (this.database.prepare(`
+      SELECT * FROM event_relations ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
+      ORDER BY status, score DESC, updated_at DESC
+    `).all(...parameters) as Record<string, unknown>[]).map(mapEventRelation);
+  }
+
+  getEventRelation(id: string): EventRelation | undefined {
+    const row = this.database.prepare("SELECT * FROM event_relations WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    return row ? mapEventRelation(row) : undefined;
+  }
+
+  upsertEventRelation(relation: EventRelation): EventRelation {
+    const existing = this.database.prepare(`
+      SELECT * FROM event_relations WHERE source_event_id = ? AND target_event_id = ? AND kind = ?
+    `).get(relation.sourceEventId, relation.targetEventId, relation.kind) as Record<string, unknown> | undefined;
+    if (existing) {
+      const mapped = mapEventRelation(existing);
+      if (relation.origin === "user") {
+        this.database.prepare(`
+          UPDATE event_relations SET status = 'confirmed', origin = 'user', score = NULL, basis_json = ?,
+            algorithm_identity = NULL, algorithm_version = NULL, source_revision = ?, target_revision = ?, updated_at = ?
+          WHERE id = ?
+        `).run(JSON.stringify(relation.basis), relation.sourceRevision, relation.targetRevision, relation.updatedAt, mapped.id);
+        return this.getEventRelation(mapped.id)!;
+      }
+      if (mapped.status !== "suggested" || mapped.origin !== "algorithm") return mapped;
+      this.database.prepare(`
+        UPDATE event_relations SET score = ?, basis_json = ?, source_revision = ?, target_revision = ?, updated_at = ? WHERE id = ?
+      `).run(relation.score ?? null, JSON.stringify(relation.basis), relation.sourceRevision,
+        relation.targetRevision, relation.updatedAt, mapped.id);
+      return this.getEventRelation(mapped.id)!;
+    }
+    this.database.prepare(`
+      INSERT INTO event_relations(
+        id, source_event_id, target_event_id, kind, status, origin, score, basis_json,
+        algorithm_identity, algorithm_version, source_revision, target_revision, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(relation.id, relation.sourceEventId, relation.targetEventId, relation.kind, relation.status,
+      relation.origin, relation.score ?? null, JSON.stringify(relation.basis), relation.algorithmIdentity ?? null,
+      relation.algorithmVersion ?? null, relation.sourceRevision, relation.targetRevision, relation.createdAt, relation.updatedAt);
+    return relation;
+  }
+
+  updateEventRelationStatus(id: string, status: EventRelation["status"], now: string): EventRelation {
+    const result = this.database.prepare(
+      "UPDATE event_relations SET status = ?, updated_at = ? WHERE id = ?"
+    ).run(status, now, id);
+    if (result.changes !== 1) throw new AppError("ENTITY_NOT_FOUND", "The event relation no longer exists.");
+    return this.getEventRelation(id)!;
+  }
+
+  deleteEventRelation(id: string): void {
+    const result = this.database.prepare("DELETE FROM event_relations WHERE id = ?").run(id);
+    if (result.changes !== 1) throw new AppError("ENTITY_NOT_FOUND", "The event relation no longer exists.");
+  }
+
+  searchUnifiedKeyword(query: UnifiedSearchQuery): UnifiedSearchHit[] {
+    const limit = Math.min(200, Math.max(1, query.limit ?? 100));
+    const eventQuery: EventSearchQuery = {
+      text: query.text, limit, ...(query.status ? { status: query.status } : {}),
+      ...(query.from ? { from: query.from } : {}), ...(query.to ? { to: query.to } : {})
+    };
+    if (query.personId) eventQuery.personIds = this.listIdentityPersonIds(query.personId);
+    const includeEvents = !query.kinds?.length || query.kinds.includes("event");
+    const eventHits = includeEvents ? this.searchEvents(eventQuery).map((event, index): UnifiedSearchHit => {
+      const occurredAt = temporalBounds(event).from;
+      return {
+        kind: "event", id: event.id, eventId: event.id, title: event.title,
+        excerpt: (event.narrative ?? event.facts.map(({ text }) => text).join(" ")).slice(0, 360),
+        ...(occurredAt ? { occurredAt } : {}), sourceRefs: event.sourceRefs,
+        keywordScore: 1 / (index + 1), combinedScore: 1 / (index + 1)
+      };
+    }) : [];
+    const sourceKinds = (query.kinds ?? ["journal_entry", "transcript"]).filter((kind) => kind !== "event");
+    if (!sourceKinds.length) return eventHits.slice(0, limit);
+    const conditions = [`d.kind IN (${sourceKinds.map(() => "?").join(",")})`];
+    const parameters: unknown[] = [...sourceKinds];
+    const hasText = Boolean(query.text.trim());
+    if (hasText) { conditions.push("fts_sources MATCH ?"); parameters.push(ftsQuery(query.text)); }
+    if (query.from) { conditions.push("d.occurred_at IS NOT NULL AND d.occurred_at >= ?"); parameters.push(query.from); }
+    if (query.to) { conditions.push("d.occurred_at IS NOT NULL AND d.occurred_at <= ?"); parameters.push(query.to); }
+    if (query.status) {
+      conditions.push(`EXISTS (
+        SELECT 1 FROM event_sources es JOIN events linked ON linked.id = es.event_id
+        WHERE es.source_item_id = d.source_item_id AND linked.status = ?
+      )`);
+      parameters.push(query.status);
+    }
+    if (query.personId) {
+      const personIds = this.listIdentityPersonIds(query.personId);
+      conditions.push(`EXISTS (
+        SELECT 1 FROM event_sources es JOIN event_people ep ON ep.event_id = es.event_id
+        WHERE es.source_item_id = d.source_item_id AND ep.person_id IN (${personIds.map(() => "?").join(",")})
+      )`);
+      parameters.push(...personIds);
+    }
+    parameters.push(limit);
+    const rows = this.database.prepare(`
+      SELECT d.*${hasText ? ", bm25(fts_sources) AS rank" : ""}
+      FROM source_search_documents d ${hasText ? "JOIN fts_sources ON fts_sources.document_id = d.id" : ""}
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY ${hasText ? "rank, d.updated_at DESC" : "d.updated_at DESC"} LIMIT ?
+    `).all(...parameters) as Record<string, unknown>[];
+    const sourceHits = rows.map((row, index): UnifiedSearchHit => {
+      const document = mapSearchDocument(row);
+      return {
+        kind: document.kind, id: document.id, title: document.title, excerpt: document.content.slice(0, 360),
+        ...(document.occurredAt ? { occurredAt: document.occurredAt } : {}),
+        ...(document.eventId ? { eventId: document.eventId } : {}),
+        ...(document.sourceItemId ? { sourceItemId: document.sourceItemId } : {}),
+        sourceRefs: document.sourceRefs, keywordScore: 1 / (index + 1), combinedScore: 1 / (index + 1)
+      };
+    });
+    return [...eventHits, ...sourceHits].sort((a, b) => (b.keywordScore ?? 0) - (a.keywordScore ?? 0)).slice(0, limit);
+  }
+
+  listSearchDocuments(): SearchDocument[] {
+    const events = (this.database.prepare("SELECT * FROM events WHERE status <> 'archived'").all() as Record<string, unknown>[])
+      .map(mapEvent).map((event): SearchDocument => {
+        const content = [event.title, event.narrative ?? "", ...event.facts.map(({ text }) => text),
+          ...event.interpretations.map(({ text }) => text), ...event.interests.map(({ label }) => label)].join("\n");
+        const occurredAt = temporalBounds(event).from;
+        return {
+          kind: "event", id: event.id, eventId: event.id, title: event.title, content,
+          contentHash: createHash("sha256").update(content).digest("hex"),
+          ...(occurredAt ? { occurredAt } : {}), sourceRefs: event.sourceRefs
+        };
+      });
+    const sources = (this.database.prepare("SELECT * FROM source_search_documents").all() as Record<string, unknown>[]).map(mapSearchDocument);
+    return [...events, ...sources];
+  }
+
+  upsertSearchDocument(document: SearchDocument, now: string): void {
+    if (document.kind === "event") throw new AppError("VALIDATION_FAILED", "Event search documents are derived from Event projections.");
+    this.database.transaction(() => {
+      this.database.prepare(`
+        INSERT INTO source_search_documents(
+          id, kind, title, content, content_hash, occurred_at, event_id, source_item_id, source_refs_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, title = excluded.title, content = excluded.content,
+          content_hash = excluded.content_hash, occurred_at = excluded.occurred_at, event_id = excluded.event_id,
+          source_item_id = excluded.source_item_id, source_refs_json = excluded.source_refs_json, updated_at = excluded.updated_at
+      `).run(document.id, document.kind, document.title, document.content, document.contentHash,
+        document.occurredAt ?? null, document.eventId ?? null, document.sourceItemId ?? null,
+        JSON.stringify(document.sourceRefs), now);
+      this.database.prepare("DELETE FROM fts_sources WHERE document_id = ?").run(document.id);
+      this.database.prepare("INSERT INTO fts_sources(document_id, title, content) VALUES (?, ?, ?)")
+        .run(document.id, document.title, document.content);
+    })();
+  }
+
+  getSourceReference(id: string): SourceReferenceDetail | undefined {
+    const row = this.database.prepare(`
+      SELECT si.*, s.kind AS source_kind, s.name AS source_name,
+        m.id AS message_id, m.conversation_id,
+        je.journal_date, je.current_version,
+        sv.content AS version_content, sv.content_hash
+      FROM source_items si JOIN sources s ON s.id = si.source_id
+      LEFT JOIN messages m ON m.source_item_id = si.id
+      LEFT JOIN journal_entries je ON je.source_item_id = si.id
+      LEFT JOIN source_versions sv ON sv.id = je.current_version_id
+      WHERE si.id = ?
+    `).get(id) as Record<string, unknown> | undefined;
+    if (!row) {
+      const transcript = this.database.prepare(
+        "SELECT * FROM source_search_documents WHERE id = ? AND kind = 'transcript'"
+      ).get(id) as Record<string, unknown> | undefined;
+      if (!transcript) return undefined;
+      const document = mapSearchDocument(transcript);
+      return {
+        sourceItemId: document.sourceItemId ?? document.id, kind: "transcript", title: document.title,
+        excerpt: document.content.slice(0, 4000), recordedAt: document.occurredAt ?? String(transcript.updated_at),
+        eventIds: document.eventId ? [document.eventId] : [], assetIds: []
+      };
+    }
+    const eventIds = (this.database.prepare("SELECT event_id FROM event_sources WHERE source_item_id = ? ORDER BY event_id")
+      .all(id) as Array<{ event_id: string }>).map(({ event_id }) => event_id);
+    const directAssets = (this.database.prepare("SELECT asset_id FROM source_item_assets WHERE source_item_id = ?")
+      .all(id) as Array<{ asset_id: string }>).map(({ asset_id }) => asset_id);
+    const versionAssets = (this.database.prepare(`
+      SELECT sva.asset_id FROM journal_entries je JOIN source_version_assets sva ON sva.source_version_id = je.current_version_id
+      WHERE je.source_item_id = ?
+    `).all(id) as Array<{ asset_id: string }>).map(({ asset_id }) => asset_id);
+    const isJournal = Boolean(row.journal_date);
+    const isMessage = Boolean(row.message_id);
+    const value: SourceReferenceDetail = {
+      sourceItemId: id, kind: isJournal ? "journal_entry" : isMessage ? "message" : "manual",
+      title: isJournal ? `Day One · ${String(row.journal_date)}` : String(row.source_name),
+      excerpt: String(row.version_content ?? row.content ?? "").slice(0, 4000), recordedAt: String(row.recorded_at),
+      eventIds, assetIds: [...new Set([...directAssets, ...versionAssets])]
+    };
+    if (row.current_version) value.sourceVersion = Number(row.current_version);
+    if (row.content_hash) value.contentHash = String(row.content_hash);
+    if (row.conversation_id) value.conversationId = String(row.conversation_id);
+    if (row.message_id) value.messageId = String(row.message_id);
+    return value;
+  }
+
+  getSetting<T>(key: string): T | undefined {
+    const row = this.database.prepare("SELECT value_json FROM workspace_settings WHERE key = ?").get(key) as { value_json: string } | undefined;
+    return row ? JSON.parse(row.value_json) as T : undefined;
+  }
+
+  setSetting(key: string, value: unknown, now: string): void {
+    this.database.prepare(`
+      INSERT INTO workspace_settings(key, value_json, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+    `).run(key, JSON.stringify(value), now);
+  }
+
+  listEmbeddingGenerations(): EmbeddingGeneration[] {
+    return (this.database.prepare("SELECT * FROM embedding_generations ORDER BY created_at DESC").all() as Record<string, unknown>[])
+      .map(mapEmbeddingGeneration);
+  }
+
+  createEmbeddingGeneration(generation: EmbeddingGeneration): void {
+    this.database.prepare(`
+      INSERT INTO embedding_generations(
+        id, adapter_identity, adapter_version, dimensions, state, document_count, last_error, created_at, activated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(generation.id, generation.adapterIdentity, generation.adapterVersion, generation.dimensions,
+      generation.state, generation.documentCount, generation.lastError ?? null, generation.createdAt, generation.activatedAt ?? null);
+  }
+
+  putEmbedding(generationId: string, document: SearchDocument, vector: Float32Array): void {
+    const bytes = Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength);
+    this.database.prepare(`
+      INSERT INTO embeddings(generation_id, document_kind, document_id, content_hash, vector)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(generation_id, document_kind, document_id)
+      DO UPDATE SET content_hash = excluded.content_hash, vector = excluded.vector
+    `).run(generationId, document.kind, document.id, document.contentHash, bytes);
+  }
+
+  activateEmbeddingGeneration(id: string, documentCount: number, now: string): void {
+    this.database.transaction(() => {
+      this.database.prepare("UPDATE embedding_generations SET state = 'superseded' WHERE state = 'active'").run();
+      const result = this.database.prepare(`
+        UPDATE embedding_generations SET state = 'active', document_count = ?, activated_at = ?, last_error = NULL
+        WHERE id = ? AND state = 'building'
+      `).run(documentCount, now, id);
+      if (result.changes !== 1) throw new AppError("VALIDATION_FAILED", "The embedding generation is no longer buildable.");
+    })();
+  }
+
+  failEmbeddingGeneration(id: string, error: string): void {
+    this.database.prepare(
+      "UPDATE embedding_generations SET state = 'failed', last_error = ? WHERE id = ? AND state = 'building'"
+    ).run(error.slice(0, 1000), id);
+  }
+
+  listEmbeddings(generationId: string): Array<{ document: SearchDocument; vector: Float32Array }> {
+    const documents = new Map(this.listSearchDocuments().map((document) => [`${document.kind}:${document.id}`, document]));
+    const rows = this.database.prepare("SELECT * FROM embeddings WHERE generation_id = ?").all(generationId) as Record<string, unknown>[];
+    return rows.flatMap((row) => {
+      const document = documents.get(`${String(row.document_kind)}:${String(row.document_id)}`);
+      if (!document || document.contentHash !== String(row.content_hash)) return [];
+      const buffer = row.vector as Buffer;
+      const copy = Uint8Array.from(buffer);
+      return [{ document, vector: new Float32Array(copy.buffer) }];
+    });
+  }
+
+  listReviews(): ReviewRun[] {
+    return (this.database.prepare(
+      "SELECT output_json FROM analysis_runs WHERE type = 'review.periodic' ORDER BY created_at DESC"
+    ).all() as Array<{ output_json: string }>).map(({ output_json }) => JSON.parse(output_json) as ReviewRun);
+  }
+
+  getReview(id: string): ReviewRun | undefined {
+    const row = this.database.prepare(
+      "SELECT output_json FROM analysis_runs WHERE id = ? AND type = 'review.periodic'"
+    ).get(id) as { output_json: string } | undefined;
+    return row ? JSON.parse(row.output_json) as ReviewRun : undefined;
+  }
+
+  saveReview(review: ReviewRun): ReviewRun {
+    this.database.prepare(`
+      INSERT INTO analysis_runs(
+        id, type, processor_identity, processor_version, input_hash, from_date, to_date, output_json, created_at
+      ) VALUES (?, 'review.periodic', ?, ?, ?, ?, ?, ?, ?)
+    `).run(review.id, review.generatorIdentity, review.generatorVersion, review.inputHash,
+      review.from, review.to, JSON.stringify(review), review.createdAt);
+    return review;
+  }
+
   listClarifications(eventId?: string): Clarification[] {
     const rows = eventId
       ? this.database.prepare("SELECT * FROM clarifications WHERE event_id = ? ORDER BY created_at").all(eventId)
-      : this.database.prepare("SELECT * FROM clarifications ORDER BY status, priority DESC, created_at").all();
+      : this.database.prepare(`
+          SELECT * FROM clarifications ORDER BY
+            CASE status WHEN 'open' THEN 0 WHEN 'answered' THEN 1 ELSE 2 END,
+            CASE priority WHEN 'rights_related' THEN 0 WHEN 'important' THEN 1 ELSE 2 END,
+            created_at
+        `).all();
     return (rows as Record<string, unknown>[]).map(mapClarification);
   }
 
   getClarification(id: string): Clarification | undefined {
     const row = this.database.prepare("SELECT * FROM clarifications WHERE id = ?").get(id) as Record<string, unknown> | undefined;
     return row ? mapClarification(row) : undefined;
+  }
+
+  setClarificationPriority(id: string, priority: Clarification["priority"], now: string): Clarification {
+    const result = this.database.prepare(
+      "UPDATE clarifications SET priority = ?, updated_at = ? WHERE id = ?"
+    ).run(priority, now, id);
+    if (result.changes !== 1) throw new AppError("ENTITY_NOT_FOUND", "The clarification no longer exists.");
+    return mapClarification(this.database.prepare("SELECT * FROM clarifications WHERE id = ?").get(id) as Record<string, unknown>);
   }
 
   private getConversationRequired(id: string): Conversation {
@@ -1179,6 +1923,12 @@ export class SqliteDayOneRepository implements DayOneRepositoryPort {
         INSERT INTO import_run_entries(import_run_id, source_item_id, outcome) VALUES (?, ?, ?)
         ON CONFLICT(import_run_id, source_item_id) DO UPDATE SET outcome = excluded.outcome
       `).run(importRunId, sourceItemId, existingRow ? "updated" : "new");
+      const title = entry.text.trim().split(/[。！？.!?\n]/, 1)[0]?.slice(0, 120) || `Day One · ${entry.journalDate}`;
+      this.memory.upsertSearchDocument({
+        kind: "journal_entry", id: `journal:${sourceItemId}`, title, content: entry.text,
+        contentHash: entry.contentHash, occurredAt: entry.journalDate, sourceItemId,
+        sourceRefs: [sourceItemId]
+      }, now);
       return { outcome: existingRow ? "updated" as const : "new" as const, journalEntry: mapJournalEntry(journalRow), sourceVersion };
     })();
   }
@@ -1394,17 +2144,213 @@ export class SqliteDayOneRepository implements DayOneRepositoryPort {
   }
 }
 
+export class SqliteAgentRepository implements AgentRepositoryPort {
+  constructor(private readonly database: Database.Database) {}
+
+  listRuns(conversationId: string): AgentRun[] {
+    const rows = this.database.prepare(
+      "SELECT id FROM agent_runs WHERE conversation_id = ? ORDER BY created_at, id"
+    ).all(conversationId) as Array<{ id: string }>;
+    return rows.map(({ id }) => this.getRun(id)).filter((run): run is AgentRun => Boolean(run));
+  }
+
+  getRun(id: string): AgentRun | undefined {
+    const row = this.database.prepare("SELECT * FROM agent_runs WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    const toolCalls = (this.database.prepare(
+      "SELECT * FROM agent_tool_calls WHERE run_id = ? ORDER BY sequence"
+    ).all(id) as Record<string, unknown>[]).map((tool): AgentToolCall => ({
+      id: String(tool.id), runId: String(tool.run_id), sequence: Number(tool.sequence),
+      toolName: String(tool.tool_name), toolVersion: Number(tool.tool_version), inputHash: String(tool.input_hash),
+      inputRefs: JSON.parse(String(tool.input_refs_json)) as string[],
+      outputRefs: JSON.parse(String(tool.output_refs_json)) as string[],
+      status: tool.status as AgentToolCall["status"], startedAt: String(tool.started_at),
+      ...(tool.error_code ? { errorCode: String(tool.error_code) } : {}),
+      ...(tool.finished_at ? { finishedAt: String(tool.finished_at) } : {})
+    }));
+    const actions = (this.database.prepare(
+      "SELECT * FROM agent_actions WHERE run_id = ? ORDER BY created_at, id"
+    ).all(id) as Record<string, unknown>[]).map((action): AgentAction => ({
+      id: String(action.id), runId: String(action.run_id), toolCallId: String(action.tool_call_id),
+      toolName: String(action.tool_name), toolVersion: Number(action.tool_version), summary: String(action.summary),
+      payload: JSON.parse(String(action.payload_json)), status: action.status as AgentAction["status"],
+      resultRefs: JSON.parse(String(action.result_refs_json)) as string[], createdAt: String(action.created_at),
+      ...(action.expected_revision ? { expectedRevision: Number(action.expected_revision) } : {}),
+      ...(action.resolved_at ? { resolvedAt: String(action.resolved_at) } : {}),
+      ...(action.error_code ? { errorCode: String(action.error_code) } : {})
+    }));
+    const disclosureRow = this.database.prepare(
+      "SELECT * FROM external_context_disclosures WHERE run_id = ?"
+    ).get(id) as Record<string, unknown> | undefined;
+    const disclosure = disclosureRow ? {
+      id: String(disclosureRow.id), runId: String(disclosureRow.run_id), policyVersion: Number(disclosureRow.policy_version),
+      categories: JSON.parse(String(disclosureRow.categories_json)),
+      categoryCounts: JSON.parse(String(disclosureRow.category_counts_json)), contextHash: String(disclosureRow.context_hash),
+      required: Boolean(disclosureRow.required), createdAt: String(disclosureRow.created_at),
+      ...(disclosureRow.accepted_at ? { acceptedAt: String(disclosureRow.accepted_at) } : {}),
+      ...(disclosureRow.rejected_at ? { rejectedAt: String(disclosureRow.rejected_at) } : {})
+    } as NonNullable<AgentRun["disclosure"]> : undefined;
+    return {
+      id: String(row.id), conversationId: String(row.conversation_id), userMessageId: String(row.user_message_id),
+      intent: row.intent as AgentRun["intent"], mode: row.mode as AgentRun["mode"], status: row.status as AgentRun["status"],
+      toolSchemaVersion: Number(row.tool_schema_version), contextHash: String(row.context_hash),
+      responseVersion: Number(row.response_version), citations: JSON.parse(String(row.citations_json)), toolCalls, actions,
+      createdAt: String(row.created_at),
+      ...(row.assistant_message_id ? { assistantMessageId: String(row.assistant_message_id) } : {}),
+      ...(row.model_identity ? { modelIdentity: String(row.model_identity) } : {}),
+      ...(row.model_version ? { modelVersion: Number(row.model_version) } : {}),
+      ...(row.response_text ? { responseText: String(row.response_text) } : {}),
+      ...(row.analysis_json ? { analysis: JSON.parse(String(row.analysis_json)) } : {}),
+      ...(disclosure ? { disclosure } : {}),
+      ...(row.error_code ? { errorCode: String(row.error_code) } : {}),
+      ...(row.completed_at ? { completedAt: String(row.completed_at) } : {})
+    };
+  }
+
+  saveRun(run: AgentRun): AgentRun {
+    return this.database.transaction(() => {
+      this.database.prepare(`
+        INSERT INTO agent_runs(
+          id, conversation_id, user_message_id, assistant_message_id, intent, mode, status, model_identity,
+          model_version, tool_schema_version, context_hash, response_version, response_text, analysis_json,
+          citations_json, error_code, created_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET assistant_message_id = excluded.assistant_message_id,
+          intent = excluded.intent, mode = excluded.mode, status = excluded.status,
+          model_identity = excluded.model_identity, model_version = excluded.model_version,
+          tool_schema_version = excluded.tool_schema_version, context_hash = excluded.context_hash,
+          response_version = excluded.response_version, response_text = excluded.response_text,
+          analysis_json = excluded.analysis_json, citations_json = excluded.citations_json,
+          error_code = excluded.error_code, completed_at = excluded.completed_at
+      `).run(run.id, run.conversationId, run.userMessageId, run.assistantMessageId ?? null, run.intent, run.mode,
+        run.status, run.modelIdentity ?? null, run.modelVersion ?? null, run.toolSchemaVersion, run.contextHash,
+        run.responseVersion, run.responseText ?? null, run.analysis ? JSON.stringify(run.analysis) : null,
+        JSON.stringify(run.citations), run.errorCode ?? null, run.createdAt, run.completedAt ?? null);
+
+      this.database.prepare("DELETE FROM agent_actions WHERE run_id = ?").run(run.id);
+      this.database.prepare("DELETE FROM external_context_disclosures WHERE run_id = ?").run(run.id);
+      this.database.prepare("DELETE FROM agent_tool_calls WHERE run_id = ?").run(run.id);
+      for (const call of run.toolCalls) {
+        this.database.prepare(`
+          INSERT INTO agent_tool_calls(id, run_id, sequence, tool_name, tool_version, input_hash,
+            input_refs_json, output_refs_json, status, error_code, started_at, finished_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(call.id, call.runId, call.sequence, call.toolName, call.toolVersion, call.inputHash,
+          JSON.stringify(call.inputRefs), JSON.stringify(call.outputRefs), call.status, call.errorCode ?? null,
+          call.startedAt, call.finishedAt ?? null);
+      }
+      for (const action of run.actions) {
+        this.database.prepare(`
+          INSERT INTO agent_actions(id, run_id, tool_call_id, tool_name, tool_version, summary, payload_json,
+            expected_revision, status, result_refs_json, error_code, created_at, resolved_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(action.id, action.runId, action.toolCallId, action.toolName, action.toolVersion, action.summary,
+          JSON.stringify(action.payload), action.expectedRevision ?? null, action.status, JSON.stringify(action.resultRefs),
+          action.errorCode ?? null, action.createdAt, action.resolvedAt ?? null);
+      }
+      if (run.disclosure) {
+        const value = run.disclosure;
+        this.database.prepare(`
+          INSERT INTO external_context_disclosures(id, run_id, policy_version, categories_json,
+            category_counts_json, context_hash, required, accepted_at, rejected_at, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(value.id, value.runId, value.policyVersion, JSON.stringify(value.categories),
+          JSON.stringify(value.categoryCounts), value.contextHash, value.required ? 1 : 0,
+          value.acceptedAt ?? null, value.rejectedAt ?? null, value.createdAt);
+      }
+      return this.getRun(run.id)!;
+    })();
+  }
+
+  listModelCallAudits(runId: string): AgentModelCallAudit[] {
+    return (this.database.prepare(
+      "SELECT * FROM agent_model_calls WHERE run_id = ? ORDER BY sequence"
+    ).all(runId) as Record<string, unknown>[]).map((row): AgentModelCallAudit => ({
+      id: String(row.id), runId: String(row.run_id), sequence: Number(row.sequence),
+      endpointOrigin: String(row.endpoint_origin), model: String(row.model),
+      categories: JSON.parse(String(row.categories_json)), contextHash: String(row.context_hash),
+      status: row.status as AgentModelCallAudit["status"], startedAt: String(row.started_at),
+      ...(row.prompt_tokens !== null ? { promptTokens: Number(row.prompt_tokens) } : {}),
+      ...(row.completion_tokens !== null ? { completionTokens: Number(row.completion_tokens) } : {}),
+      ...(row.error_code ? { errorCode: String(row.error_code) } : {}),
+      ...(row.finished_at ? { finishedAt: String(row.finished_at) } : {})
+    }));
+  }
+
+  saveModelCallAudit(audit: AgentModelCallAudit): AgentModelCallAudit {
+    this.database.prepare(`
+      INSERT INTO agent_model_calls(id, run_id, sequence, endpoint_origin, model, categories_json,
+        context_hash, status, prompt_tokens, completion_tokens, error_code, started_at, finished_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET status = excluded.status, prompt_tokens = excluded.prompt_tokens,
+        completion_tokens = excluded.completion_tokens, error_code = excluded.error_code,
+        finished_at = excluded.finished_at
+    `).run(audit.id, audit.runId, audit.sequence, audit.endpointOrigin, audit.model,
+      JSON.stringify(audit.categories), audit.contextHash, audit.status, audit.promptTokens ?? null,
+      audit.completionTokens ?? null, audit.errorCode ?? null, audit.startedAt, audit.finishedAt ?? null);
+    return this.listModelCallAudits(audit.runId).find(({ id }) => id === audit.id)!;
+  }
+
+  getSettings(): AgentModelSettings | undefined {
+    const row = this.database.prepare("SELECT * FROM agent_model_settings WHERE singleton = 1")
+      .get() as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    return {
+      mode: row.mode as AgentModelSettings["mode"], consentPolicyVersion: Number(row.consent_policy_version),
+      consentedDataCategories: JSON.parse(String(row.consented_categories_json)),
+      ...(row.private_endpoint_json ? { privateEndpoint: JSON.parse(String(row.private_endpoint_json)) } : {}),
+      ...(row.enhanced_endpoint_json ? { enhancedEndpoint: JSON.parse(String(row.enhanced_endpoint_json)) } : {})
+    };
+  }
+
+  saveSettings(settings: AgentModelSettings, now: string): AgentModelSettings {
+    this.database.prepare(`
+      INSERT INTO agent_model_settings(singleton, mode, private_endpoint_json, enhanced_endpoint_json,
+        consent_policy_version, consented_categories_json, updated_at)
+      VALUES (1, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(singleton) DO UPDATE SET mode = excluded.mode,
+        private_endpoint_json = excluded.private_endpoint_json,
+        enhanced_endpoint_json = excluded.enhanced_endpoint_json,
+        consent_policy_version = excluded.consent_policy_version,
+        consented_categories_json = excluded.consented_categories_json,
+        updated_at = excluded.updated_at
+    `).run(settings.mode, settings.privateEndpoint ? JSON.stringify(settings.privateEndpoint) : null,
+      settings.enhancedEndpoint ? JSON.stringify(settings.enhancedEndpoint) : null,
+      settings.consentPolicyVersion, JSON.stringify(settings.consentedDataCategories), now);
+    return this.getSettings()!;
+  }
+
+  getCredential(mode: AgentExecutionMode): AgentCredentialEnvelope | undefined {
+    const row = this.database.prepare("SELECT envelope_json FROM agent_credentials WHERE mode = ?")
+      .get(mode) as { envelope_json: string } | undefined;
+    return row ? JSON.parse(row.envelope_json) as AgentCredentialEnvelope : undefined;
+  }
+
+  saveCredential(mode: AgentExecutionMode, envelope: AgentCredentialEnvelope | undefined, now: string): void {
+    if (!envelope) {
+      this.database.prepare("DELETE FROM agent_credentials WHERE mode = ?").run(mode);
+      return;
+    }
+    this.database.prepare(`
+      INSERT INTO agent_credentials(mode, envelope_json, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(mode) DO UPDATE SET envelope_json = excluded.envelope_json, updated_at = excluded.updated_at
+    `).run(mode, JSON.stringify(envelope), now);
+  }
+}
+
 export class SqliteWorkspaceDatabase {
   readonly assets: SqliteAssetRepository;
   readonly jobs: SqliteJobRepository;
   readonly memory: SqliteMemoryRepository;
   readonly dayOne: SqliteDayOneRepository;
+  readonly agents: SqliteAgentRepository;
 
   constructor(readonly database: Database.Database) {
     this.assets = new SqliteAssetRepository(database);
     this.jobs = new SqliteJobRepository(database);
     this.memory = new SqliteMemoryRepository(database);
     this.dayOne = new SqliteDayOneRepository(database, this.memory);
+    this.agents = new SqliteAgentRepository(database);
   }
 
   ensureWorkspace(workspace: Workspace): void {
