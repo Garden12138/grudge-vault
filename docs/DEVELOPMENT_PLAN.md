@@ -23,7 +23,7 @@
 | Phase 5 | Evidence Vault 与 Case | 可以面向权益问题整理来源、缺口和材料包 | Evidence Beta |
 | Phase 6 | 本地智能与持续记忆 | 更自动的处理、回顾和多数据源接入 | Ongoing |
 
-首个“功能齐全且日常可用”的目标是完成 Phase 4。Phase 1 已经能可靠记账，Phase 2 能利用既有 Day One 数据，Phase 3—4 则让长期记忆和 Harness Agent 的差异真正显现。
+Phase 5 Evidence Beta 已于 2026-08-25 完成。Phase 1 已经能可靠记账，Phase 2 能利用既有 Day One 数据，Phase 3—4 形成长期记忆与 Harness Agent，Phase 5 补齐 Evidence、Case、可恢复安全迁移和可独立校验 Binder。
 
 ## 3. Phase 0：可运行基础
 
@@ -193,6 +193,8 @@
 - 模型失败时，普通浏览、搜索和编辑功能仍可使用。
 
 ## 8. Phase 5：Evidence Vault 与 Case
+
+> 实施状态：Evidence Beta 已于 2026-08-25 落地；OCR/ASR 与像素级脱敏仍属于后续阶段。
 
 ### 目标
 

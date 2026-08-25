@@ -212,6 +212,9 @@ export interface Asset {
   originalFileName: string;
   vaultFormat: number;
   integrityStatus: IntegrityStatus;
+  availabilityStatus: AssetAvailabilityStatus;
+  supersededByAssetId?: EntityId;
+  deletedAt?: IsoDateTime;
   verifiedAt?: IsoDateTime;
   createdAt: IsoDateTime;
 }
@@ -535,7 +538,7 @@ export interface Job {
   updatedAt: IsoDateTime;
 }
 
-export type AgentIntent = "record" | "retrieve" | "review" | "clarify" | "strategy";
+export type AgentIntent = "record" | "retrieve" | "review" | "clarify" | "strategy" | "evidence";
 export type AgentExecutionMode = "private" | "enhanced";
 export type AgentDataCategory =
   | "conversation_text"
@@ -682,4 +685,271 @@ export interface AgentModelSettings {
   enhancedEndpoint?: AgentEndpointSettings;
   consentPolicyVersion: number;
   consentedDataCategories: AgentDataCategory[];
+}
+
+export type WorkspaceLockState =
+  | { status: "closed" }
+  | { status: "locked"; workspaceId: EntityId; workspaceName: string }
+  | { status: "open"; workspace: Workspace };
+
+export interface WorkspaceSecuritySettings {
+  autoLockMinutes: 0 | 5 | 15 | 30 | 60;
+  integrityScanIntervalDays: number;
+}
+
+export interface WorkspaceCryptoStatus {
+  workspaceFormatVersion: number;
+  objectFormatVersion: number;
+  activeKeyId: EntityId;
+  keyEpoch: number;
+  retiringKeyIds: EntityId[];
+  migrationState: "idle" | "queued" | "running" | "failed";
+  processedObjects: number;
+  totalObjects: number;
+  lastError?: string;
+}
+
+export interface RecoveryPackageSummary {
+  formatVersion: 1;
+  workspaceId: EntityId;
+  keyEpoch: number;
+  createdAt: IsoDateTime;
+  keyCount: number;
+}
+
+export type AssetAvailabilityStatus = "available" | "missing" | "deleted" | "superseded";
+
+export interface DerivedArtifact {
+  id: EntityId;
+  sourceAssetId: EntityId;
+  kind: "ocr" | "transcript" | "key_frames" | "thumbnail" | "redacted_copy" | "other";
+  sha256: string;
+  byteSize: number;
+  mimeType: string;
+  processorIdentity: string;
+  processorVersion: number;
+  inputHash: string;
+  createdAt: IsoDateTime;
+}
+
+export interface EvidenceReferenceImpact {
+  assetId: EntityId;
+  eventIds: EntityId[];
+  sourceItemIds: EntityId[];
+  importRunIds: EntityId[];
+  caseIds: EntityId[];
+}
+
+export interface EvidenceDetail {
+  asset: Asset;
+  availabilityStatus: AssetAvailabilityStatus;
+  supersededByAssetId?: EntityId;
+  deletedAt?: IsoDateTime;
+  sources: SourceReferenceDetail[];
+  events: Event[];
+  facts: Array<{ eventId: EntityId; statement: Statement }>;
+  cases: Array<{ id: EntityId; title: string }>;
+  derivedArtifacts: DerivedArtifact[];
+  impact: EvidenceReferenceImpact;
+}
+
+export interface IntegrityScanCounts {
+  total: number;
+  verified: number;
+  corrupt: number;
+  missing: number;
+  skipped: number;
+}
+
+export interface IntegrityScanItemResult {
+  assetId: EntityId;
+  result: "verified" | "corrupt" | "missing" | "skipped";
+  expectedSha256: string;
+  expectedByteSize: number;
+  verifiedAt: IsoDateTime;
+  error?: string;
+}
+
+export interface IntegrityScan {
+  id: EntityId;
+  state: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  cursor?: EntityId;
+  counts: IntegrityScanCounts;
+  results?: IntegrityScanItemResult[];
+  lastError?: string;
+  createdAt: IsoDateTime;
+  updatedAt: IsoDateTime;
+  finishedAt?: IsoDateTime;
+}
+
+export interface CaseAmount {
+  id: EntityId;
+  label: string;
+  currency: string;
+  amount?: string;
+  minimum?: string;
+  maximum?: string;
+  precision: Precision;
+  certainty: Certainty;
+  sourceRefs: EntityId[];
+}
+
+export interface CaseDisputePoint {
+  id: EntityId;
+  text: string;
+  sourceRefs: EntityId[];
+}
+
+export interface CaseQuestion {
+  id: EntityId;
+  question: string;
+  reason: string;
+  status: "open" | "answered" | "dismissed";
+  answer?: string;
+  sourceRefs: EntityId[];
+}
+
+export interface CaseMaterialGap {
+  id: EntityId;
+  label: string;
+  reason: string;
+  priority: "normal" | "important" | "rights_related";
+  status: "open" | "resolved" | "dismissed";
+  resolvedByAssetId?: EntityId;
+}
+
+export interface CaseEvidenceLink {
+  id: EntityId;
+  assetId: EntityId;
+  eventId?: EntityId;
+  statementIds: EntityId[];
+  sourceRefs: EntityId[];
+  notes?: string;
+}
+
+export interface Case {
+  id: EntityId;
+  title: string;
+  status: "draft" | "active" | "archived";
+  summary?: string;
+  jurisdiction: string;
+  asOfDate: string;
+  eventRefs: EntityId[];
+  personRefs: EntityId[];
+  sourceRefs: EntityId[];
+  assetRefs: EntityId[];
+  amounts: CaseAmount[];
+  disputePoints: CaseDisputePoint[];
+  questions: CaseQuestion[];
+  materialGaps: CaseMaterialGap[];
+  evidenceLinks: CaseEvidenceLink[];
+  currentRevision: number;
+  createdAt: IsoDateTime;
+  updatedAt: IsoDateTime;
+}
+
+export interface CaseRevision {
+  id: EntityId;
+  caseId: EntityId;
+  revision: number;
+  previousRevision: number;
+  snapshot: Case;
+  actor: "user" | "agent";
+  reason: string;
+  createdAt: IsoDateTime;
+}
+
+export interface CaseDetail {
+  case: Case;
+  revisions: CaseRevision[];
+  events: Event[];
+  people: Person[];
+  evidence: EvidenceDetail[];
+  timeline: TimelineResult;
+  legalVerification?: LegalVerificationResult;
+}
+
+export interface LegalVerificationResult {
+  id: EntityId;
+  caseId: EntityId;
+  caseRevision: number;
+  jurisdiction: string;
+  asOfDate: string;
+  adapterIdentity: string;
+  adapterVersion: number;
+  requestHash: string;
+  status: "needs_external_verification";
+  questions: string[];
+  disclaimer: string;
+  createdAt: IsoDateTime;
+  stale: boolean;
+}
+
+export interface CaseBinderRedactions {
+  personIds: EntityId[];
+  maskAmounts: boolean;
+  maskContacts: boolean;
+  maskAccounts: boolean;
+  maskFileNames: boolean;
+  omitSourceExcerpts: boolean;
+}
+
+export interface CaseBinderProfile {
+  caseRevision: number;
+  eventIds: EntityId[];
+  sourceItemIds: EntityId[];
+  assetIds: EntityId[];
+  derivedArtifactIds: EntityId[];
+  includeOriginals: boolean;
+  includeDerivedArtifacts: boolean;
+  locale: "zh-CN" | "en";
+  redactions: CaseBinderRedactions;
+}
+
+export interface CaseBinderPreviewFile {
+  path: string;
+  classification: "generated" | "original" | "derived";
+  byteSize?: number;
+  sourceId?: EntityId;
+  sha256?: string;
+}
+
+export interface CaseBinderPreview {
+  id: EntityId;
+  caseId: EntityId;
+  caseRevision: number;
+  profile: CaseBinderProfile;
+  files: CaseBinderPreviewFile[];
+  warnings: string[];
+  blockedReasons: string[];
+  createdAt: IsoDateTime;
+}
+
+export interface CaseBinderManifestEntry {
+  path: string;
+  classification: CaseBinderPreviewFile["classification"];
+  byteSize: number;
+  sha256: string;
+  sourceId?: EntityId;
+  originalSha256?: string;
+}
+
+export interface CaseBinderManifestV1 {
+  formatVersion: 1;
+  caseId: EntityId;
+  caseRevision: number;
+  generatedAt: IsoDateTime;
+  generatorIdentity: string;
+  generatorVersion: number;
+  profile: CaseBinderProfile;
+  eventRevisions: Array<{ eventId: EntityId; revision: number }>;
+  entries: CaseBinderManifestEntry[];
+}
+
+export interface CaseBinderExportResult {
+  path: string;
+  manifestSha256: string;
+  fileCount: number;
+  byteSize: number;
+  generatedAt: IsoDateTime;
 }

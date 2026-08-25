@@ -100,3 +100,20 @@ The production build intentionally ships without an Embedding Adapter. When an a
 10. Create and restore a `.gvbackup`; confirm that Agent settings, encrypted credentials, runs, structured analyses, citations, actions, disclosures, and external-call audits survive.
 
 Automated Adapter tests use injected `fetch`/model doubles and never contact a real service. Release verification must use Node 24 and pnpm 11.23 for lint, typecheck, unit/integration, E2E, and production build; validation under another runtime is informative but is not release sign-off.
+
+## Phase 5 acceptance path
+
+1. Open a v1 workspace and confirm that `workspace.json` atomically upgrades to v2, SQLite reaches migration v6, and existing GVOB v1 objects remain readable while `workspace.crypto-migrate` is queued.
+2. Interrupt object/credential migration, restart, and confirm that its SQLite cursor resumes. Complete rotation and verify that every original and derived object header uses the target key before retiring slots are removed.
+3. Export a `.gvrecovery` package with an untrimmed 12+ character passphrase. Confirm that wrong passphrases, tampering, another workspace, and an older epoch fail, then rebind the workspace through a different test KeyProtector.
+4. Trigger manual, system-idle, suspend, and screen-lock paths. Confirm that running jobs are requeued, SQLite closes, key Buffers are zeroed, and Renderer clears entity text, paths, and preview Blob URLs. Unlock must use the OS key store.
+5. Open **Evidence**, run the whole-vault scan, interrupt and resume it, and inspect per-original authentication/hash/size results. Remove an object externally and corrupt another to verify `missing` and `corrupt` remain distinct from availability tombstones.
+6. Inspect deletion impact, reject the first confirmation, then delete an original and confirm its Asset tombstone and Event/Source/Import/Case links remain. Supersede another original and confirm that no existing reference is rewritten.
+7. Create a Case with Events, People, Sources, original Assets, decimal multi-currency amounts, dispute points, questions, material gaps, and Evidence-to-Statement mappings. Cause an `expectedRevision` conflict and verify the newer projection wins.
+8. Run the offline Legal Information Adapter. Change the Case and confirm the old `needs_external_verification` result becomes stale without presenting a legal conclusion.
+9. Use Binder Wizard to select the Case revision, Events, Sources, originals, derived attachments, locale, and redaction profile. Inspect the warning that original bytes may contain sensitive content.
+10. Export to a nonexistent directory. Verify `sha256sums.txt` independently, compare an exported original byte-for-byte, inspect Event revisions in `manifest.json`, and force a corrupt/missing item to confirm atomic failure cleanup.
+11. Ask the Agent for Case evidence. Confirm schema v2 tools reject guessed IDs, Case writes remain approval cards, and `prepare_case_bundle` cannot choose a path or export.
+12. Create and restore a v2 snapshot during mixed-key migration and after Binder audit creation. Confirm all Phase 5 database state and encrypted objects survive, while `.gvrecovery` remains outside the snapshot.
+
+Release sign-off uses Node 24 and pnpm 11.23 for `lint`, `typecheck`, unit/integration tests, the Phase 5 E2E path, and the production build. Native packaging remains a macOS/Windows/Linux CI responsibility.

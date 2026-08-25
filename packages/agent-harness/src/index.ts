@@ -13,6 +13,8 @@ import type {
   AgentModelSettings,
   AgentRun,
   AgentToolCall,
+  Case,
+  EvidenceDetail,
   Event,
   ExternalContextDisclosure,
   GroundedAgentClaim,
@@ -27,11 +29,13 @@ import {
   type AgentSendInput,
   type AgentSendResult,
   type AgentSettingsUpdateInput,
+  type CreateCaseInput,
   type EventWriteFields,
+  type UpdateCaseInput,
   type UpdateEventInput
 } from "@grudge-vault/shared";
 
-export const AGENT_TOOL_SCHEMA_VERSION = 1;
+export const AGENT_TOOL_SCHEMA_VERSION = 2;
 export const AGENT_RESPONSE_VERSION = 1;
 export const AGENT_REDACTION_POLICY_VERSION = 1;
 export const MAX_AGENT_MODEL_ROUNDS = 4;
@@ -78,7 +82,7 @@ export class AgentToolRegistry {
 export function createDefaultAgentToolRegistry(): AgentToolRegistry {
   const registry = new AgentToolRegistry();
   const add = (name: string, description: string, intents: AgentIntent[], write: boolean, schema: z.ZodType) =>
-    registry.register({ name, version: 1, description, intents, write, schema });
+    registry.register({ name, version: 2, description, intents, write, schema });
   add("record_source", "Confirm that the current conversation message is preserved as a local source.", ["record"], false, z.object({}));
   add("propose_event", "Propose a candidate Event for user approval.", ["record"], true, z.object({
     title: z.string().trim().min(1).max(120), narrative: textSchema,
@@ -116,29 +120,47 @@ export function createDefaultAgentToolRegistry(): AgentToolRegistry {
     z.object({ options: z.array(z.object({ title: z.string().trim().min(1).max(120), description: textSchema })).min(2).max(6) }));
   add("create_action_plan", "Create a reversible sequence of proposed next steps.", ["strategy"], false,
     z.object({ steps: z.array(z.string().trim().min(1).max(500)).min(1).max(10) }));
+  add("get_evidence", "Read one known Evidence item without exposing original bytes.", ["evidence", "retrieve"], false,
+    z.object({ evidenceRef: idSchema }));
+  add("get_case", "Read one known Case and its current revision.", ["evidence", "retrieve", "review", "strategy"], false,
+    z.object({ caseRef: idSchema }));
+  add("build_case_timeline", "Build the current Event projection for a known Case.", ["evidence", "review", "strategy"], false,
+    z.object({ caseRef: idSchema }));
+  add("list_case_gaps", "List questions and material gaps for a known Case.", ["evidence", "review", "strategy"], false,
+    z.object({ caseRef: idSchema }));
+  add("create_case", "Propose a new draft Case for explicit user approval.", ["evidence"], true,
+    z.object({ title: z.string().trim().min(1).max(200), jurisdiction: z.string().trim().min(1).max(500), asOfDate: z.iso.date(), summary: z.string().trim().max(20_000).optional() }));
+  add("update_case", "Propose a revision to a known Case for explicit user approval.", ["evidence"], true,
+    z.object({ caseRef: idSchema, expectedRevision: z.number().int().positive(), summary: z.string().trim().max(20_000) }));
+  add("prepare_case_bundle", "Request a user-controlled Case Binder preview; never exports files.", ["evidence"], false,
+    z.object({ caseRef: idSchema }));
   return registry;
 }
 
-export function exportAgentToolSchemasV1(intent?: AgentIntent): Array<{
+export function exportAgentToolSchemasV2(intent?: AgentIntent): Array<{
   name: string;
-  version: 1;
+  version: 2;
   description: string;
   intents: AgentIntent[];
   write: boolean;
   schema: Record<string, unknown>;
 }> {
   const registry = createDefaultAgentToolRegistry();
-  const tools = intent ? registry.definitions(intent) : (["record", "retrieve", "review", "clarify", "strategy"] as const)
+  const tools = intent ? registry.definitions(intent) : (["record", "retrieve", "review", "clarify", "strategy", "evidence"] as const)
     .flatMap((value) => registry.definitions(value))
     .filter((tool, index, all) => all.findIndex(({ name }) => name === tool.name) === index);
   return tools.map(({ name, description, intents, write, jsonSchema }) => ({
-    name, version: 1, description, intents, write, schema: jsonSchema
+    name, version: 2, description, intents, write, schema: jsonSchema
   }));
 }
+
+/** @deprecated Consumers should advertise the v2 registry. */
+export const exportAgentToolSchemasV1 = exportAgentToolSchemasV2;
 
 export function routeAgentIntent(content: string): AgentIntent {
   const text = content.normalize("NFKC").toLocaleLowerCase("en-US");
   if (/补全|澄清|回答.*问题|clarif|fill.*gap|answer.*question/.test(text)) return "clarify";
+  if (/证据|原件|材料缺口|案卷|案件|case\b|evidence|binder/.test(text)) return "evidence";
   if (/复盘|回顾|月度|季度|这一年|timeline|review|summar/.test(text)) return "review";
   if (/策略|怎么办|行动|选项|风险|利弊|归属|strategy|option|risk|what should/.test(text)) return "strategy";
   if (/^(?:请)?(?:记录|记下)|^record\b|保存.*事件|发生了|remember|save.*event/.test(text)) return "record";
@@ -331,6 +353,8 @@ interface AgentSnapshot {
   categories: AgentDataCategory[];
   categoryCounts: Partial<Record<AgentDataCategory, number>>;
   events: Event[];
+  cases: Case[];
+  evidence: EvidenceDetail[];
   sources: SourceReferenceDetail[];
   hits: UnifiedSearchHit[];
   citations: AgentCitation[];
@@ -435,6 +459,7 @@ function deterministicResponse(intent: AgentIntent, snapshot: AgentSnapshot, act
   if (english) {
     if (intent === "record") return actions.length ? "I preserved your message and prepared a candidate Event for approval." : "I preserved your message as a local source.";
     if (intent === "clarify" && actions.some(({ status }) => status === "approved")) return "I saved this direct answer to the single clarification that was shown, with your message as its source.";
+    if (intent === "evidence") return `I found ${snapshot.cases.length} Case(s) and ${snapshot.evidence.length} Evidence item(s). Binder export remains a user-only action.`;
     if (snapshot.events.length === 0) return "I could not find a matching local Event. I have not filled in any missing details.";
     if (intent === "strategy") return `I found ${snapshot.events.length} grounded Event(s). The analysis separates facts, unknowns, interpretations, risks, and reversible options.`;
     if (intent === "review") return `I found ${snapshot.events.length} Event(s) for this review. Every factual item below links back to local memory.`;
@@ -442,6 +467,7 @@ function deterministicResponse(intent: AgentIntent, snapshot: AgentSnapshot, act
   }
   if (intent === "record") return actions.length ? "我已保存原始消息，并准备了一条待确认的候选事件。" : "我已将这条消息保存为本地来源。";
   if (intent === "clarify" && actions.some(({ status }) => status === "approved")) return "我已把这条直接回复写入刚才明确展示的单个待补全问题，并保留了原始消息作为依据。";
+  if (intent === "evidence") return `找到 ${snapshot.cases.length} 个 Case 和 ${snapshot.evidence.length} 项证据；Binder 导出仍必须由用户点击完成。`;
   if (snapshot.events.length === 0) return "没有找到匹配的本地事件；我没有补造缺失信息。";
   if (intent === "strategy") return `找到 ${snapshot.events.length} 条有依据的事件。下面将事实、未知、解释、风险和可逆行动选项分开呈现。`;
   if (intent === "review") return `找到 ${snapshot.events.length} 条用于本次回顾的事件；下列事实均可跳回本地来源。`;
@@ -551,7 +577,7 @@ export class AgentHarness {
     const now = new Date().toISOString();
     let nextAction: AgentAction;
     try {
-      let result: Event;
+      let result: Event | Case;
       if (action.toolName === "propose_event") {
         result = this.application.proposeAgentEvent(action.payload as EventWriteFields, sourceRef);
       } else if (action.toolName === "update_event" || action.toolName === "add_asset") {
@@ -559,12 +585,18 @@ export class AgentHarness {
       } else if (action.toolName === "answer_clarification") {
         const input = action.payload as { clarificationId: string; answer: string; expectedRevision: number };
         result = this.application.answerClarificationFromAgent(input.clarificationId, input.answer, input.expectedRevision, sourceRef);
+      } else if (action.toolName === "create_case") {
+        const input = action.payload as CreateCaseInput;
+        result = this.application.createCase({ ...input, sourceRefs: [...new Set([...input.sourceRefs, sourceRef])] });
+      } else if (action.toolName === "update_case") {
+        const input = action.payload as UpdateCaseInput;
+        result = this.application.updateCase({ ...input, sourceRefs: [...new Set([...input.sourceRefs, sourceRef])] });
       } else throw new AppError("AGENT_TOOL_FAILED", "The stored Agent action uses an unsupported tool.");
       nextAction = { ...action, status: "approved", resultRefs: [result.id], resolvedAt: now };
     } catch (error) {
       const code = error instanceof AppError ? error.code : "INTERNAL_ERROR";
       nextAction = {
-        ...action, status: code === "EVENT_REVISION_CONFLICT" ? "stale" : "failed",
+        ...action, status: code === "EVENT_REVISION_CONFLICT" || code === "CASE_REVISION_CONFLICT" ? "stale" : "failed",
         errorCode: code, resolvedAt: now
       };
     }
@@ -611,9 +643,12 @@ export class AgentHarness {
     const now = new Date().toISOString();
     const initialCall: AgentToolCall = {
       id: randomUUID(), runId: run.id, sequence: 0,
-      toolName: run.intent === "record" ? "record_source" : "search_events", toolVersion: 1,
+      toolName: run.intent === "record" ? "record_source" : run.intent === "evidence" ? "get_evidence" : "search_events",
+      toolVersion: AGENT_TOOL_SCHEMA_VERSION,
       inputHash: sha256(userMessage.content ?? ""), inputRefs: [userMessage.sourceItemId],
-      outputRefs: snapshot.events.map(({ id }) => id), status: "succeeded", startedAt: now, finishedAt: now
+      outputRefs: run.intent === "evidence"
+        ? [...snapshot.cases.map(({ id }) => id), ...snapshot.evidence.map(({ asset }) => asset.id)]
+        : snapshot.events.map(({ id }) => id), status: "succeeded", startedAt: now, finishedAt: now
     };
     run = { ...run, status: "running", toolCalls: [initialCall], citations: snapshot.citations };
     const endpoint = settings.mode === "private" ? settings.privateEndpoint : settings.enhancedEndpoint;
@@ -680,12 +715,12 @@ export class AgentHarness {
       facts: [], interpretations: [], emotions: [], interests: [], participants: [], sourceRefs: [], assetRefs: []
     };
     const call: AgentToolCall = {
-      id: randomUUID(), runId: run.id, sequence: run.toolCalls.length, toolName: "propose_event", toolVersion: 1,
+      id: randomUUID(), runId: run.id, sequence: run.toolCalls.length, toolName: "propose_event", toolVersion: AGENT_TOOL_SCHEMA_VERSION,
       inputHash: sha256(JSON.stringify(fields)), inputRefs: [run.userMessageId], outputRefs: [], status: "proposed",
       startedAt: new Date().toISOString()
     };
     const action: AgentAction = {
-      id: randomUUID(), runId: run.id, toolCallId: call.id, toolName: call.toolName, toolVersion: 1,
+      id: randomUUID(), runId: run.id, toolCallId: call.id, toolName: call.toolName, toolVersion: AGENT_TOOL_SCHEMA_VERSION,
       summary: `创建候选事件：${title}`, payload: fields, status: "pending", resultRefs: [], createdAt: call.startedAt
     };
     return { ...run, toolCalls: [...run.toolCalls, call], actions: [...run.actions, action] };
@@ -707,12 +742,12 @@ export class AgentHarness {
     );
     const call: AgentToolCall = {
       id: randomUUID(), runId: run.id, sequence: run.toolCalls.length,
-      toolName: "answer_clarification", toolVersion: 1,
+      toolName: "answer_clarification", toolVersion: AGENT_TOOL_SCHEMA_VERSION,
       inputHash: sha256(userMessage.content!), inputRefs: [clarification.id, userMessage.sourceItemId],
       outputRefs: [result.id], status: "succeeded", startedAt: now, finishedAt: now
     };
     const action: AgentAction = {
-      id: randomUUID(), runId: run.id, toolCallId: call.id, toolName: call.toolName, toolVersion: 1,
+      id: randomUUID(), runId: run.id, toolCallId: call.id, toolName: call.toolName, toolVersion: AGENT_TOOL_SCHEMA_VERSION,
       summary: "回答一条当前明确展示的待补全问题", payload: {
         clarificationId: clarification.id, expectedRevision: event.currentRevision
       }, expectedRevision: event.currentRevision, status: "approved", resultRefs: [result.id],
@@ -744,7 +779,47 @@ export class AgentHarness {
     let output: unknown;
     let action: AgentAction | undefined;
     const value = input as Record<string, unknown>;
-    if (name === "search_events") {
+    if (name === "get_evidence") {
+      const evidence = this.application.getEvidence(resolve(String(value.evidenceRef)));
+      output = {
+        ref: String(value.evidenceRef), sha256: evidence.asset.sha256, byteSize: evidence.asset.byteSize,
+        mimeType: evidence.asset.mimeType, availabilityStatus: evidence.availabilityStatus,
+        integrityStatus: evidence.asset.integrityStatus, derivedArtifacts: evidence.derivedArtifacts.map(({ id, kind }) => ({ id, kind }))
+      };
+      call.outputRefs = [evidence.asset.id, ...evidence.derivedArtifacts.map(({ id }) => id)];
+    } else if (name === "get_case") {
+      const detail = this.application.getCase(resolve(String(value.caseRef)));
+      output = {
+        ref: String(value.caseRef), title: redactExternalText(detail.case.title, snapshot.personNames),
+        status: detail.case.status, jurisdiction: detail.case.jurisdiction, asOfDate: detail.case.asOfDate,
+        currentRevision: detail.case.currentRevision, eventCount: detail.case.eventRefs.length,
+        evidenceCount: detail.case.assetRefs.length
+      };
+      call.outputRefs = [detail.case.id, ...detail.case.eventRefs, ...detail.case.assetRefs];
+    } else if (name === "build_case_timeline") {
+      const detail = this.application.getCase(resolve(String(value.caseRef)));
+      output = detail.timeline.groups.map(({ label, events }) => ({ label, events: events.map(({ id, title, currentRevision }) => ({
+        ref: [...snapshot.aliases.entries()].find(([, target]) => target === id)?.[0] ?? "event",
+        title: redactExternalText(title, snapshot.personNames), currentRevision
+      })) }));
+      call.outputRefs = detail.case.eventRefs;
+    } else if (name === "list_case_gaps") {
+      const detail = this.application.getCase(resolve(String(value.caseRef)));
+      output = {
+        questions: detail.case.questions.map(({ question, reason, status }) => ({
+          question: redactExternalText(question, snapshot.personNames), reason: redactExternalText(reason, snapshot.personNames), status
+        })),
+        materialGaps: detail.case.materialGaps.map(({ label, reason, priority, status }) => ({
+          label: redactExternalText(label, snapshot.personNames), reason: redactExternalText(reason, snapshot.personNames), priority, status
+        }))
+      };
+      call.outputRefs = [detail.case.id];
+    } else if (name === "prepare_case_bundle") {
+      const detail = this.application.getCase(resolve(String(value.caseRef)));
+      output = { previewCard: true, caseRef: String(value.caseRef), caseRevision: detail.case.currentRevision,
+        requiresUserSelection: true, exportAvailableToModel: false };
+      call.outputRefs = [detail.case.id];
+    } else if (name === "search_events") {
       const hits = await this.application.unifiedSearch({ text: String(value.query), semantic: false, limit: 8 });
       output = hits.map((hit, index) => {
         const ref = `search_result_${index + 1}`;
@@ -852,6 +927,22 @@ export class AgentHarness {
           assetRefs: [...new Set([...event.assetRefs, assetId])], reason: "Agent asset link approved by user"
         } satisfies UpdateEventInput;
         summary = `关联材料到事件：${event.title}`;
+      } else if (name === "create_case") {
+        payload = {
+          title: String(value.title), status: "draft", ...(value.summary ? { summary: String(value.summary) } : {}),
+          jurisdiction: String(value.jurisdiction), asOfDate: String(value.asOfDate), eventRefs: [], personRefs: [],
+          sourceRefs: [], assetRefs: [], amounts: [], disputePoints: [], questions: [], materialGaps: [], evidenceLinks: [],
+          reason: "Agent Case creation approved by user"
+        } satisfies CreateCaseInput;
+        summary = `创建 Case：${String(value.title)}`;
+      } else if (name === "update_case") {
+        const caseItem = this.application.getCase(resolve(String(value.caseRef))).case;
+        expectedRevision = Number(value.expectedRevision);
+        payload = {
+          ...caseItem, caseId: caseItem.id, expectedRevision, summary: String(value.summary),
+          reason: "Agent Case revision approved by user"
+        } satisfies UpdateCaseInput;
+        summary = `更新 Case：${caseItem.title}`;
       } else throw new AppError("AGENT_TOOL_FAILED", `Tool ${name} has no executor.`);
       action = {
         id: randomUUID(), runId: run.id, toolCallId: call.id, toolName: name, toolVersion: tool.version,
@@ -882,6 +973,14 @@ export class AgentHarness {
         try { eventsById.set(eventId, this.application.getEvent(eventId).event); } catch { /* stale search hit */ }
       }
     }
+    const cases = intent === "evidence" ? this.application.listCases().slice(0, 8) : [];
+    if (intent === "evidence") {
+      for (const caseItem of cases) {
+        for (const eventId of caseItem.eventRefs) {
+          try { eventsById.set(eventId, this.application.getEvent(eventId).event); } catch { /* stale Case reference */ }
+        }
+      }
+    }
     if (eventsById.size === 0 && ["review", "strategy", "clarify"].includes(intent)) {
       for (const event of this.application.searchEvents({ status: "confirmed", limit: 8 })) eventsById.set(event.id, event);
     }
@@ -890,7 +989,13 @@ export class AgentHarness {
     for (const sourceRef of [...new Set(events.flatMap(({ sourceRefs }) => sourceRefs))].slice(0, 8)) {
       try { sources.push(this.application.getSourceReference(sourceRef)); } catch { /* source removed */ }
     }
-    const assets = this.application.listAssets().filter(({ id }) => events.some(({ assetRefs }) => assetRefs.includes(id))).slice(0, 8);
+    const caseAssetIds = new Set(cases.flatMap(({ assetRefs }) => assetRefs));
+    const evidence = (intent === "evidence" ? this.application.listEvidence()
+      .filter(({ asset }) => caseAssetIds.size === 0 || caseAssetIds.has(asset.id)) : []).slice(0, 8);
+    const assets = [...new Map([
+      ...this.application.listAssets().filter(({ id }) => events.some(({ assetRefs }) => assetRefs.includes(id))),
+      ...evidence.map(({ asset }) => asset)
+    ].map((asset) => [asset.id, asset])).values()].slice(0, 8);
     const people = this.application.listPeople();
     const names = people.map(({ displayName }) => displayName);
     const messages = this.application.listMessages(conversationId).slice(0, -1).slice(-12);
@@ -898,6 +1003,8 @@ export class AgentHarness {
     events.forEach((event, index) => aliases.set(`event_${index + 1}`, event.id));
     sources.forEach((source, index) => aliases.set(`source_${index + 1}`, source.sourceItemId));
     assets.forEach((asset, index) => aliases.set(`asset_${index + 1}`, asset.id));
+    cases.forEach((caseItem, index) => aliases.set(`case_${index + 1}`, caseItem.id));
+    evidence.forEach((item, index) => aliases.set(`evidence_${index + 1}`, item.asset.id));
     people.forEach((person, index) => aliases.set(`person_${index + 1}`, person.id));
     const external = {
       message: redactExternalText(content, names).slice(0, 20_000),
@@ -915,7 +1022,17 @@ export class AgentHarness {
         ref: `source_${index + 1}`, kind: source.kind,
         excerpt: redactExternalText(source.excerpt, names).slice(0, 1000)
       })),
-      assets: assets.map((asset, index) => ({ ref: `asset_${index + 1}`, mimeType: asset.mimeType, byteSize: asset.byteSize }))
+      assets: assets.map((asset, index) => ({ ref: `asset_${index + 1}`, mimeType: asset.mimeType, byteSize: asset.byteSize })),
+      cases: cases.map((caseItem, index) => ({
+        ref: `case_${index + 1}`, title: redactExternalText(caseItem.title, names), status: caseItem.status,
+        jurisdiction: caseItem.jurisdiction, asOfDate: caseItem.asOfDate, currentRevision: caseItem.currentRevision,
+        openGapCount: caseItem.materialGaps.filter(({ status }) => status === "open").length
+      })),
+      evidence: evidence.map((item, index) => ({
+        ref: `evidence_${index + 1}`, mimeType: item.asset.mimeType, byteSize: item.asset.byteSize,
+        availabilityStatus: item.availabilityStatus, integrityStatus: item.asset.integrityStatus,
+        derivedArtifactCount: item.derivedArtifacts.length
+      }))
     };
     const context = truncateUtf8(JSON.stringify(external), MAX_AGENT_CONTEXT_BYTES);
     const categories: AgentDataCategory[] = ["conversation_text"];
@@ -943,7 +1060,7 @@ export class AgentHarness {
     ];
     return {
       context, contextHash: sha256(context), categories, categoryCounts,
-      events, sources, hits, citations, aliases, personNames: names
+      events, cases, evidence, sources, hits, citations, aliases, personNames: names
     };
   }
 }

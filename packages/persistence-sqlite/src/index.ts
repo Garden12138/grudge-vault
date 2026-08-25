@@ -15,6 +15,9 @@ import type {
   SourceReferenceDetail, SourceVersion, UnifiedSearchHit, UnifiedSearchQuery, Workspace
 } from "@grudge-vault/domain";
 import { AppError, type CandidateMergeInput, type CandidateMergeResult } from "@grudge-vault/shared";
+import { SqlitePhaseFiveRepository } from "./phase5";
+
+export { SqlitePhaseFiveRepository } from "./phase5";
 
 export interface Migration {
   version: number;
@@ -568,6 +571,237 @@ export const DEFAULT_MIGRATIONS: readonly Migration[] = [
         UNIQUE(run_id, sequence)
       ) STRICT;
     `
+  },
+  {
+    version: 6,
+    name: "phase-five-evidence-cases-security",
+    sql: `
+      CREATE TABLE agent_runs_phase5 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id),
+        user_message_id TEXT NOT NULL REFERENCES messages(id),
+        assistant_message_id TEXT REFERENCES messages(id),
+        intent TEXT NOT NULL CHECK(intent IN ('record', 'retrieve', 'review', 'clarify', 'strategy', 'evidence')),
+        mode TEXT NOT NULL CHECK(mode IN ('private', 'enhanced')),
+        status TEXT NOT NULL CHECK(status IN ('awaiting_consent', 'running', 'succeeded', 'failed', 'cancelled')),
+        model_identity TEXT,
+        model_version INTEGER CHECK(model_version IS NULL OR model_version > 0),
+        tool_schema_version INTEGER NOT NULL CHECK(tool_schema_version > 0),
+        context_hash TEXT NOT NULL CHECK(length(context_hash) = 64),
+        response_version INTEGER NOT NULL CHECK(response_version > 0),
+        response_text TEXT,
+        analysis_json TEXT,
+        citations_json TEXT NOT NULL,
+        error_code TEXT,
+        created_at TEXT NOT NULL,
+        completed_at TEXT
+      ) STRICT;
+      CREATE TABLE agent_tool_calls_phase5 (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES agent_runs_phase5(id) ON DELETE CASCADE,
+        sequence INTEGER NOT NULL CHECK(sequence >= 0),
+        tool_name TEXT NOT NULL,
+        tool_version INTEGER NOT NULL CHECK(tool_version > 0),
+        input_hash TEXT NOT NULL CHECK(length(input_hash) = 64),
+        input_refs_json TEXT NOT NULL,
+        output_refs_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('running', 'succeeded', 'failed', 'proposed')),
+        error_code TEXT,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        UNIQUE(run_id, sequence)
+      ) STRICT;
+      CREATE TABLE agent_actions_phase5 (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES agent_runs_phase5(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL REFERENCES agent_tool_calls_phase5(id),
+        tool_name TEXT NOT NULL,
+        tool_version INTEGER NOT NULL CHECK(tool_version > 0),
+        summary TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        expected_revision INTEGER CHECK(expected_revision IS NULL OR expected_revision > 0),
+        status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'rejected', 'stale', 'failed')),
+        result_refs_json TEXT NOT NULL,
+        error_code TEXT,
+        created_at TEXT NOT NULL,
+        resolved_at TEXT
+      ) STRICT;
+      CREATE TABLE external_context_disclosures_phase5 (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL UNIQUE REFERENCES agent_runs_phase5(id) ON DELETE CASCADE,
+        policy_version INTEGER NOT NULL CHECK(policy_version > 0),
+        categories_json TEXT NOT NULL,
+        category_counts_json TEXT NOT NULL,
+        context_hash TEXT NOT NULL CHECK(length(context_hash) = 64),
+        required INTEGER NOT NULL CHECK(required IN (0, 1)),
+        accepted_at TEXT,
+        rejected_at TEXT,
+        created_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE agent_model_calls_phase5 (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES agent_runs_phase5(id) ON DELETE CASCADE,
+        sequence INTEGER NOT NULL CHECK(sequence >= 0),
+        endpoint_origin TEXT NOT NULL,
+        model TEXT NOT NULL,
+        categories_json TEXT NOT NULL,
+        context_hash TEXT NOT NULL CHECK(length(context_hash) = 64),
+        status TEXT NOT NULL CHECK(status IN ('running', 'succeeded', 'failed')),
+        prompt_tokens INTEGER CHECK(prompt_tokens IS NULL OR prompt_tokens >= 0),
+        completion_tokens INTEGER CHECK(completion_tokens IS NULL OR completion_tokens >= 0),
+        error_code TEXT,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        UNIQUE(run_id, sequence)
+      ) STRICT;
+      INSERT INTO agent_runs_phase5 SELECT * FROM agent_runs;
+      INSERT INTO agent_tool_calls_phase5 SELECT * FROM agent_tool_calls;
+      INSERT INTO agent_actions_phase5 SELECT * FROM agent_actions;
+      INSERT INTO external_context_disclosures_phase5 SELECT * FROM external_context_disclosures;
+      INSERT INTO agent_model_calls_phase5 SELECT * FROM agent_model_calls;
+      DROP TABLE agent_actions;
+      DROP TABLE external_context_disclosures;
+      DROP TABLE agent_model_calls;
+      DROP TABLE agent_tool_calls;
+      DROP TABLE agent_runs;
+      ALTER TABLE agent_runs_phase5 RENAME TO agent_runs;
+      ALTER TABLE agent_tool_calls_phase5 RENAME TO agent_tool_calls;
+      ALTER TABLE agent_actions_phase5 RENAME TO agent_actions;
+      ALTER TABLE external_context_disclosures_phase5 RENAME TO external_context_disclosures;
+      ALTER TABLE agent_model_calls_phase5 RENAME TO agent_model_calls;
+      CREATE INDEX agent_runs_conversation_idx ON agent_runs(conversation_id, created_at);
+      CREATE INDEX agent_actions_status_idx ON agent_actions(status, created_at);
+
+      ALTER TABLE assets ADD COLUMN availability_status TEXT NOT NULL DEFAULT 'available'
+        CHECK(availability_status IN ('available', 'missing', 'deleted', 'superseded'));
+      ALTER TABLE assets ADD COLUMN superseded_by_asset_id TEXT REFERENCES assets(id);
+      ALTER TABLE assets ADD COLUMN deleted_at TEXT;
+
+      CREATE TABLE derived_artifacts (
+        id TEXT PRIMARY KEY,
+        source_asset_id TEXT NOT NULL REFERENCES assets(id),
+        kind TEXT NOT NULL CHECK(kind IN ('ocr', 'transcript', 'key_frames', 'thumbnail', 'redacted_copy', 'other')),
+        sha256 TEXT NOT NULL CHECK(length(sha256) = 64),
+        byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+        mime_type TEXT NOT NULL,
+        processor_identity TEXT NOT NULL,
+        processor_version INTEGER NOT NULL CHECK(processor_version > 0),
+        input_hash TEXT NOT NULL CHECK(length(input_hash) = 64),
+        created_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX derived_artifacts_source_idx ON derived_artifacts(source_asset_id, created_at);
+
+      CREATE TABLE cases (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('draft', 'active', 'archived')),
+        jurisdiction TEXT NOT NULL,
+        as_of_date TEXT NOT NULL,
+        projection_json TEXT NOT NULL,
+        current_revision INTEGER NOT NULL CHECK(current_revision > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX cases_status_idx ON cases(status, updated_at);
+
+      CREATE TABLE case_revisions (
+        id TEXT PRIMARY KEY,
+        case_id TEXT NOT NULL REFERENCES cases(id),
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        previous_revision INTEGER NOT NULL CHECK(previous_revision >= 0),
+        snapshot_json TEXT NOT NULL,
+        actor TEXT NOT NULL CHECK(actor IN ('user', 'agent')),
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(case_id, revision)
+      ) STRICT;
+
+      CREATE TABLE case_event_refs (
+        case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+        event_id TEXT NOT NULL REFERENCES events(id),
+        PRIMARY KEY(case_id, event_id)
+      ) STRICT;
+      CREATE TABLE case_person_refs (
+        case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+        person_id TEXT NOT NULL REFERENCES people(id),
+        PRIMARY KEY(case_id, person_id)
+      ) STRICT;
+      CREATE TABLE case_source_refs (
+        case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+        source_item_id TEXT NOT NULL REFERENCES source_items(id),
+        PRIMARY KEY(case_id, source_item_id)
+      ) STRICT;
+      CREATE TABLE case_asset_refs (
+        case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+        asset_id TEXT NOT NULL REFERENCES assets(id),
+        PRIMARY KEY(case_id, asset_id)
+      ) STRICT;
+      CREATE TABLE case_evidence_links (
+        id TEXT PRIMARY KEY,
+        case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+        asset_id TEXT NOT NULL REFERENCES assets(id),
+        event_id TEXT REFERENCES events(id),
+        statement_ids_json TEXT NOT NULL,
+        source_refs_json TEXT NOT NULL,
+        notes TEXT
+      ) STRICT;
+      CREATE INDEX case_evidence_links_case_idx ON case_evidence_links(case_id, asset_id);
+
+      CREATE TABLE integrity_scans (
+        id TEXT PRIMARY KEY,
+        state TEXT NOT NULL CHECK(state IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+        cursor TEXT,
+        counts_json TEXT NOT NULL,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        finished_at TEXT
+      ) STRICT;
+      CREATE TABLE integrity_scan_results (
+        scan_id TEXT NOT NULL REFERENCES integrity_scans(id) ON DELETE CASCADE,
+        asset_id TEXT NOT NULL REFERENCES assets(id),
+        result TEXT NOT NULL CHECK(result IN ('verified', 'corrupt', 'missing', 'skipped')),
+        expected_sha256 TEXT NOT NULL CHECK(length(expected_sha256) = 64),
+        expected_byte_size INTEGER NOT NULL CHECK(expected_byte_size >= 0),
+        verified_at TEXT NOT NULL,
+        error TEXT,
+        PRIMARY KEY(scan_id, asset_id)
+      ) STRICT;
+
+      CREATE TABLE crypto_migrations (
+        id TEXT PRIMARY KEY,
+        from_key_id TEXT NOT NULL,
+        to_key_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('queued', 'running', 'succeeded', 'failed')),
+        cursor TEXT,
+        processed_objects INTEGER NOT NULL DEFAULT 0,
+        total_objects INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        finished_at TEXT
+      ) STRICT;
+
+      CREATE TABLE legal_verifications (
+        id TEXT PRIMARY KEY,
+        case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+        case_revision INTEGER NOT NULL CHECK(case_revision > 0),
+        request_hash TEXT NOT NULL CHECK(length(request_hash) = 64),
+        result_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX legal_verifications_case_idx ON legal_verifications(case_id, created_at);
+
+      CREATE TABLE binder_exports (
+        id TEXT PRIMARY KEY,
+        case_id TEXT NOT NULL REFERENCES cases(id),
+        case_revision INTEGER NOT NULL CHECK(case_revision > 0),
+        profile_json TEXT NOT NULL,
+        manifest_sha256 TEXT NOT NULL CHECK(length(manifest_sha256) = 64),
+        generated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX binder_exports_case_idx ON binder_exports(case_id, generated_at);
+    `
   }
 ];
 
@@ -629,8 +863,11 @@ function mapAsset(row: Record<string, unknown>): Asset {
     originalFileName: String(row.original_file_name),
     vaultFormat: Number(row.vault_format),
     integrityStatus: row.integrity_status as Asset["integrityStatus"],
+    availabilityStatus: (row.availability_status ?? "available") as Asset["availabilityStatus"],
     createdAt: String(row.created_at)
   };
+  if (row.superseded_by_asset_id) asset.supersededByAssetId = String(row.superseded_by_asset_id);
+  if (row.deleted_at) asset.deletedAt = String(row.deleted_at);
   if (row.verified_at) asset.verifiedAt = String(row.verified_at);
   return asset;
 }
@@ -672,10 +909,11 @@ export class SqliteAssetRepository implements AssetRepositoryPort {
       this.database.prepare(`
         INSERT INTO assets(
           id, sha256, byte_size, mime_type, original_file_name, vault_format,
-          integrity_status, verified_at, created_at
+          integrity_status, verified_at, availability_status, superseded_by_asset_id, deleted_at, created_at
         ) VALUES (@id, @sha256, @byteSize, @mimeType, @originalFileName, @vaultFormat,
-          @integrityStatus, @verifiedAt, @createdAt)
-      `).run({ ...asset, verifiedAt: asset.verifiedAt ?? null });
+          @integrityStatus, @verifiedAt, @availabilityStatus, @supersededByAssetId, @deletedAt, @createdAt)
+      `).run({ ...asset, verifiedAt: asset.verifiedAt ?? null,
+        supersededByAssetId: asset.supersededByAssetId ?? null, deletedAt: asset.deletedAt ?? null });
       return { asset, deduplicated: false };
     })();
   }
@@ -684,6 +922,12 @@ export class SqliteAssetRepository implements AssetRepositoryPort {
     const result = this.database.prepare(
       "UPDATE assets SET integrity_status = ?, verified_at = ? WHERE id = ?"
     ).run(status, verifiedAt ?? null, id);
+    if (result.changes !== 1) throw new AppError("ASSET_NOT_FOUND", "The asset no longer exists.");
+    return this.findById(id)!;
+  }
+
+  setVaultFormat(id: string, vaultFormat: number): Asset {
+    const result = this.database.prepare("UPDATE assets SET vault_format = ? WHERE id = ?").run(vaultFormat, id);
     if (result.changes !== 1) throw new AppError("ASSET_NOT_FOUND", "The asset no longer exists.");
     return this.findById(id)!;
   }
@@ -2344,6 +2588,7 @@ export class SqliteWorkspaceDatabase {
   readonly memory: SqliteMemoryRepository;
   readonly dayOne: SqliteDayOneRepository;
   readonly agents: SqliteAgentRepository;
+  readonly phase5: SqlitePhaseFiveRepository;
 
   constructor(readonly database: Database.Database) {
     this.assets = new SqliteAssetRepository(database);
@@ -2351,6 +2596,7 @@ export class SqliteWorkspaceDatabase {
     this.memory = new SqliteMemoryRepository(database);
     this.dayOne = new SqliteDayOneRepository(database, this.memory);
     this.agents = new SqliteAgentRepository(database);
+    this.phase5 = new SqlitePhaseFiveRepository(database, this.memory);
   }
 
   ensureWorkspace(workspace: Workspace): void {
@@ -2384,8 +2630,15 @@ export function inspectWorkspaceSnapshot(path: string): { workspaceId: string; a
       | { workspace_id: string }
       | undefined;
     if (!workspace) throw new Error("Workspace metadata is missing.");
-    const assets = database.prepare("SELECT sha256 FROM assets ORDER BY sha256").all() as Array<{ sha256: string }>;
-    return { workspaceId: workspace.workspace_id, assetHashes: assets.map(({ sha256 }) => sha256) };
+    const hasAvailability = Boolean(database.prepare("SELECT 1 FROM pragma_table_info('assets') WHERE name = 'availability_status'").get());
+    const assets = database.prepare(hasAvailability
+      ? "SELECT sha256 FROM assets WHERE availability_status != 'deleted' ORDER BY sha256"
+      : "SELECT sha256 FROM assets ORDER BY sha256").all() as Array<{ sha256: string }>;
+    const hasDerived = Boolean(database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'derived_artifacts'").get());
+    const derived = hasDerived
+      ? database.prepare("SELECT sha256 FROM derived_artifacts ORDER BY sha256").all() as Array<{ sha256: string }>
+      : [];
+    return { workspaceId: workspace.workspace_id, assetHashes: [...new Set([...assets, ...derived].map(({ sha256 }) => sha256))].sort() };
   } finally {
     database.close();
   }

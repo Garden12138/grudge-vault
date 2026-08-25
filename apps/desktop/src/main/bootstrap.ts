@@ -1,11 +1,12 @@
 import { join } from "node:path";
-import { app, BrowserWindow, session } from "electron";
+import { app, BrowserWindow, powerMonitor, session } from "electron";
 import { z } from "zod";
 import { GrudgeVaultApplication, JobRunner, type KeyProtectorPort } from "@grudge-vault/application";
 import { AgentHarness, type AgentModelAdapterPort } from "@grudge-vault/agent-harness";
 import { DayOneZipImporter } from "@grudge-vault/importer-dayone";
 import { AppError } from "@grudge-vault/shared";
 import { registerIpcHandlers } from "./ipc";
+import { ElectronCaseSummaryPdfRenderer } from "./case-summary-pdf";
 import { SafeStorageKeyProtector } from "./key-protector";
 import { LocalWorkspaceManager } from "./workspace-manager";
 
@@ -20,6 +21,8 @@ const verifyPayloadSchema = z.object({ assetId: z.string().uuid(), sha256: z.str
 const importPayloadSchema = z.object({ importRunId: z.string().uuid() });
 const backfillPayloadSchema = z.object({ backfillRunId: z.string().uuid() });
 const embeddingPayloadSchema = z.object({ generationId: z.string().uuid() });
+const integrityPayloadSchema = z.object({ scanId: z.string().uuid() });
+const cryptoMigrationPayloadSchema = z.object({ targetKeyId: z.string().uuid() });
 
 export async function bootstrap(options: BootstrapOptions = {}): Promise<void> {
   await app.whenReady();
@@ -27,7 +30,13 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<void> {
     options.keyProtector ?? new SafeStorageKeyProtector(),
     join(app.getPath("userData"), "state.json")
   );
-  const application = new GrudgeVaultApplication(workspaces, undefined, new DayOneZipImporter());
+  const application = new GrudgeVaultApplication(
+    workspaces,
+    undefined,
+    new DayOneZipImporter(),
+    undefined,
+    { pdf: new ElectronCaseSummaryPdfRenderer() }
+  );
   const agent = new AgentHarness(application, {
     ...(options.agentModelAdapter ? { modelAdapter: options.agentModelAdapter } : {})
   });
@@ -82,7 +91,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<void> {
         if (!asset || asset.sha256 !== payload.sha256) {
           throw new AppError("ASSET_NOT_FOUND", "The asset for this verification job no longer exists.");
         }
-        const valid = await current.vault.verify(payload.sha256, current.key, context.reportProgress);
+        const valid = await current.vault.verify(payload.sha256, current.keyRing ?? current.key, context.reportProgress, asset.byteSize);
         if (!valid) {
           current.assets.setIntegrity(asset.id, "corrupt");
           throw new AppError("ASSET_CORRUPT", "The encrypted object failed integrity verification.");
@@ -97,11 +106,50 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<void> {
       },
       "search.embedding-rebuild": async (job, context) => {
         await application.runEmbeddingRebuild(embeddingPayloadSchema.parse(job.payload).generationId, context);
+      },
+      "vault.integrity-scan": async (job, context) => {
+        await application.runIntegrityScan(integrityPayloadSchema.parse(job.payload).scanId, context);
+      },
+      "workspace.crypto-migrate": async (job, context) => {
+        await application.runWorkspaceCryptoMigration(cryptoMigrationPayloadSchema.parse(job.payload).targetKeyId, context);
       }
     }, { onChanged: notifyJobsChanged });
+    application.ensureWorkspaceCryptoMigration();
     runner.start();
+
+    const scans = application.listIntegrityScans();
+    const hasActiveScan = scans.some(({ state }) => state === "queued" || state === "running");
+    const lastSuccess = scans.filter(({ state }) => state === "succeeded").sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+    const intervalDays = application.getWorkspaceSecuritySettings().integrityScanIntervalDays;
+    if (!hasActiveScan && (!lastSuccess || Date.now() - Date.parse(lastSuccess.updatedAt) >= intervalDays * 86_400_000)) {
+      application.startIntegrityScan();
+      runner.wake();
+    }
   };
   restartRunner();
+
+  let locking = false;
+  const lockWorkspace = async () => {
+    if (locking || application.getWorkspaceStatus().status !== "open") return application.getWorkspaceStatus();
+    locking = true;
+    try {
+      await runner?.stopAndWait();
+      runner = undefined;
+      const state = await application.lockWorkspace();
+      if (!window.isDestroyed()) window.webContents.send("workspace:locked");
+      return state;
+    } finally {
+      locking = false;
+    }
+  };
+  const lockForPowerEvent = () => { void lockWorkspace(); };
+  powerMonitor.on("suspend", lockForPowerEvent);
+  powerMonitor.on("lock-screen", lockForPowerEvent);
+  const idleTimer = setInterval(() => {
+    if (application.getWorkspaceStatus().status !== "open") return;
+    const minutes = application.getWorkspaceSecuritySettings().autoLockMinutes;
+    if (minutes > 0 && powerMonitor.getSystemIdleTime() >= minutes * 60) void lockWorkspace();
+  }, 30_000);
 
   const removeIpcHandlers = registerIpcHandlers({
     window,
@@ -109,6 +157,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<void> {
     agent,
     workspaces,
     restartRunner,
+    lockWorkspace,
     getRunner: () => runner
   });
 
@@ -120,6 +169,9 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<void> {
   window.once("ready-to-show", () => window.show());
 
   app.on("before-quit", () => {
+    clearInterval(idleTimer);
+    powerMonitor.removeListener("suspend", lockForPowerEvent);
+    powerMonitor.removeListener("lock-screen", lockForPowerEvent);
     runner?.stop();
     removeIpcHandlers();
     void workspaces.close();

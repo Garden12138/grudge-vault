@@ -6,8 +6,22 @@ const invoke = <T>(channel: string, input?: unknown) => ipcRenderer.invoke(chann
 const api: GrudgeVaultApi = {
   workspace: {
     current: () => invoke("workspace:current"),
+    status: () => invoke("workspace:status"),
     create: (name) => invoke("workspace:create", name),
-    open: () => invoke("workspace:open")
+    open: () => invoke("workspace:open"),
+    lock: () => invoke("workspace:lock"),
+    unlock: () => invoke("workspace:unlock"),
+    getSecuritySettings: () => invoke("workspace:security-settings"),
+    updateSecuritySettings: (settings) => invoke("workspace:update-security-settings", settings),
+    exportRecovery: (input) => invoke("workspace:export-recovery", input),
+    recover: (input) => invoke("workspace:recover", input),
+    rotateKey: () => invoke("workspace:rotate-key"),
+    cryptoStatus: () => invoke("workspace:crypto-status"),
+    onLocked: (callback) => {
+      const listener = () => callback();
+      ipcRenderer.on("workspace:locked", listener);
+      return () => ipcRenderer.removeListener("workspace:locked", listener);
+    }
   },
   conversations: {
     list: () => invoke("conversations:list"),
@@ -113,6 +127,26 @@ const api: GrudgeVaultApi = {
     verify: (assetId) => invoke("assets:verify", assetId),
     preview: (assetId) => invoke("assets:preview", assetId),
     exportCopy: (assetId) => invoke("assets:export", assetId)
+  },
+  evidence: {
+    list: () => invoke("evidence:list"),
+    get: (assetId) => invoke("evidence:get", assetId),
+    startScan: () => invoke("evidence:start-scan"),
+    listScans: () => invoke("evidence:list-scans"),
+    deleteImpact: (assetId) => invoke("evidence:delete-impact", assetId),
+    deleteOriginal: (input) => invoke("evidence:delete-original", input),
+    supersede: (input) => invoke("evidence:supersede", input)
+  },
+  cases: {
+    list: () => invoke("cases:list"),
+    get: (id) => invoke("cases:get", id),
+    create: (input) => invoke("cases:create", input),
+    update: (input) => invoke("cases:update", input),
+    archive: (id, expectedRevision) => invoke("cases:archive", { id, expectedRevision }),
+    listRevisions: (id) => invoke("cases:revisions", id),
+    runLegalCheck: (id) => invoke("cases:legal-check", id),
+    previewBinder: (id, profile) => invoke("cases:binder-preview", { id, profile }),
+    exportBinder: (previewId) => invoke("cases:binder-export", previewId)
   },
   imports: {
     chooseDayOneZip: () => invoke("imports:choose-dayone"),

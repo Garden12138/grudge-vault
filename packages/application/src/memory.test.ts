@@ -21,6 +21,8 @@ function testContext(generator?: EventDraftGeneratorPort, embeddingAdapter?: Emb
     async putStream() { return { sha256: "a".repeat(64), byteSize: 4, vaultFormat: 1, deduplicated: false }; },
     async open() { return Readable.from(Buffer.from("test")); },
     async verify() { return true; },
+    async exists() { return true; },
+    async remove() {},
     async cleanupTempFiles() {}
   };
   const memory = new SqliteMemoryRepository(database);
@@ -122,19 +124,19 @@ describe("Phase 1 event recording application", () => {
     const now = "2026-08-24T00:00:00.000Z";
     context.session.assets.upsert({
       id: "asset-text", sha256: "a".repeat(64), byteSize: 4, mimeType: "text/plain",
-      originalFileName: "note.txt", vaultFormat: 1, integrityStatus: "verified", createdAt: now
+      originalFileName: "note.txt", vaultFormat: 1, integrityStatus: "verified", availabilityStatus: "available", createdAt: now
     });
     expect(Buffer.from((await context.application.previewAsset("asset-text")).bytes).toString("utf8")).toBe("test");
     context.session.assets.upsert({
       id: "asset-html", sha256: "b".repeat(64), byteSize: 4, mimeType: "text/html",
-      originalFileName: "unsafe.html", vaultFormat: 1, integrityStatus: "verified", createdAt: now
+      originalFileName: "unsafe.html", vaultFormat: 1, integrityStatus: "verified", availabilityStatus: "available", createdAt: now
     });
     await expect(context.application.previewAsset("asset-html")).rejects.toMatchObject({
       code: "ASSET_PREVIEW_UNAVAILABLE"
     });
     context.session.assets.upsert({
       id: "asset-large", sha256: "c".repeat(64), byteSize: 64 * 1024 * 1024 + 1, mimeType: "video/mp4",
-      originalFileName: "large.mp4", vaultFormat: 1, integrityStatus: "verified", createdAt: now
+      originalFileName: "large.mp4", vaultFormat: 1, integrityStatus: "verified", availabilityStatus: "available", createdAt: now
     });
     await expect(context.application.previewAsset("asset-large")).rejects.toMatchObject({
       code: "ASSET_PREVIEW_UNAVAILABLE"
@@ -162,7 +164,7 @@ describe("Phase 2 historical backfill application", () => {
     const now = "2026-08-24T00:00:00.000Z";
     context.session.assets.upsert({
       id: "archive-asset", sha256: "d".repeat(64), byteSize: 10, mimeType: "application/zip",
-      originalFileName: "DayOne.zip", vaultFormat: 1, integrityStatus: "verified", createdAt: now
+      originalFileName: "DayOne.zip", vaultFormat: 1, integrityStatus: "verified", availabilityStatus: "available", createdAt: now
     });
     const run: ImportRun = {
       id: "import-run-1", archiveAssetId: "archive-asset", archiveFileName: "DayOne.zip", state: "succeeded", progress: 1,
@@ -196,7 +198,7 @@ describe("Phase 2 historical backfill application", () => {
     const now = "2026-08-24T00:00:00.000Z";
     context.session.assets.upsert({
       id: "archive-asset", sha256: "e".repeat(64), byteSize: 10, mimeType: "application/zip",
-      originalFileName: "DayOne.zip", vaultFormat: 1, integrityStatus: "verified", createdAt: now
+      originalFileName: "DayOne.zip", vaultFormat: 1, integrityStatus: "verified", availabilityStatus: "available", createdAt: now
     });
     const run: ImportRun = {
       id: "import-run-2", archiveAssetId: "archive-asset", archiveFileName: "DayOne.zip", state: "succeeded", progress: 1,
@@ -264,7 +266,7 @@ describe("Phase 2 historical backfill application", () => {
     const now = "2026-08-24T00:00:00.000Z";
     context.session.assets.upsert({
       id: "archive-placeholders", sha256: "3".repeat(64), byteSize: 10, mimeType: "application/zip",
-      originalFileName: "DayOne.zip", vaultFormat: 1, integrityStatus: "verified", createdAt: now
+      originalFileName: "DayOne.zip", vaultFormat: 1, integrityStatus: "verified", availabilityStatus: "available", createdAt: now
     });
     const run: ImportRun = {
       id: "import-placeholders", archiveAssetId: "archive-placeholders", archiveFileName: "DayOne.zip", state: "succeeded", progress: 1,
@@ -287,7 +289,7 @@ describe("Phase 2 historical backfill application", () => {
     const now = "2026-08-24T00:00:00.000Z";
     context.session.assets.upsert({
       id: "archive-supersede", sha256: "1".repeat(64), byteSize: 10, mimeType: "application/zip",
-      originalFileName: "DayOne.zip", vaultFormat: 1, integrityStatus: "verified", createdAt: now
+      originalFileName: "DayOne.zip", vaultFormat: 1, integrityStatus: "verified", availabilityStatus: "available", createdAt: now
     });
     const run: ImportRun = {
       id: "import-supersede", archiveAssetId: "archive-supersede", archiveFileName: "DayOne.zip", state: "succeeded", progress: 1,
@@ -315,7 +317,7 @@ describe("Phase 2 historical backfill application", () => {
     const now = "2026-08-24T00:00:00.000Z";
     context.session.assets.upsert({
       id: "archive-batches", sha256: "2".repeat(64), byteSize: 10, mimeType: "application/zip",
-      originalFileName: "DayOne.zip", vaultFormat: 1, integrityStatus: "verified", createdAt: now
+      originalFileName: "DayOne.zip", vaultFormat: 1, integrityStatus: "verified", availabilityStatus: "available", createdAt: now
     });
     const run: ImportRun = {
       id: "import-batches", archiveAssetId: "archive-batches", archiveFileName: "DayOne.zip", state: "succeeded", progress: 1,
@@ -440,7 +442,7 @@ describe("Phase 3 relations, retrieval, and review application", () => {
     const now = "2026-08-24T00:00:00.000Z";
     context.session.assets.upsert({
       id: "phase3-archive", sha256: "3".repeat(64), byteSize: 10, mimeType: "application/zip",
-      originalFileName: "DayOne.zip", vaultFormat: 1, integrityStatus: "verified", createdAt: now
+      originalFileName: "DayOne.zip", vaultFormat: 1, integrityStatus: "verified", availabilityStatus: "available", createdAt: now
     });
     const run: ImportRun = {
       id: "phase3-import", archiveAssetId: "phase3-archive", archiveFileName: "DayOne.zip", state: "succeeded", progress: 1,

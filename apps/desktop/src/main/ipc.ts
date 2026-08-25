@@ -5,8 +5,8 @@ import type { AgentHarness } from "@grudge-vault/agent-harness";
 import type { EventSearchQuery, Person, TimelineQuery, UnifiedSearchQuery } from "@grudge-vault/domain";
 import type {
   AgentSendInput, AgentSettingsUpdateInput, CandidateMergeInput, ClarificationAnswerInput, CreateEventInput,
-  CreateRelationInput, PersonAliasInput, PersonMergeInput, ReviewGenerateInput, SendMessageInput,
-  StartBackfillInput, UpdateEventInput
+  CreateCaseInput, CreateRelationInput, PersonAliasInput, PersonMergeInput, ReviewGenerateInput,
+  SendMessageInput, StartBackfillInput, UpdateCaseInput, UpdateEventInput
 } from "@grudge-vault/shared";
 import { AppError, toSerializedError, type IpcResult } from "@grudge-vault/shared";
 
@@ -105,6 +105,53 @@ const agentSettingsSchema = z.object({
   mode: z.enum(["private", "enhanced"]), privateEndpoint: agentEndpointSchema.optional(),
   enhancedEndpoint: agentEndpointSchema.optional(), consentedDataCategories: agentCategoriesSchema.optional()
 });
+const securitySettingsSchema = z.object({
+  autoLockMinutes: z.union([z.literal(0), z.literal(5), z.literal(15), z.literal(30), z.literal(60)]),
+  integrityScanIntervalDays: z.number().int().min(1).max(365)
+});
+const passphraseSchema = z.object({ passphrase: z.string().min(12).max(10_000) });
+const caseAmountSchema = z.object({
+  id: idSchema, label: z.string().trim().min(1).max(500), currency: z.string().regex(/^[A-Z]{3}$/),
+  amount: z.string().regex(/^(?:0|[1-9]\d*)(?:\.\d+)?$/).optional(),
+  minimum: z.string().regex(/^(?:0|[1-9]\d*)(?:\.\d+)?$/).optional(),
+  maximum: z.string().regex(/^(?:0|[1-9]\d*)(?:\.\d+)?$/).optional(),
+  precision: z.enum(["exact", "approximate", "range", "unknown"]),
+  certainty: z.enum(["observed", "documented", "recalled", "inferred", "unknown"]),
+  sourceRefs: sourceRefsSchema
+});
+const caseFields = {
+  title: z.string().trim().min(1).max(200), status: z.enum(["draft", "active", "archived"]),
+  summary: z.string().trim().max(100_000).optional(), jurisdiction: z.string().trim().min(1).max(500),
+  asOfDate: z.iso.date(), eventRefs: z.array(idSchema).max(1_000), personRefs: z.array(idSchema).max(1_000),
+  sourceRefs: sourceRefsSchema, assetRefs: z.array(idSchema).max(1_000), amounts: z.array(caseAmountSchema).max(1_000),
+  disputePoints: z.array(z.object({ id: idSchema, text: z.string().trim().min(1).max(20_000), sourceRefs: sourceRefsSchema })).max(1_000),
+  questions: z.array(z.object({
+    id: idSchema, question: z.string().trim().min(1).max(20_000), reason: z.string().trim().min(1).max(20_000),
+    status: z.enum(["open", "answered", "dismissed"]), answer: z.string().trim().max(100_000).optional(), sourceRefs: sourceRefsSchema
+  })).max(1_000),
+  materialGaps: z.array(z.object({
+    id: idSchema, label: z.string().trim().min(1).max(500), reason: z.string().trim().min(1).max(20_000),
+    priority: z.enum(["normal", "important", "rights_related"]), status: z.enum(["open", "resolved", "dismissed"]),
+    resolvedByAssetId: idSchema.optional()
+  })).max(1_000),
+  evidenceLinks: z.array(z.object({
+    id: idSchema, assetId: idSchema, eventId: idSchema.optional(), statementIds: z.array(idSchema).max(1_000),
+    sourceRefs: sourceRefsSchema, notes: z.string().trim().max(20_000).optional()
+  })).max(2_000)
+};
+const createCaseSchema = z.object({ ...caseFields, reason: z.string().trim().min(1).max(1_000) });
+const updateCaseSchema = z.object({
+  ...caseFields, caseId: idSchema, expectedRevision: z.number().int().positive(), reason: z.string().trim().min(1).max(1_000)
+});
+const binderProfileSchema = z.object({
+  caseRevision: z.number().int().positive(), eventIds: z.array(idSchema).max(1_000), sourceItemIds: z.array(idSchema).max(1_000),
+  assetIds: z.array(idSchema).max(1_000), derivedArtifactIds: z.array(idSchema).max(1_000),
+  includeOriginals: z.boolean(), includeDerivedArtifacts: z.boolean(), locale: z.enum(["zh-CN", "en"]),
+  redactions: z.object({
+    personIds: z.array(idSchema).max(1_000), maskAmounts: z.boolean(), maskContacts: z.boolean(),
+    maskAccounts: z.boolean(), maskFileNames: z.boolean(), omitSourceExcerpts: z.boolean()
+  })
+});
 
 interface IpcDependencies {
   window: BrowserWindow;
@@ -112,6 +159,7 @@ interface IpcDependencies {
   agent: AgentHarness;
   workspaces: WorkspaceManagerPort;
   restartRunner(): void;
+  lockWorkspace(): Promise<unknown>;
   getRunner(): JobRunner | undefined;
 }
 
@@ -150,6 +198,7 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   };
 
   add("workspace:current", emptySchema, () => dependencies.application.getCurrentWorkspace());
+  add("workspace:status", emptySchema, () => dependencies.application.getWorkspaceStatus());
   add("workspace:create", titleSchema, async (name) => {
     const selection = await dialog.showOpenDialog(dependencies.window, {
       title: "Choose an empty folder for the workspace", properties: ["openDirectory", "createDirectory"]
@@ -168,6 +217,42 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     dependencies.restartRunner();
     return workspace;
   });
+  add("workspace:lock", emptySchema, () => dependencies.lockWorkspace());
+  add("workspace:unlock", emptySchema, async () => {
+    const workspace = await dependencies.application.unlockWorkspace();
+    dependencies.restartRunner();
+    return workspace;
+  });
+  add("workspace:security-settings", emptySchema, () => dependencies.application.getWorkspaceSecuritySettings());
+  add("workspace:update-security-settings", securitySettingsSchema, (settings) =>
+    dependencies.application.updateWorkspaceSecuritySettings(settings));
+  add("workspace:export-recovery", passphraseSchema, async ({ passphrase }) => {
+    const workspace = dependencies.application.getCurrentWorkspace();
+    if (!workspace) throw new AppError("NO_ACTIVE_WORKSPACE", "Unlock the workspace before exporting recovery material.");
+    const selection = await dialog.showSaveDialog(dependencies.window, {
+      title: "Export passphrase recovery package", defaultPath: `${workspace.name}.gvrecovery`,
+      filters: [{ name: "Grudge Vault Recovery", extensions: ["gvrecovery"] }]
+    });
+    if (selection.canceled || !selection.filePath) return null;
+    const path = selection.filePath.endsWith(".gvrecovery") ? selection.filePath : `${selection.filePath}.gvrecovery`;
+    return dependencies.application.exportWorkspaceRecovery(path, passphrase);
+  });
+  add("workspace:recover", passphraseSchema, async ({ passphrase }) => {
+    const selection = await dialog.showOpenDialog(dependencies.window, {
+      title: "Choose a recovery package", properties: ["openFile"],
+      filters: [{ name: "Grudge Vault Recovery", extensions: ["gvrecovery"] }]
+    });
+    if (selection.canceled || !selection.filePaths[0]) return null;
+    const workspace = await dependencies.application.recoverWorkspace(selection.filePaths[0], passphrase);
+    dependencies.restartRunner();
+    return workspace;
+  });
+  add("workspace:rotate-key", emptySchema, async () => {
+    const status = await dependencies.application.rotateWorkspaceKey();
+    dependencies.getRunner()?.wake();
+    return status;
+  });
+  add("workspace:crypto-status", emptySchema, () => dependencies.application.getWorkspaceCryptoStatus());
 
   add("conversations:list", emptySchema, () => dependencies.application.listConversations());
   add("conversations:create", titleSchema, (title) => dependencies.application.createConversation(title));
@@ -294,6 +379,37 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     const selection = await dialog.showSaveDialog(dependencies.window, { defaultPath: asset.originalFileName });
     if (selection.canceled || !selection.filePath) return null;
     return dependencies.application.exportAsset(assetId, selection.filePath);
+  });
+
+  add("evidence:list", emptySchema, () => dependencies.application.listEvidence());
+  add("evidence:get", idSchema, (assetId) => dependencies.application.getEvidence(assetId));
+  add("evidence:start-scan", emptySchema, () => {
+    const scan = dependencies.application.startIntegrityScan();
+    dependencies.getRunner()?.wake();
+    return scan;
+  });
+  add("evidence:list-scans", emptySchema, () => dependencies.application.listIntegrityScans());
+  add("evidence:delete-impact", idSchema, (assetId) => dependencies.application.getEvidenceImpact(assetId));
+  add("evidence:delete-original", z.object({ assetId: idSchema, confirmReferencedDeletion: z.boolean() }), (input) =>
+    dependencies.application.deleteOriginal(input.assetId, input.confirmReferencedDeletion));
+  add("evidence:supersede", z.object({ oldAssetId: idSchema, newAssetId: idSchema }), (input) =>
+    dependencies.application.supersedeOriginal(input.oldAssetId, input.newAssetId));
+
+  add("cases:list", emptySchema, () => dependencies.application.listCases());
+  add("cases:get", idSchema, (id) => dependencies.application.getCase(id));
+  add("cases:create", createCaseSchema, (input) => dependencies.application.createCase(input as CreateCaseInput));
+  add("cases:update", updateCaseSchema, (input) => dependencies.application.updateCase(input as UpdateCaseInput));
+  add("cases:archive", idRevisionSchema, ({ id, expectedRevision }) => dependencies.application.archiveCase(id, expectedRevision));
+  add("cases:revisions", idSchema, (id) => dependencies.application.listCaseRevisions(id));
+  add("cases:legal-check", idSchema, (id) => dependencies.application.runLegalCheck(id));
+  add("cases:binder-preview", z.object({ id: idSchema, profile: binderProfileSchema }), ({ id, profile }) =>
+    dependencies.application.previewCaseBinder(id, profile));
+  add("cases:binder-export", idSchema, async (previewId) => {
+    const selection = await dialog.showSaveDialog(dependencies.window, {
+      title: "Export Case Binder to a new directory", defaultPath: "case-binder"
+    });
+    if (selection.canceled || !selection.filePath) return null;
+    return dependencies.application.exportCaseBinder(previewId, selection.filePath);
   });
 
   add("imports:choose-dayone", emptySchema, async () => {

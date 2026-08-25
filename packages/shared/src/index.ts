@@ -6,6 +6,12 @@ import type {
   AgentModelSettings,
   AgentRun,
   BackfillRun,
+  Case,
+  CaseBinderExportResult,
+  CaseBinderPreview,
+  CaseBinderProfile,
+  CaseDetail,
+  CaseRevision,
   CandidateDetail,
   CandidateSummary,
   Clarification,
@@ -19,10 +25,13 @@ import type {
   EventRelationKind,
   EventSearchQuery,
   EmbeddingIndexStatus,
+  EvidenceDetail,
+  EvidenceReferenceImpact,
   Interest,
   Job,
   ImportRun,
   ImportRunDetail,
+  IntegrityScan,
   Message,
   Person,
   PersonAlias,
@@ -37,7 +46,12 @@ import type {
   TimelineResult,
   UnifiedSearchHit,
   UnifiedSearchQuery,
-  Workspace
+  Workspace,
+  WorkspaceCryptoStatus,
+  WorkspaceLockState,
+  WorkspaceSecuritySettings,
+  RecoveryPackageSummary,
+  LegalVerificationResult
 } from "@grudge-vault/domain";
 
 export const APP_ERROR_CODES = [
@@ -45,6 +59,9 @@ export const APP_ERROR_CODES = [
   "WORKSPACE_INVALID",
   "WORKSPACE_EXISTS",
   "WORKSPACE_KEY_UNAVAILABLE",
+  "WORKSPACE_LOCKED",
+  "RECOVERY_PACKAGE_INVALID",
+  "CRYPTO_MIGRATION_CONFLICT",
   "INSECURE_KEY_BACKEND",
   "FILE_NOT_REGULAR",
   "ASSET_IMPORT_FAILED",
@@ -52,8 +69,13 @@ export const APP_ERROR_CODES = [
   "ASSET_CORRUPT",
   "ASSET_PREVIEW_UNAVAILABLE",
   "ASSET_EXPORT_FAILED",
+  "EVIDENCE_UNAVAILABLE",
   "ENTITY_NOT_FOUND",
   "EVENT_REVISION_CONFLICT",
+  "CASE_REVISION_CONFLICT",
+  "BINDER_PREVIEW_STALE",
+  "BINDER_EXPORT_FAILED",
+  "LEGAL_VERIFICATION_UNAVAILABLE",
   "BACKUP_INVALID",
   "BACKUP_EXISTS",
   "IMPORT_INVALID_ARCHIVE",
@@ -229,11 +251,51 @@ export interface AgentSettingsUpdateInput {
   consentedDataCategories?: AgentDataCategory[];
 }
 
+export type CaseWriteFields = Omit<Case, "id" | "currentRevision" | "createdAt" | "updatedAt">;
+
+export interface CreateCaseInput extends CaseWriteFields {
+  reason: string;
+}
+
+export interface UpdateCaseInput extends CaseWriteFields {
+  caseId: string;
+  expectedRevision: number;
+  reason: string;
+}
+
+export interface SupersedeAssetInput {
+  oldAssetId: string;
+  newAssetId: string;
+}
+
+export interface DeleteAssetInput {
+  assetId: string;
+  confirmReferencedDeletion: boolean;
+}
+
+export interface RecoveryExportInput {
+  passphrase: string;
+}
+
+export interface RecoveryImportInput {
+  passphrase: string;
+}
+
 export interface GrudgeVaultApi {
   workspace: {
     current(): Promise<IpcResult<Workspace | null>>;
+    status(): Promise<IpcResult<WorkspaceLockState>>;
     create(name: string): Promise<IpcResult<Workspace | null>>;
     open(): Promise<IpcResult<Workspace | null>>;
+    lock(): Promise<IpcResult<WorkspaceLockState>>;
+    unlock(): Promise<IpcResult<Workspace | null>>;
+    getSecuritySettings(): Promise<IpcResult<WorkspaceSecuritySettings>>;
+    updateSecuritySettings(settings: WorkspaceSecuritySettings): Promise<IpcResult<WorkspaceSecuritySettings>>;
+    exportRecovery(input: RecoveryExportInput): Promise<IpcResult<RecoveryPackageSummary | null>>;
+    recover(input: RecoveryImportInput): Promise<IpcResult<Workspace | null>>;
+    rotateKey(): Promise<IpcResult<WorkspaceCryptoStatus>>;
+    cryptoStatus(): Promise<IpcResult<WorkspaceCryptoStatus>>;
+    onLocked(callback: () => void): () => void;
   };
   conversations: {
     list(): Promise<IpcResult<Conversation[]>>;
@@ -318,6 +380,26 @@ export interface GrudgeVaultApi {
     verify(assetId: string): Promise<IpcResult<Job>>;
     preview(assetId: string): Promise<IpcResult<AssetPreview>>;
     exportCopy(assetId: string): Promise<IpcResult<string | null>>;
+  };
+  evidence: {
+    list(): Promise<IpcResult<EvidenceDetail[]>>;
+    get(assetId: string): Promise<IpcResult<EvidenceDetail>>;
+    startScan(): Promise<IpcResult<IntegrityScan>>;
+    listScans(): Promise<IpcResult<IntegrityScan[]>>;
+    deleteImpact(assetId: string): Promise<IpcResult<EvidenceReferenceImpact>>;
+    deleteOriginal(input: DeleteAssetInput): Promise<IpcResult<EvidenceDetail>>;
+    supersede(input: SupersedeAssetInput): Promise<IpcResult<EvidenceDetail>>;
+  };
+  cases: {
+    list(): Promise<IpcResult<Case[]>>;
+    get(id: string): Promise<IpcResult<CaseDetail>>;
+    create(input: CreateCaseInput): Promise<IpcResult<Case>>;
+    update(input: UpdateCaseInput): Promise<IpcResult<Case>>;
+    archive(id: string, expectedRevision: number): Promise<IpcResult<Case>>;
+    listRevisions(id: string): Promise<IpcResult<CaseRevision[]>>;
+    runLegalCheck(id: string): Promise<IpcResult<LegalVerificationResult>>;
+    previewBinder(id: string, profile: CaseBinderProfile): Promise<IpcResult<CaseBinderPreview>>;
+    exportBinder(previewId: string): Promise<IpcResult<CaseBinderExportResult | null>>;
   };
   imports: {
     chooseDayOneZip(): Promise<IpcResult<ImportRun | null>>;

@@ -3,12 +3,13 @@ import type {
   AgentAction, AgentModelSettings, AgentRun, Asset, BackfillRun, CandidateDetail, CandidateSummary, Conversation, Event, EventDetail,
   EmbeddingIndexStatus, EventRelation, EventRevision, ImportRun, ImportRunDetail, Job, Message, Person,
   PersonIdentityDetail, PersonMergeSuggestion, ReviewRun, SourceReferenceDetail, StatementKind,
-  TemporalValue, TimelineResult, UnifiedSearchHit, Workspace
+  TemporalValue, TimelineResult, UnifiedSearchHit, Workspace, WorkspaceLockState
 } from "@grudge-vault/domain";
 import type { EventWriteFields, IpcResult } from "@grudge-vault/shared";
 import { detectLanguage, translator, type Language } from "./i18n";
+import { CasesPanel, EvidencePanel, WorkspaceSecurityPanel } from "./PhaseFive";
 
-type View = "chat" | "events" | "search" | "timeline" | "people" | "review" | "backfill" | "vault" | "settings";
+type View = "chat" | "events" | "search" | "timeline" | "people" | "review" | "backfill" | "vault" | "evidence" | "cases" | "settings";
 
 interface EventForm {
   title: string;
@@ -141,6 +142,8 @@ export function App() {
   const [language, setLanguage] = useState<Language>(detectLanguage);
   const t = useMemo(() => translator(language), [language]);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [lockState, setLockState] = useState<WorkspaceLockState>({ status: "closed" });
+  const [recoveryPassphrase, setRecoveryPassphrase] = useState("");
   const [workspaceName, setWorkspaceName] = useState(language === "zh-CN" ? "我的记仇账本" : "My Grudge Vault");
   const [view, setView] = useState<View>("chat");
   const [error, setError] = useState<string>();
@@ -275,6 +278,13 @@ export function App() {
   }, []);
 
   const refresh = useCallback(async () => {
+    const status = await window.grudgeVault.workspace.status();
+    if (!status.ok) return setError(status.error.message);
+    setLockState(status.data);
+    if (status.data.status === "locked") {
+      setWorkspace(null);
+      return;
+    }
     const current = await window.grudgeVault.workspace.current();
     if (!current.ok) return setError(current.error.message);
     setWorkspace(current.data);
@@ -305,6 +315,16 @@ export function App() {
     });
   }, [selectedImportId, importRuns]);
   useEffect(() => () => { if (preview?.url) URL.revokeObjectURL(preview.url); }, [preview]);
+  const clearSensitiveRendererState = useCallback(() => {
+    if (preview?.url) URL.revokeObjectURL(preview.url);
+    setPreview(undefined); setSourceDetail(undefined); setWorkspace(null); setMessages([]); setEvents([]); setPeople([]);
+    setPersonIdentities([]); setAssets([]); setImportDetail(undefined); setCandidateDetail(undefined); setSelectedReview(undefined);
+    setAgentRuns([]); setPendingAgentRun(undefined); setConversations([]); setTimeline(undefined); setUnifiedHits([]);
+    setLockState((current) => current.status === "open"
+      ? { status: "locked", workspaceId: current.workspace.id, workspaceName: current.workspace.name }
+      : current);
+  }, [preview]);
+  useEffect(() => window.grudgeVault.workspace.onLocked(clearSensitiveRendererState), [clearSensitiveRendererState]);
 
   const runWorkspaceAction = async (action: () => Promise<IpcResult<Workspace | null>>) => {
     setBusy(true); setError(undefined);
@@ -739,6 +759,37 @@ export function App() {
     setLanguage(next);
   };
 
+  if (lockState.status === "locked") {
+    const unlock = async () => {
+      setBusy(true); setError(undefined);
+      const result = await window.grudgeVault.workspace.unlock();
+      setBusy(false);
+      if (!result.ok) return setError(result.error.message);
+      await refresh();
+    };
+    const recover = async () => {
+      setBusy(true); setError(undefined);
+      const result = await window.grudgeVault.workspace.recover({ passphrase: recoveryPassphrase });
+      setRecoveryPassphrase(""); setBusy(false);
+      if (!result.ok) return setError(result.error.message);
+      await refresh();
+    };
+    return <main className="landing locked-landing"><section className="landing-card">
+      <div className="language-pills"><button className={language === "zh-CN" ? "active" : ""} onClick={() => setAppLanguage("zh-CN")}>中文</button>
+        <button className={language === "en" ? "active" : ""} onClick={() => setAppLanguage("en")}>EN</button></div>
+      <p className="eyebrow">WORKSPACE LOCKED</p><h1>{language === "zh-CN" ? "工作区已锁定" : "Workspace locked"}</h1>
+      <p className="lede">{language === "zh-CN" ? "实体正文、预览和本地路径已从界面清除。使用系统钥匙串解锁。" : "Entity content, previews, and local paths have been cleared. Unlock with the OS key store."}</p>
+      {error && <div className="error-banner" role="alert">{error}</div>}
+      <div className="landing-actions"><button className="primary" disabled={busy} onClick={() => void unlock()}>{language === "zh-CN" ? "使用系统钥匙串解锁" : "Unlock with OS key store"}</button></div>
+      <details className="recovery-unlock"><summary>{language === "zh-CN" ? "钥匙串不可用？重新绑定恢复包" : "Key store unavailable? Rebind a recovery package"}</summary>
+        <p className="security-note">{language === "zh-CN" ? "恢复包只用于重新绑定钥匙串，不会直接解锁日常会话。" : "Recovery packages only rebind the key store; they are not a routine unlock method."}</p>
+        <label className="field"><span>{language === "zh-CN" ? "恢复口令（不少于 12 字符）" : "Recovery passphrase (12+ characters)"}</span>
+          <input type="password" value={recoveryPassphrase} onChange={(event) => setRecoveryPassphrase(event.target.value)} /></label>
+        <button disabled={busy || Array.from(recoveryPassphrase).length < 12} onClick={() => void recover()}>{language === "zh-CN" ? "选择 .gvrecovery 并重新绑定" : "Choose .gvrecovery and rebind"}</button>
+      </details>
+    </section></main>;
+  }
+
   if (!workspace) {
     return <main className="landing"><section className="landing-card">
       <div className="language-pills">
@@ -762,7 +813,7 @@ export function App() {
     <aside className="app-sidebar">
       <div className="brand"><p className="eyebrow">GRUDGE VAULT</p><h1>{t("appName")}</h1></div>
       <nav>
-        {(["chat", "events", "search", "timeline", "people", "review", "backfill", "vault", "settings"] as View[]).map((item) =>
+        {(["chat", "events", "search", "timeline", "people", "review", "backfill", "vault", "evidence", "cases", "settings"] as View[]).map((item) =>
           <button key={item} className={view === item ? "active" : ""} onClick={() => {
             setView(item);
             if (item === "timeline") void loadTimeline();
@@ -1120,6 +1171,11 @@ export function App() {
         </section>
       </div>}
 
+      {view === "evidence" && <EvidencePanel language={language} onError={setError} onNotice={setNotice} />}
+
+      {view === "cases" && <CasesPanel language={language} events={events} people={people} evidence={assets}
+        onError={setError} onNotice={setNotice} />}
+
       {view === "vault" && <div className="vault-grid">
         <section className="panel drop-target" onDragOver={(event) => event.preventDefault()} onDrop={(event) => {
           event.preventDefault(); void importVaultFiles(Array.from(event.dataTransfer.files));
@@ -1143,6 +1199,8 @@ export function App() {
       </div>}
 
       {view === "settings" && <div className="settings-grid">
+        <WorkspaceSecurityPanel language={language} onError={setError} onNotice={setNotice}
+          onLocked={clearSensitiveRendererState} />
         <section className="panel settings-card"><p className="eyebrow">LANGUAGE</p><h2>{t("language")}</h2>
           <div className="language-pills"><button className={language === "zh-CN" ? "active" : ""} onClick={() => setAppLanguage("zh-CN")}>{t("chinese")}</button>
             <button className={language === "en" ? "active" : ""} onClick={() => setAppLanguage("en")}>{t("english")}</button></div></section>

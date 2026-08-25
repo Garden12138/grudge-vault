@@ -90,7 +90,7 @@ Day One 官方说明 macOS 支持通过 `File → Export` 导出 JSON，ZIP 可�
 - 全文搜索、人物关联和时间线回顾；
 - 基于工具调用的 Agent 检索与结构化分析。
 
-Case Binder、内置本地模型、多源自动同步和主动周期回顾将在基础闭环稳定后逐步加入。阶段顺序用于表达依赖关系，可根据真实使用反馈调整，不作为僵硬范围合同。
+内置本地模型、多源自动同步、OCR/ASR 和主动周期回顾将在基础闭环稳定后逐步加入。阶段顺序用于表达依赖关系，可根据真实使用反馈调整，不作为僵硬范围合同。
 
 ## 建议实现基线
 
@@ -109,12 +109,13 @@ Case Binder、内置本地模型、多源自动同步和主动周期回顾将在
 - [架构设计与实现](docs/ARCHITECTURE.md)
 - [分阶段开发计划](docs/DEVELOPMENT_PLAN.md)
 - [开发与验证](docs/DEVELOPMENT.md)
+- [Case Binder 格式 v1](docs/CASE_BINDER_FORMAT.md)
 - [架构决策记录](docs/adr/)
 - [产品构想参考对话](https://chatgpt.com/share/6a8b0514-1c4c-83ea-aacf-e1d4971390fa)
 
 ## 当前状态
 
-Phase 4 First Useful Beta 已完成以 Chat 为统一入口的 Harness Agent，并保留 Phase 1—3 的记录、历史回填、关联与回顾能力：
+Phase 5 Evidence Beta 已完成工作区安全迁移、Evidence、Case 与可独立校验 Binder，并保留 Phase 1—4 的记录、历史回填、关联、回顾与 Harness Agent 能力：
 
 - Electron + React + TypeScript Monorepo 与安全的 Main / Preload / Renderer 边界；
 - 可创建、打开并自动恢复最近的本地工作区，支持中英文切换；
@@ -122,8 +123,9 @@ Phase 4 First Useful Beta 已完成以 Chat 为统一入口的 Harness Agent，�
 - 事件确认、编辑、归档、人物、模糊时间、事实/解释、情绪、利益和待补全项；
 - 追加式 EventRevision、乐观并发控制以及来源引用；
 - SQLite FTS5 关键词搜索与状态、人物、时间过滤；
-- 由系统密钥存储保护的 Workspace Key；
-- AES-256-GCM 加密、SHA-256 内容寻址的对象保险库；
+- 由系统密钥存储保护、带 key ID 与 epoch 的 Workspace Key Ring，以及手动/空闲/休眠/锁屏锁定；
+- 使用异步 scrypt 与 AES-256-GCM、绑定工作区和 epoch、包含迁移中全部 key slots 的显式 `.gvrecovery` 恢复包；
+- GVOB v2 随机内容密钥、认证信封、SHA-256 内容寻址与可中断/继续的流式对象和凭证密钥迁移；
 - 事件附件关联、常见格式受控预览、导出副本、完整性校验和任务重试；
 - 带 manifest 和文件哈希校验的同账户加密工作区快照与恢复；
 - Day One JSON ZIP 安全校验、流式解析、原始 ZIP 与媒体加密入库；
@@ -143,6 +145,13 @@ Phase 4 First Useful Beta 已完成以 Chat 为统一入口的 Harness Agent，�
 - 结构化事实、争议/未知、解释、情绪、利益、风险和可逆行动选项，以及 Event/Source/Asset 引用跳转；
 - 写入提案批准/拒绝、expected revision 冲突保护、`actor: agent` 修订和单条明确 Clarification 的对话内回答；
 - Workspace Key 派生边界内的 AES-256-GCM API 凭证加密，Renderer 只获得 `credentialConfigured` 状态；
+- 独立的 Evidence 视图、30 天默认全库完整性巡检、逐项结果、删除影响、墓碑和不改写引用的替换状态；
+- 原件与只读 DerivedArtifact 的可信分类，以及 Event/事实/Source/Import/Case 引用投影；
+- 追加修订 Case、多币种十进制金额、争议点、问题、材料缺口、Evidence-to-Statement 映射和动态 Case Timeline；
+- 完全离线、只生成外部核验问题且随 Case 修订过期的 Legal Information Adapter；
+- 明确预览和遮盖 profile 后，由用户点击导出的普通目录 Case Binder，包含 PDF、JSON、原件/派生物、manifest 和 POSIX SHA-256 清单；
+- Agent Tool Registry v2 的 Evidence intent、Case/Evidence/Timeline/Gap 工具、Case 写入审批与不可由模型触发的最终 Binder 导出；
+- SQLite v6、workspace/backup manifest v2，以及混合密钥、完整性、Case、Legal 与 Binder 审计状态的快照恢复；
 - lint、typecheck、unit/integration/E2E、生产构建与三平台 CI 打包基线。
 
 快速启动：
@@ -152,6 +161,6 @@ pnpm install
 pnpm dev
 ```
 
-当前版本尚不包含 Import Folder 监听、超大 ZIP 专项优化、OCR/ASR、内置 Embedding/LLM 模型、Case 或 Evidence 工具；这些功能按[分阶段开发计划](docs/DEVELOPMENT_PLAN.md)继续交付。应用不会分发或下载模型：Private 可连接用户已有的 loopback OpenAI 兼容服务，Enhanced 仅在用户配置 HTTPS 兼容端点并确认本次新增外发类别后启用。未注入 Embedding Adapter 时语义检索显示为不可用并完整回退关键词检索。SQLite 中的事件、消息、Day One 来源正文、Agent 派生结果和可选向量仍是本地未加密元数据；原始 ZIP 与二进制媒体已加密。
+当前版本尚不包含 Import Folder 监听、超大 ZIP 专项优化、OCR/ASR、图像/PDF 像素级脱敏或内置 Embedding/LLM 模型；这些功能按[分阶段开发计划](docs/DEVELOPMENT_PLAN.md)继续交付。应用不会分发或下载模型：Private 可连接用户已有的 loopback OpenAI 兼容服务，Enhanced 仅在用户配置 HTTPS 兼容端点并确认本次新增外发类别后启用。未注入 Embedding Adapter 时语义检索显示为不可用并完整回退关键词检索。SQLite 中的事件、消息、Day One 来源正文、Case、Agent 派生结果和可选向量仍是本地未加密元数据；原始 ZIP、二进制媒体和派生对象已加密。
 
 > Grudge Vault 可以帮助整理材料和准备问题，但涉及法律结论时，应结合所在地、事发时点与具体事实核验有效规则，并在需要时咨询专业人士。

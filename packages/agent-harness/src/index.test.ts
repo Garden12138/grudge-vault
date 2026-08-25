@@ -13,7 +13,8 @@ import {
   SqliteAssetRepository,
   SqliteDayOneRepository,
   SqliteJobRepository,
-  SqliteMemoryRepository
+  SqliteMemoryRepository,
+  SqlitePhaseFiveRepository
 } from "@grudge-vault/persistence-sqlite";
 import { AppError } from "@grudge-vault/shared";
 import {
@@ -22,7 +23,7 @@ import {
   MAX_AGENT_MODEL_ROUNDS,
   OpenAiCompatibleChatAdapter,
   createDefaultAgentToolRegistry,
-  exportAgentToolSchemasV1,
+  exportAgentToolSchemasV2,
   redactExternalText,
   routeAgentIntent,
   type AgentModelAdapterPort
@@ -37,6 +38,8 @@ function createContext() {
     async putStream() { return { sha256: "a".repeat(64), byteSize: 4, vaultFormat: 1, deduplicated: false }; },
     async open() { return Readable.from(Buffer.from("test")); },
     async verify() { return true; },
+    async exists() { return true; },
+    async remove() {},
     async cleanupTempFiles() {}
   };
   const memory = new SqliteMemoryRepository(database);
@@ -46,7 +49,8 @@ function createContext() {
       formatVersion: 1, createdAt: "2026-08-24T00:00:00.000Z", updatedAt: "2026-08-24T00:00:00.000Z"
     },
     key: Buffer.alloc(32, 7), assets: new SqliteAssetRepository(database), jobs: new SqliteJobRepository(database),
-    memory, agents: new SqliteAgentRepository(database), dayOne: new SqliteDayOneRepository(database, memory), vault,
+    memory, agents: new SqliteAgentRepository(database), phase5: new SqlitePhaseFiveRepository(database, memory),
+    dayOne: new SqliteDayOneRepository(database, memory), vault,
     async backupDatabase() {}, async close() { database.close(); }
   };
   const manager: WorkspaceManagerPort = {
@@ -73,11 +77,14 @@ describe("Phase 4 Agent Harness", () => {
 
   it("exports versioned schemas and rejects unknown, unauthorized, and invalid tool calls", () => {
     const registry = createDefaultAgentToolRegistry();
-    expect(AGENT_TOOL_SCHEMA_VERSION).toBe(1);
+    expect(AGENT_TOOL_SCHEMA_VERSION).toBe(2);
     expect(registry.definitions("record").every(({ version, jsonSchema }) =>
-      version === 1 && jsonSchema.type === "object")).toBe(true);
-    expect(exportAgentToolSchemasV1("strategy").every(({ version, schema }) =>
-      version === 1 && schema.type === "object")).toBe(true);
+      version === 2 && jsonSchema.type === "object")).toBe(true);
+    expect(exportAgentToolSchemasV2("strategy").every(({ version, schema }) =>
+      version === 2 && schema.type === "object")).toBe(true);
+    expect(registry.definitions("evidence").map(({ name }) => name)).toEqual(expect.arrayContaining([
+      "get_evidence", "get_case", "build_case_timeline", "list_case_gaps", "prepare_case_bundle"
+    ]));
     expect(() => registry.parse("retrieve", "propose_event", {})).toThrowError(AppError);
     expect(() => registry.parse("retrieve", "does_not_exist", {})).toThrowError(AppError);
     expect(() => registry.parse("retrieve", "get_event", { eventRef: "" })).toThrowError(AppError);
@@ -88,6 +95,7 @@ describe("Phase 4 Agent Harness", () => {
     expect(routeAgentIntent("回顾这一年发生了什么")).toBe("review");
     expect(routeAgentIntent("这个情况我该怎么办，有哪些风险？")).toBe("strategy");
     expect(routeAgentIntent("逐项补全这些澄清问题")).toBe("clarify");
+    expect(routeAgentIntent("检查这个 Case 的证据和材料缺口")).toBe("evidence");
     expect(routeAgentIntent("Alex 的历史记录")).toBe("retrieve");
   });
 
@@ -301,7 +309,7 @@ describe("Phase 4 Agent Harness", () => {
     const current = context.application.getEvent(recorded.draft!.id).event;
     context.session.assets.upsert({
       id: "asset-1", sha256: "a".repeat(64), byteSize: 4, mimeType: "text/plain",
-      originalFileName: "secret.txt", vaultFormat: 1, integrityStatus: "verified",
+      originalFileName: "secret.txt", vaultFormat: 1, integrityStatus: "verified", availabilityStatus: "available",
       createdAt: "2026-08-24T00:00:00.000Z"
     });
     context.application.updateEvent({

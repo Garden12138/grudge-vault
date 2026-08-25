@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -52,6 +52,34 @@ describe("EncryptedObjectVault", () => {
       await writeFile(objectPath, bytes);
 
       expect(await vault.verify(stored.sha256, key)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates GVOB v1 objects to authenticated v2 envelopes and rotates key IDs atomically", async () => {
+    const root = await mkdtemp(join(tmpdir(), "grudge-vault-v2-"));
+    try {
+      const input = join(root, "original.txt");
+      const content = Buffer.from("Phase 5 evidence original\n".repeat(4_000));
+      await writeFile(input, content);
+      const vault = new EncryptedObjectVault(join(root, "vault"));
+      const legacyKey = randomBytes(32);
+      const nextKey = randomBytes(32);
+      const legacyKeyId = randomUUID();
+      const nextKeyId = randomUUID();
+      const stored = await vault.put(input, legacyKey);
+      const ring = { activeKeyId: nextKeyId, legacyKeyId, keys: new Map([[legacyKeyId, legacyKey], [nextKeyId, nextKey]]) };
+
+      await vault.migrate(stored.sha256, ring, nextKeyId);
+
+      expect(await vault.keyId(stored.sha256, ring)).toBe(nextKeyId);
+      expect(await vault.verify(stored.sha256, ring, undefined, content.length)).toBe(true);
+      expect(await readAll(await vault.open(stored.sha256, ring))).toEqual(content);
+      expect((await readFile(vault.objectPath(stored.sha256))).subarray(0, 6)).toEqual(Buffer.from([0x47, 0x56, 0x4f, 0x42, 2, 1]));
+      const empty = await vault.putStream(Readable.from(Buffer.alloc(0)), ring, 0);
+      expect(await vault.verify(empty.sha256, ring, undefined, 0)).toBe(true);
+      expect(await readAll(await vault.open(empty.sha256, ring))).toEqual(Buffer.alloc(0));
     } finally {
       await rm(root, { recursive: true, force: true });
     }

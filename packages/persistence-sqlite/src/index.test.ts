@@ -38,7 +38,7 @@ describe("SQLite foundation", () => {
       runMigrations(database);
       expect(database.pragma("journal_mode", { simple: true })).toBe("wal");
       expect(database.pragma("foreign_keys", { simple: true })).toBe(1);
-      expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 5 });
+      expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 6 });
       expect(database.prepare("SELECT count(*) AS count FROM pragma_module_list WHERE name = 'fts5'").get()).toEqual({ count: 1 });
       database.close();
     } finally {
@@ -59,7 +59,7 @@ describe("SQLite foundation", () => {
     runMigrations(database, [DEFAULT_MIGRATIONS[0]!]);
     expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 1 });
     runMigrations(database);
-    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 5 });
+    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 6 });
     expect(database.prepare("SELECT name FROM sqlite_master WHERE name = 'events'").get()).toEqual({ name: "events" });
     database.close();
   });
@@ -115,7 +115,7 @@ describe("SQLite foundation", () => {
       "agent_actions", "agent_credentials", "agent_model_calls", "agent_model_settings",
       "agent_runs", "agent_tool_calls", "external_context_disclosures"
     ]);
-    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 5 });
+    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 6 });
     database.close();
   });
 

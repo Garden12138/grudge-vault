@@ -8,17 +8,21 @@ import { setImmediate } from "node:timers";
 import { lookup as lookupMimeType } from "mime-types";
 import type {
   AgentExecutionMode, AgentModelCallAudit, AgentModelSettings, AgentRun, Asset, BackfillRun, CandidateDetail,
+  Case, CaseBinderExportResult, CaseBinderPreview, CaseBinderProfile, CaseDetail, CaseRevision,
   CandidateExtraction, CandidateSummary, Clarification, Conversation, EmbeddingGeneration,
   EmbeddingIndexStatus, Event, EventRelation, EventRevision,
-  EventSearchQuery, ImportIssue, ImportRun, ImportRunDetail, Job, Message, Person, PersonAlias,
+  EventSearchQuery, EvidenceDetail, EvidenceReferenceImpact, ImportIssue, ImportRun, ImportRunDetail, IntegrityScan, Job,
+  LegalVerificationResult, Message, Person, PersonAlias,
   PersonIdentityDetail, PersonMergeRecord, PersonMergeSuggestion, ReviewRun, Source,
   SourceItem, SourceReferenceDetail, SourceVersion, TimelineQuery, TimelineResult,
-  UnifiedSearchHit, UnifiedSearchQuery, Workspace
+  RecoveryPackageSummary, UnifiedSearchHit, UnifiedSearchQuery, Workspace, WorkspaceCryptoStatus,
+  WorkspaceLockState, WorkspaceSecuritySettings
 } from "@grudge-vault/domain";
 import {
   AppError, toSerializedError, type AssetImportResult, type AssetPreview,
   type BackupSummary, type ClarificationAnswerInput, type CreateEventInput,
   type AgentSettingsUpdateInput, type CandidateMergeInput, type CandidateMergeResult, type CreateRelationInput, type EventWriteFields,
+  type CaseWriteFields, type CreateCaseInput, type UpdateCaseInput,
   type PersonAliasInput, type PersonMergeInput, type ReviewGenerateInput, type SendMessageInput,
   type SendMessageResult, type StartBackfillInput, type UpdateEventInput
 } from "@grudge-vault/shared";
@@ -32,10 +36,15 @@ import {
   reciprocalRankFusion, relationSuggestions, REVIEW_GENERATOR_IDENTITY, REVIEW_GENERATOR_VERSION,
   type EmbeddingAdapterPort
 } from "./phase3";
+import {
+  PhaseFiveService, type CaseSummaryPdfPort, type CryptoMigrationRecord,
+  type LegalInformationAdapterPort, type PhaseFiveRepositoryPort
+} from "./phase5";
 
 export * from "./memory";
 export * from "./dayone";
 export * from "./phase3";
+export * from "./phase5";
 
 export interface StoredObject {
   sha256: string;
@@ -44,11 +53,23 @@ export interface StoredObject {
   deduplicated: boolean;
 }
 
+export interface WorkspaceKeyRing {
+  activeKeyId: string;
+  legacyKeyId: string;
+  keys: ReadonlyMap<string, Buffer>;
+}
+
+export type VaultKey = Buffer | WorkspaceKeyRing;
+
 export interface ObjectVaultPort {
-  put(inputPath: string, key: Buffer): Promise<StoredObject>;
-  putStream(input: Readable, key: Buffer, expectedByteSize?: number, onProgress?: (progress: number) => void): Promise<StoredObject>;
-  open(sha256: string, key: Buffer): Promise<Readable>;
-  verify(sha256: string, key: Buffer, onProgress?: (progress: number) => void): Promise<boolean>;
+  put(inputPath: string, key: VaultKey): Promise<StoredObject>;
+  putStream(input: Readable, key: VaultKey, expectedByteSize?: number, onProgress?: (progress: number) => void): Promise<StoredObject>;
+  open(sha256: string, key: VaultKey): Promise<Readable>;
+  verify(sha256: string, key: VaultKey, onProgress?: (progress: number) => void, expectedByteSize?: number): Promise<boolean>;
+  migrate?(sha256: string, key: WorkspaceKeyRing, targetKeyId: string, onProgress?: (progress: number) => void): Promise<void>;
+  keyId?(sha256: string, key: WorkspaceKeyRing): Promise<string>;
+  exists(sha256: string): Promise<boolean>;
+  remove(sha256: string): Promise<void>;
   cleanupTempFiles(): Promise<void>;
 }
 
@@ -57,6 +78,7 @@ export interface AssetRepositoryPort {
   findById(id: string): Asset | undefined;
   upsert(asset: Asset): { asset: Asset; deduplicated: boolean };
   setIntegrity(id: string, status: Asset["integrityStatus"], verifiedAt?: string): Asset;
+  setVaultFormat?(id: string, vaultFormat: number): Asset;
 }
 
 export interface JobRepositoryPort {
@@ -73,10 +95,12 @@ export interface JobRepositoryPort {
 export interface WorkspaceSession {
   workspace: Workspace;
   key: Buffer;
+  keyRing?: WorkspaceKeyRing;
   assets: AssetRepositoryPort;
   jobs: JobRepositoryPort;
   memory: MemoryRepositoryPort;
   agents: AgentRepositoryPort;
+  phase5?: PhaseFiveRepositoryPort;
   dayOne: import("./dayone").DayOneRepositoryPort;
   vault: ObjectVaultPort;
   backupDatabase(destinationPath: string): Promise<void>;
@@ -89,6 +113,16 @@ export interface WorkspaceManagerPort {
   open(rootPath: string): Promise<WorkspaceSession>;
   createBackup(destinationPath: string): Promise<BackupSummary>;
   restoreBackup(backupPath: string, destinationPath: string): Promise<WorkspaceSession>;
+  status?(): WorkspaceLockState;
+  lock?(): Promise<WorkspaceLockState>;
+  unlock?(): Promise<WorkspaceSession>;
+  getSecuritySettings?(): WorkspaceSecuritySettings;
+  updateSecuritySettings?(settings: WorkspaceSecuritySettings): Promise<WorkspaceSecuritySettings>;
+  exportRecovery?(path: string, passphrase: string): Promise<RecoveryPackageSummary>;
+  recover?(path: string, passphrase: string): Promise<WorkspaceSession>;
+  prepareKeyRotation?(): Promise<WorkspaceCryptoStatus>;
+  completeKeyRotation?(targetKeyId: string): Promise<WorkspaceCryptoStatus>;
+  getCryptoStatus?(): WorkspaceCryptoStatus;
   close(): Promise<void>;
 }
 
@@ -99,6 +133,16 @@ export interface KeyProtectorPort {
 }
 
 const AGENT_CONSENT_POLICY_VERSION = 1;
+
+function normalizeCaseWriteFields(value: CaseWriteFields): CaseWriteFields {
+  return {
+    title: value.title, status: value.status, ...(value.summary !== undefined ? { summary: value.summary } : {}),
+    jurisdiction: value.jurisdiction, asOfDate: value.asOfDate, eventRefs: value.eventRefs,
+    personRefs: value.personRefs, sourceRefs: value.sourceRefs, assetRefs: value.assetRefs,
+    amounts: value.amounts, disputePoints: value.disputePoints, questions: value.questions,
+    materialGaps: value.materialGaps, evidenceLinks: value.evidenceLinks
+  };
+}
 
 function normalizeAgentEndpoint(mode: AgentExecutionMode, baseUrl: string): string {
   const input = baseUrl.trim();
@@ -152,15 +196,155 @@ function decryptAgentCredential(
 }
 
 export class GrudgeVaultApplication {
+  private readonly phaseFive: PhaseFiveService;
+
   constructor(
     private readonly workspaces: WorkspaceManagerPort,
     private readonly draftGenerator: EventDraftGeneratorPort = new DeterministicEventDraftGenerator(),
     private readonly dayOneImporter?: DayOneImporterPort,
-    private readonly embeddingAdapter?: EmbeddingAdapterPort
-  ) {}
+    private readonly embeddingAdapter?: EmbeddingAdapterPort,
+    phaseFiveOptions: { pdf?: CaseSummaryPdfPort; legal?: LegalInformationAdapterPort } = {}
+  ) {
+    this.phaseFive = new PhaseFiveService(() => {
+      const session = this.requireSession();
+      if (!session.phase5) throw new AppError("INTERNAL_ERROR", "Phase 5 storage is unavailable.");
+      return {
+        workspaceId: session.workspace.id, workspaceRoot: session.workspace.rootPath,
+        key: session.keyRing ?? session.key,
+        assets: session.assets, memory: session.memory, phase5: session.phase5, vault: session.vault
+      };
+    }, phaseFiveOptions.pdf, phaseFiveOptions.legal);
+  }
 
   getCurrentWorkspace(): Workspace | null {
     return this.workspaces.current()?.workspace ?? null;
+  }
+
+  getWorkspaceStatus(): WorkspaceLockState {
+    return this.workspaces.status?.() ?? (this.getCurrentWorkspace() ? { status: "open", workspace: this.getCurrentWorkspace()! } : { status: "closed" });
+  }
+
+  lockWorkspace(): Promise<WorkspaceLockState> {
+    if (!this.workspaces.lock) throw new AppError("INTERNAL_ERROR", "Workspace locking is unavailable.");
+    return this.workspaces.lock();
+  }
+
+  async unlockWorkspace(): Promise<Workspace> {
+    if (!this.workspaces.unlock) throw new AppError("INTERNAL_ERROR", "Workspace unlocking is unavailable.");
+    return (await this.workspaces.unlock()).workspace;
+  }
+
+  getWorkspaceSecuritySettings(): WorkspaceSecuritySettings {
+    return this.workspaces.getSecuritySettings?.() ?? { autoLockMinutes: 15, integrityScanIntervalDays: 30 };
+  }
+
+  updateWorkspaceSecuritySettings(settings: WorkspaceSecuritySettings): Promise<WorkspaceSecuritySettings> {
+    if (!this.workspaces.updateSecuritySettings) throw new AppError("INTERNAL_ERROR", "Workspace security settings are unavailable.");
+    return this.workspaces.updateSecuritySettings(settings);
+  }
+
+  exportWorkspaceRecovery(path: string, passphrase: string): Promise<RecoveryPackageSummary> {
+    if (!this.workspaces.exportRecovery) throw new AppError("INTERNAL_ERROR", "Workspace recovery export is unavailable.");
+    return this.workspaces.exportRecovery(path, passphrase);
+  }
+
+  async recoverWorkspace(path: string, passphrase: string): Promise<Workspace> {
+    if (!this.workspaces.recover) throw new AppError("INTERNAL_ERROR", "Workspace recovery is unavailable.");
+    return (await this.workspaces.recover(path, passphrase)).workspace;
+  }
+
+  getWorkspaceCryptoStatus(): WorkspaceCryptoStatus {
+    if (!this.workspaces.getCryptoStatus) throw new AppError("INTERNAL_ERROR", "Workspace crypto status is unavailable.");
+    const status = this.workspaces.getCryptoStatus();
+    const migration = this.workspaces.current()?.phase5?.getActiveCryptoMigration();
+    return migration ? {
+      ...status, migrationState: migration.state === "succeeded" ? "idle" : migration.state, processedObjects: migration.processedObjects,
+      totalObjects: migration.totalObjects, ...(migration.lastError ? { lastError: migration.lastError } : {})
+    } : status;
+  }
+
+  async rotateWorkspaceKey(): Promise<WorkspaceCryptoStatus> {
+    if (!this.workspaces.prepareKeyRotation) throw new AppError("INTERNAL_ERROR", "Workspace Key rotation is unavailable.");
+    const status = await this.workspaces.prepareKeyRotation();
+    const session = this.requireSession();
+    const now = new Date().toISOString();
+    const totalObjects = session.assets.list().filter(({ availabilityStatus }) => availabilityStatus !== "deleted").length
+      + (session.phase5?.listDerivedArtifacts().length ?? 0);
+    session.phase5?.saveCryptoMigration({
+      id: randomUUID(), fromKeyId: status.retiringKeyIds[0] ?? status.activeKeyId, toKeyId: status.activeKeyId,
+      state: "queued", processedObjects: 0,
+      totalObjects,
+      createdAt: now, updatedAt: now
+    });
+    session.jobs.enqueue("workspace.crypto-migrate", { targetKeyId: status.activeKeyId }, new Date().toISOString(), 10);
+    return status;
+  }
+
+  ensureWorkspaceCryptoMigration(): Job | undefined {
+    const session = this.requireSession();
+    const status = this.getWorkspaceCryptoStatus();
+    if (status.migrationState === "idle") return undefined;
+    if (session.jobs.list().some(({ type, state }) => type === "workspace.crypto-migrate" && (state === "queued" || state === "running"))) {
+      return undefined;
+    }
+    const now = new Date().toISOString();
+    if (!session.phase5?.getActiveCryptoMigration()) {
+      const totalObjects = session.assets.list().filter(({ availabilityStatus }) => availabilityStatus !== "deleted").length
+        + (session.phase5?.listDerivedArtifacts().length ?? 0);
+      session.phase5?.saveCryptoMigration({
+        id: randomUUID(), fromKeyId: status.retiringKeyIds[0] ?? status.activeKeyId, toKeyId: status.activeKeyId,
+        state: "queued", processedObjects: 0, totalObjects, createdAt: now, updatedAt: now
+      });
+    }
+    return session.jobs.enqueue("workspace.crypto-migrate", { targetKeyId: status.activeKeyId }, now, 10);
+  }
+
+  async runWorkspaceCryptoMigration(targetKeyId: string, context: JobHandlerContext): Promise<void> {
+    const session = this.requireSession();
+    const ring = session.keyRing;
+    const repository = session.phase5;
+    if (!ring || !session.vault.migrate || !repository) throw new AppError("CRYPTO_MIGRATION_CONFLICT", "The versioned Object Vault is unavailable.");
+    const objects: Array<{ cursorId: string; sha256: string; assetId?: string }> = [
+      ...session.assets.list().filter(({ availabilityStatus }) => availabilityStatus !== "deleted")
+        .map(({ id, sha256 }) => ({ cursorId: `asset:${id}`, sha256, assetId: id })),
+      ...repository.listDerivedArtifacts().map(({ id, sha256 }) => ({ cursorId: `derived:${id}`, sha256 }))
+    ].sort((a, b) => a.cursorId.localeCompare(b.cursorId));
+    const now = new Date().toISOString();
+    let migration: CryptoMigrationRecord = repository.getActiveCryptoMigration() ?? {
+      id: randomUUID(), fromKeyId: ring.legacyKeyId, toKeyId: targetKeyId, state: "queued",
+      processedObjects: 0, totalObjects: objects.length, createdAt: now, updatedAt: now
+    };
+    if (migration.toKeyId !== targetKeyId) throw new AppError("CRYPTO_MIGRATION_CONFLICT", "Another key migration is active.");
+    migration = repository.saveCryptoMigration({ ...migration, state: "running", totalObjects: objects.length, updatedAt: now, lastError: undefined });
+    const start = migration.cursor ? Math.max(0, objects.findIndex(({ cursorId }) => cursorId === migration.cursor) + 1) : 0;
+    try {
+      for (let index = start; index < objects.length; index += 1) {
+        if (context.signal.aborted) throw new Error("Workspace crypto migration interrupted.");
+        const object = objects[index]!;
+        await session.vault.migrate(object.sha256, ring, targetKeyId, (progress) =>
+          context.reportProgress((index + progress) / Math.max(1, objects.length)));
+        if (object.assetId) session.assets.setVaultFormat?.(object.assetId, 2);
+        migration = repository.saveCryptoMigration({ ...migration, cursor: object.cursorId, processedObjects: index + 1, updatedAt: new Date().toISOString() });
+      }
+      if (session.vault.keyId) {
+        for (const object of objects) {
+          if (await session.vault.keyId(object.sha256, ring) !== targetKeyId) {
+            throw new AppError("CRYPTO_MIGRATION_CONFLICT", "An object still uses a retiring Workspace Key.");
+          }
+        }
+      }
+      this.reencryptAgentCredentials(targetKeyId);
+      if (!this.workspaces.completeKeyRotation) throw new AppError("CRYPTO_MIGRATION_CONFLICT", "Workspace Key finalization is unavailable.");
+      await this.workspaces.completeKeyRotation(targetKeyId);
+      const finishedAt = new Date().toISOString();
+      repository.saveCryptoMigration({ ...migration, state: "succeeded", processedObjects: objects.length,
+        totalObjects: objects.length, updatedAt: finishedAt, finishedAt });
+      context.reportProgress(1);
+    } catch (error) {
+      repository.saveCryptoMigration({ ...migration, state: "failed", lastError: error instanceof Error ? error.message : "Migration failed",
+        updatedAt: new Date().toISOString() });
+      throw error;
+    }
   }
 
   async createWorkspace(rootPath: string, name: string): Promise<Workspace> {
@@ -277,7 +461,8 @@ export class GrudgeVaultApplication {
         if (!apiKey || apiKey.length > 10_000) {
           throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "The model credential is invalid.");
         }
-        repository.saveCredential(mode, encryptAgentCredential(apiKey, session.key, session.workspace.id, mode), new Date().toISOString());
+        const encryptionKey = session.keyRing?.keys.get(session.keyRing.activeKeyId) ?? session.key;
+        repository.saveCredential(mode, encryptAgentCredential(apiKey, encryptionKey, session.workspace.id, mode), new Date().toISOString());
       }
       return { baseUrl, model, credentialConfigured: Boolean(repository.getCredential(mode)) };
     };
@@ -305,7 +490,12 @@ export class GrudgeVaultApplication {
   getAgentCredential(mode: AgentExecutionMode): string | undefined {
     const session = this.requireSession();
     const envelope = session.agents.getCredential(mode);
-    return envelope ? decryptAgentCredential(envelope, session.key, session.workspace.id, mode) : undefined;
+    if (!envelope) return undefined;
+    const candidates = session.keyRing ? [...session.keyRing.keys.values()] : [session.key];
+    for (const key of candidates) {
+      try { return decryptAgentCredential(envelope, key, session.workspace.id, mode); } catch { /* try the next retained key */ }
+    }
+    throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "The stored model credential could not be decrypted with the current key ring.");
   }
 
   async sendMessage(input: SendMessageInput): Promise<SendMessageResult> {
@@ -815,13 +1005,13 @@ export class GrudgeVaultApplication {
       throw new AppError("FILE_NOT_REGULAR", "Only regular files can be imported.");
     }
     try {
-      const stored = await session.vault.put(filePath, session.key);
+      const stored = await session.vault.put(filePath, session.keyRing ?? session.key);
       const now = new Date().toISOString();
       const candidate: Asset = {
         id: randomUUID(), sha256: stored.sha256, byteSize: stored.byteSize,
         mimeType: lookupMimeType(filePath) || "application/octet-stream",
         originalFileName: basename(filePath), vaultFormat: stored.vaultFormat,
-        integrityStatus: "pending", createdAt: now
+        integrityStatus: "pending", availabilityStatus: "available", createdAt: now
       };
       const result = session.assets.upsert(candidate);
       if (!result.deduplicated) {
@@ -868,7 +1058,7 @@ export class GrudgeVaultApplication {
     if (!archive) throw new AppError("ASSET_NOT_FOUND", "The encrypted Day One archive no longer exists.");
     const temporary = join(session.workspace.rootPath, "vault", "tmp", `${run.id}.${randomUUID()}.dayone.zip`);
     try {
-      await pipeline(await session.vault.open(archive.sha256, session.key), createWriteStream(temporary, { flags: "wx", mode: 0o600 }));
+      await pipeline(await session.vault.open(archive.sha256, session.keyRing ?? session.key), createWriteStream(temporary, { flags: "wx", mode: 0o600 }));
       const bump = (field: keyof ImportRun["counts"], amount = 1) => {
         run = { ...run, counts: { ...run.counts, [field]: run.counts[field] + amount }, updatedAt: new Date().toISOString() };
       };
@@ -1085,7 +1275,7 @@ export class GrudgeVaultApplication {
     try {
       const chunks: Buffer[] = [];
       let byteSize = 0;
-      for await (const chunk of await session.vault.open(asset.sha256, session.key)) {
+      for await (const chunk of await session.vault.open(asset.sha256, session.keyRing ?? session.key)) {
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         byteSize += buffer.length;
         if (byteSize > 64 * 1024 * 1024) {
@@ -1110,7 +1300,7 @@ export class GrudgeVaultApplication {
     if (!asset) throw new AppError("ASSET_NOT_FOUND", "The asset no longer exists.");
     const temporary = `${outputPath}.${randomUUID()}.tmp`;
     try {
-      await pipeline(await session.vault.open(asset.sha256, session.key), createWriteStream(temporary, { flags: "wx", mode: 0o600 }));
+      await pipeline(await session.vault.open(asset.sha256, session.keyRing ?? session.key), createWriteStream(temporary, { flags: "wx", mode: 0o600 }));
       await rename(temporary, outputPath);
       return outputPath;
     } catch (error) {
@@ -1137,6 +1327,46 @@ export class GrudgeVaultApplication {
     return this.requireSession().jobs.retry(jobId, new Date().toISOString());
   }
 
+  listEvidence(): EvidenceDetail[] { return this.phaseFive.listEvidence(); }
+  getEvidence(assetId: string): EvidenceDetail { return this.phaseFive.getEvidence(assetId); }
+  getEvidenceImpact(assetId: string): EvidenceReferenceImpact { return this.phaseFive.getEvidenceImpact(assetId); }
+  listIntegrityScans(): IntegrityScan[] { return this.requireSession().phase5?.listIntegrityScans() ?? []; }
+  startIntegrityScan(): IntegrityScan {
+    const scan = this.phaseFive.startIntegrityScan();
+    this.requireSession().jobs.enqueue("vault.integrity-scan", { scanId: scan.id }, new Date().toISOString(), 3);
+    return scan;
+  }
+  runIntegrityScan(scanId: string, context: JobHandlerContext): Promise<void> {
+    return this.phaseFive.runIntegrityScan(scanId, context.reportProgress, context.signal);
+  }
+  deleteOriginal(assetId: string, confirmReferencedDeletion: boolean): Promise<EvidenceDetail> {
+    return this.phaseFive.deleteOriginal(assetId, confirmReferencedDeletion);
+  }
+  supersedeOriginal(oldAssetId: string, newAssetId: string): EvidenceDetail {
+    return this.phaseFive.supersedeOriginal(oldAssetId, newAssetId);
+  }
+
+  listCases(): Case[] { return this.phaseFive.listCases(); }
+  getCase(id: string): CaseDetail { return this.phaseFive.getCase(id); }
+  listCaseRevisions(id: string): CaseRevision[] { return this.requireSession().phase5?.listCaseRevisions(id) ?? []; }
+  createCase(input: CreateCaseInput): Case {
+    const { reason, ...fields } = input;
+    return this.phaseFive.createCase(normalizeCaseWriteFields(fields), reason);
+  }
+  updateCase(input: UpdateCaseInput): Case {
+    const { caseId, expectedRevision, reason, ...fields } = input;
+    return this.phaseFive.updateCase(caseId, expectedRevision, normalizeCaseWriteFields(fields), reason);
+  }
+  archiveCase(id: string, expectedRevision: number): Case {
+    const current = this.phaseFive.getCase(id).case;
+    return this.phaseFive.updateCase(id, expectedRevision, { ...normalizeCaseWriteFields(current), status: "archived" }, "Case archived");
+  }
+  runLegalCheck(id: string): Promise<LegalVerificationResult> { return this.phaseFive.runLegalCheck(id); }
+  previewCaseBinder(id: string, profile: CaseBinderProfile): CaseBinderPreview { return this.phaseFive.previewBinder(id, profile); }
+  exportCaseBinder(previewId: string, destinationPath: string): Promise<CaseBinderExportResult> {
+    return this.phaseFive.exportBinder(previewId, destinationPath);
+  }
+
   private createProposedEvent(proposal: EventDraftProposal): Event {
     const now = new Date().toISOString();
     const clarifications: Clarification[] = proposal.clarification ? [{
@@ -1146,14 +1376,26 @@ export class GrudgeVaultApplication {
     return this.commitNewEvent(proposal, "Created from chat message", now, { clarifications });
   }
 
+  private reencryptAgentCredentials(targetKeyId: string): void {
+    const session = this.requireSession();
+    const target = session.keyRing?.keys.get(targetKeyId);
+    if (!target) throw new AppError("CRYPTO_MIGRATION_CONFLICT", "The target key is unavailable for credential migration.");
+    for (const mode of ["private", "enhanced"] as const) {
+      const plaintext = this.getAgentCredential(mode);
+      if (plaintext !== undefined) {
+        session.agents.saveCredential(mode, encryptAgentCredential(plaintext, target, session.workspace.id, mode), new Date().toISOString());
+      }
+    }
+  }
+
   private async importAssetStream(stream: Readable, fileName: string, expectedByteSize: number): Promise<AssetImportResult> {
     const session = this.requireSession();
-    const stored = await session.vault.putStream(stream, session.key, expectedByteSize);
+    const stored = await session.vault.putStream(stream, session.keyRing ?? session.key, expectedByteSize);
     const now = new Date().toISOString();
     const result = session.assets.upsert({
       id: randomUUID(), sha256: stored.sha256, byteSize: stored.byteSize,
       mimeType: lookupMimeType(fileName) || "application/octet-stream", originalFileName: basename(fileName),
-      vaultFormat: stored.vaultFormat, integrityStatus: "pending", createdAt: now
+      vaultFormat: stored.vaultFormat, integrityStatus: "pending", availabilityStatus: "available", createdAt: now
     });
     if (!result.deduplicated) session.jobs.enqueue("asset.verify", { assetId: result.asset.id, sha256: result.asset.sha256 }, now);
     return result;
@@ -1394,6 +1636,7 @@ export class JobRunner {
   private runningAbort: AbortController | undefined;
   private draining = false;
   private stopped = true;
+  private drainPromise: Promise<void> | undefined;
 
   constructor(
     private readonly repository: JobRepositoryPort,
@@ -1410,12 +1653,12 @@ export class JobRunner {
   start(): void {
     if (!this.stopped) return;
     this.stopped = false;
-    this.pollTimer = setInterval(() => void this.drain(), this.pollMs);
-    void this.drain();
+    this.pollTimer = setInterval(() => this.triggerDrain(), this.pollMs);
+    this.triggerDrain();
   }
 
   wake(): void {
-    if (!this.stopped) void this.drain();
+    if (!this.stopped) this.triggerDrain();
   }
 
   stop(): void {
@@ -1423,6 +1666,16 @@ export class JobRunner {
     if (this.pollTimer) clearInterval(this.pollTimer);
     this.pollTimer = undefined;
     this.runningAbort?.abort();
+  }
+
+  async stopAndWait(): Promise<void> {
+    this.stop();
+    await this.drainPromise;
+  }
+
+  private triggerDrain(): void {
+    if (this.drainPromise) return;
+    this.drainPromise = this.drain().finally(() => { this.drainPromise = undefined; });
   }
 
   private async drain(): Promise<void> {
@@ -1459,15 +1712,17 @@ export class JobRunner {
           this.onChanged();
         }
       });
-      if (!this.stopped) this.repository.succeed(job.id, this.now().toISOString());
+      const finished = this.now().toISOString();
+      if (!this.stopped) this.repository.succeed(job.id, finished);
+      else this.repository.fail(job.id, "Interrupted while locking workspace", finished, finished);
     } catch (error) {
-      if (!this.stopped) {
+      if (!this.stopped || abort.signal.aborted) {
         const now = this.now();
         const retryDelays = [1_000, 5_000];
         const attemptWithinCycle = (job.attempts - 1) % 3;
-        const delay = retryDelays[attemptWithinCycle];
+        const delay = abort.signal.aborted ? 0 : retryDelays[attemptWithinCycle];
         const retryAt = delay === undefined ? undefined : new Date(now.getTime() + delay).toISOString();
-        this.repository.fail(job.id, error instanceof Error ? error.message : "Job failed", now.toISOString(), retryAt);
+        this.repository.fail(job.id, abort.signal.aborted ? "Interrupted while locking workspace" : error instanceof Error ? error.message : "Job failed", now.toISOString(), retryAt);
       }
     } finally {
       clearInterval(heartbeat);

@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { _electron as electron, expect, test } from "@playwright/test";
 
-test("completes the Phase 4 memory, Private Agent, and injected Enhanced Agent loop", async () => {
+test("completes the Phase 5 memory, Evidence, Case Binder, security, and Agent loop", async () => {
   const root = await mkdtemp(join(tmpdir(), "grudge-vault-e2e-"));
   const workspace = join(root, "workspace");
   const userData = join(root, "user-data");
@@ -126,6 +126,46 @@ test("completes the Phase 4 memory, Private Agent, and injected Enhanced Agent l
     await expect(page.locator(".pattern-list article").first()).toBeVisible();
     await expect(page.locator(".pattern-list")).toContainText("Supporting events");
 
+    await page.getByRole("button", { name: "Evidence", exact: true }).click();
+    await expect(page.locator(".evidence-view").getByText("phase-zero-demo.txt", { exact: true }).first()).toBeVisible();
+    await page.getByRole("button", { name: "Scan all", exact: true }).click();
+    await expect(page.locator(".evidence-view .revision-list article").first()).toContainText("succeeded", { timeout: 15_000 });
+
+    await page.getByRole("button", { name: "Cases", exact: true }).click();
+    const casesView = page.locator(".cases-view");
+    await casesView.getByLabel("Title").fill("Attribution Evidence Case");
+    await casesView.getByLabel("Jurisdiction").fill("CN-SH");
+    await casesView.getByRole("checkbox", { name: "On 2026-08-20 Alex omitted my name from the report", exact: true }).check();
+    await casesView.getByRole("checkbox", { name: "phase-zero-demo.txt", exact: true }).check();
+    await casesView.getByRole("button", { name: "Create Case", exact: true }).click();
+    await expect(casesView.getByText("Attribution Evidence Case", { exact: true }).first()).toBeVisible();
+    await casesView.getByPlaceholder("Amount label").fill("Attribution claim");
+    await casesView.getByPlaceholder("0.00").fill("500.00");
+    await casesView.locator(".compact-form").getByRole("button", { name: "Add", exact: true }).click();
+    await expect(casesView.getByText("CNY 500.00", { exact: false })).toBeVisible();
+    await casesView.getByPlaceholder("Missing material").fill("Delivery receipt");
+    await casesView.getByRole("button", { name: "Add gap", exact: true }).click();
+    await expect(casesView.getByText("Delivery receipt", { exact: true })).toBeVisible();
+    await casesView.getByRole("button", { name: "Offline legal check", exact: true }).click();
+    await expect(casesView.getByText("needs_external_verification", { exact: true })).toBeVisible();
+    await casesView.getByRole("button", { name: "Create explicit preview", exact: true }).click();
+    await expect(casesView.getByText("Export preview", { exact: false })).toBeVisible();
+    await expect(casesView.locator(".warning-copy").first()).toContainText("Original bytes are unchanged");
+    const binderPath = join(root, "case-binder");
+    await application.evaluate(({ dialog }, destination) => {
+      Object.defineProperty(dialog, "showSaveDialog", {
+        configurable: true, value: async () => ({ canceled: false, filePath: destination })
+      });
+    }, binderPath);
+    await casesView.getByRole("button", { name: "Choose directory and export", exact: true }).click();
+    await expect.poll(async () => readFile(join(binderPath, "manifest.json"), "utf8").then((value) => value.length, () => 0),
+      { timeout: 15_000 }).toBeGreaterThan(100);
+    const binderSums = (await readFile(join(binderPath, "sha256sums.txt"), "utf8")).trim().split("\n");
+    for (const line of binderSums) {
+      const [expected, path] = line.split("  ", 2) as [string, string];
+      expect(createHash("sha256").update(await readFile(join(binderPath, path))).digest("hex")).toBe(expected);
+    }
+
     await page.getByRole("button", { name: "Backfill", exact: true }).click();
     await page.getByRole("button", { name: "Choose JSON ZIP", exact: true }).click();
     await expect(page.locator(".import-panel .run-list article")).toHaveCount(2);
@@ -175,6 +215,38 @@ test("completes the Phase 4 memory, Private Agent, and injected Enhanced Agent l
     await enhancedTurn.getByRole("button", { name: "Work notes", exact: true }).first().click();
     await expect(page.locator(".source-modal")).toContainText("On 2026-08-20 Alex omitted my name from the report.");
     await page.locator(".source-modal").getByRole("button", { name: "×", exact: true }).click();
+
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page.getByRole("button", { name: "Lock now", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Workspace locked", exact: true })).toBeVisible();
+    await expect(page.getByText(workspace, { exact: true })).toHaveCount(0);
+    await page.getByRole("button", { name: "Unlock with OS key store", exact: true }).click();
+    await expect(page.getByText("Automated Vault", { exact: true })).toBeVisible();
+
+    const backupPath = join(root, "phase5.gvbackup");
+    const restoredPath = join(root, "phase5-restored");
+    await mkdir(restoredPath);
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await application.evaluate(({ dialog }, destination) => {
+      Object.defineProperty(dialog, "showSaveDialog", {
+        configurable: true, value: async () => ({ canceled: false, filePath: destination })
+      });
+    }, backupPath);
+    await page.getByRole("button", { name: "Create encrypted snapshot", exact: true }).click();
+    await expect.poll(async () => readFile(join(backupPath, "manifest.json"), "utf8").then((value) => value.length, () => 0),
+      { timeout: 15_000 }).toBeGreaterThan(100);
+    await application.evaluate(({ dialog }, paths) => {
+      let call = 0;
+      Object.defineProperty(dialog, "showOpenDialog", {
+        configurable: true,
+        value: async () => ({ canceled: false, filePaths: [call++ === 0 ? paths.backup : paths.restore] })
+      });
+    }, { backup: backupPath, restore: restoredPath });
+    page.once("dialog", (dialog) => void dialog.accept());
+    await page.getByRole("button", { name: "Restore snapshot", exact: true }).click();
+    await expect(page.getByText(restoredPath, { exact: true }).first()).toBeVisible({ timeout: 15_000 });
+    await page.getByRole("button", { name: "Cases", exact: true }).click();
+    await expect(page.getByText("Attribution Evidence Case", { exact: true }).first()).toBeVisible();
     await application.close();
 
     application = await launch();

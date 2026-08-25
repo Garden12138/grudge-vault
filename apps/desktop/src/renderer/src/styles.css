@@ -204,6 +204,26 @@ fieldset .inline-create { padding: 13px 0 0; }
 .settings-list span { color: #7d756b; font-size: 10px; }
 .settings-list button { padding: 5px 8px; font-size: 10px; }
 
+.phase-five-grid { display: grid; grid-template-columns: minmax(300px, .75fr) minmax(520px, 1.7fr); gap: 18px; align-items: start; }
+.phase-five-index { position: sticky; top: 24px; max-height: calc(100vh - 48px); overflow: auto; }
+.phase-five-detail { min-height: calc(100vh - 48px); }
+.evidence-statuses { display: flex !important; align-items: flex-end; gap: 5px !important; }
+.evidence-metadata { display: grid; grid-template-columns: minmax(0, 2fr) repeat(2, minmax(100px, .5fr)); gap: 10px; padding: 20px 22px; }
+.evidence-metadata > div { display: grid; gap: 6px; min-width: 0; padding: 12px; border: 1px solid #e2d8ca; border-radius: 10px; background: #fffdf8; }
+.evidence-metadata span { color: #7a7167; font-size: 10px; font-weight: 750; text-transform: uppercase; }
+.evidence-metadata code, .crypto-status code { overflow-wrap: anywhere; font-size: 10px; }
+.compact-form { display: grid; grid-template-columns: 1fr 90px 130px auto; gap: 8px; margin-top: 12px; }
+.binder-options { display: flex; gap: 13px; margin: 12px 0 16px; flex-wrap: wrap; }
+.binder-preview { margin-top: 18px; padding: 16px; border: 1px solid #d9cebf; border-radius: 11px; background: #fffdf8; }
+.warning-copy { color: #7b4d24; line-height: 1.55; }
+.security-card { grid-column: span 2; }
+.security-card .field { margin: 12px 0; }
+.crypto-status { margin: 16px 0; padding: 12px; border: 1px solid #d9cebf; border-radius: 10px; background: #fffdf8; }
+.crypto-status p { margin: 0 0 6px !important; }
+.recovery-unlock { margin-top: 22px; padding-top: 16px; border-top: 1px solid #ded4c7; }
+.recovery-unlock summary { cursor: pointer; color: #6f4a32; font-weight: 750; }
+.recovery-unlock .field { margin: 14px 0; }
+
 .message-bubble.assistant { margin-right: auto; margin-left: 0; border-radius: 15px 15px 15px 4px; background: #f3f6f2; }
 .composer-modes { display: flex; gap: 5px; }
 .composer-modes button { padding: 5px 9px; font-size: 10px; }
@@ -241,12 +261,14 @@ fieldset .inline-create { padding: 13px 0 0; }
 
 @media (max-width: 1050px) {
   .app-shell { grid-template-columns: 190px minmax(0, 1fr); }
-  .events-layout, .chat-layout, .vault-grid, .backfill-layout, .phase-three-grid { grid-template-columns: 1fr; height: auto; }
+  .events-layout, .chat-layout, .vault-grid, .backfill-layout, .phase-three-grid, .phase-five-grid { grid-template-columns: 1fr; height: auto; }
   .event-list-panel { position: static; max-height: 520px; }
   .conversation-panel, .people-index, .review-controls { position: static; max-height: 500px; }
   .chat-main { min-height: 600px; }
   .settings-grid { grid-template-columns: 1fr; }
   .agent-settings-card { grid-column: auto; }
+  .phase-five-index { position: static; max-height: 520px; }
+  .security-card { grid-column: auto; }
 }
 
 @media (max-width: 720px) {
@@ -255,7 +277,7 @@ fieldset .inline-create { padding: 13px 0 0; }
   .app-sidebar nav { grid-template-columns: repeat(3, 1fr); }
   .workspace-card { display: none; }
   .workspace-view { padding: 12px; }
-  .form-row, .date-filter, .settings-grid, .candidate-actions, .search-toolbar { grid-template-columns: 1fr; }
+  .form-row, .date-filter, .settings-grid, .candidate-actions, .search-toolbar, .evidence-metadata, .compact-form { grid-template-columns: 1fr; }
   .asset-row { grid-template-columns: 1fr; }
   .agent-analysis { grid-template-columns: 1fr; }
 }
