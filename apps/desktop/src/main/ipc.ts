@@ -8,7 +8,9 @@ import type {
   CreateCaseInput, CreateRelationInput, PersonAliasInput, PersonMergeInput, ReviewGenerateInput,
   SendMessageInput, StartBackfillInput, UpdateCaseInput, UpdateEventInput
 } from "@grudge-vault/shared";
-import { AppError, toSerializedError, type IpcResult } from "@grudge-vault/shared";
+import { AppError, toSerializedError, type IpcResult, type LocalProcessorPathKind } from "@grudge-vault/shared";
+import type { LocalMediaPipeline } from "@grudge-vault/media-pipeline";
+import type { ImportFolderMonitor } from "./import-folder-monitor";
 
 const emptySchema = z.undefined();
 const titleSchema = z.string().trim().min(1).max(120);
@@ -87,7 +89,7 @@ const timelineSchema = z.object({
   from: z.iso.date().optional(), to: z.iso.date().optional(), includeArchived: z.boolean().optional()
 }).refine((value) => !value.from || !value.to || value.from <= value.to, { message: "Invalid date range." });
 const unifiedSearchSchema = z.object({
-  text: z.string().trim().max(500), kinds: z.array(z.enum(["event", "journal_entry", "transcript"])).max(3).optional(),
+  text: z.string().trim().max(500), kinds: z.array(z.enum(["event", "journal_entry", "ocr", "transcript"])).max(4).optional(),
   personId: idSchema.optional(), status: z.enum(["candidate", "confirmed", "archived"]).optional(),
   from: z.iso.date().optional(), to: z.iso.date().optional(), semantic: z.boolean().optional(),
   limit: z.number().int().min(1).max(100).optional()
@@ -99,8 +101,8 @@ const agentEndpointSchema = z.object({
   apiKey: z.string().trim().min(1).max(10_000).optional(), clearCredential: z.boolean().optional()
 });
 const agentCategoriesSchema = z.array(z.enum([
-  "conversation_text", "event_fields", "source_excerpt", "asset_metadata", "transcript_excerpt"
-])).max(5);
+  "conversation_text", "event_fields", "source_excerpt", "asset_metadata", "ocr_excerpt", "transcript_excerpt"
+])).max(6);
 const agentSettingsSchema = z.object({
   mode: z.enum(["private", "enhanced"]), privateEndpoint: agentEndpointSchema.optional(),
   enhancedEndpoint: agentEndpointSchema.optional(), consentedDataCategories: agentCategoriesSchema.optional()
@@ -109,6 +111,14 @@ const securitySettingsSchema = z.object({
   autoLockMinutes: z.union([z.literal(0), z.literal(5), z.literal(15), z.literal(30), z.literal(60)]),
   integrityScanIntervalDays: z.number().int().min(1).max(365)
 });
+const mediaSettingsSchema = z.object({
+  autoProcessNew: z.boolean(), ocrLanguages: z.array(z.string().trim().min(1).max(80)).min(1).max(16),
+  resourceProfile: z.enum(["conservative", "balanced", "performance"]), whisperGpu: z.enum(["auto", "cpu"])
+});
+const reviewAutomationSchema = z.object({
+  monthly: z.boolean(), quarterly: z.boolean(), clarificationWeekly: z.boolean(), systemNotifications: z.boolean()
+});
+const processorPathKindSchema = z.enum(["tesseract", "poppler", "ffmpeg", "whisper", "whisper_model"]);
 const passphraseSchema = z.object({ passphrase: z.string().min(12).max(10_000) });
 const caseAmountSchema = z.object({
   id: idSchema, label: z.string().trim().min(1).max(500), currency: z.string().regex(/^[A-Z]{3}$/),
@@ -161,6 +171,8 @@ interface IpcDependencies {
   restartRunner(): void;
   lockWorkspace(): Promise<unknown>;
   getRunner(): JobRunner | undefined;
+  localMediaPipeline?: LocalMediaPipeline;
+  importFolder: ImportFolderMonitor;
 }
 
 function assertTrustedSender(event: IpcMainInvokeEvent, window: BrowserWindow): void {
@@ -320,6 +332,31 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     dependencies.getRunner()?.wake();
     return job;
   });
+  add("local-intelligence:status", emptySchema, () => dependencies.application.getLocalProcessorStatus());
+  add("local-intelligence:choose-path", processorPathKindSchema, async (kind) => {
+    if (!dependencies.localMediaPipeline) throw new AppError("LOCAL_PROCESSOR_UNAVAILABLE", "Local processor configuration is unavailable.");
+    const selection = await dialog.showOpenDialog(dependencies.window, {
+      title: kind === "whisper_model" ? "Choose a Whisper model" : `Choose ${kind} executable`, properties: ["openFile"]
+    });
+    if (selection.canceled || !selection.filePaths[0]) return null;
+    await dependencies.localMediaPipeline.setPath(kind as LocalProcessorPathKind, selection.filePaths[0]);
+    return dependencies.application.getLocalProcessorStatus();
+  });
+  add("local-intelligence:update-settings", mediaSettingsSchema, (settings) =>
+    dependencies.application.updateMediaProcessingSettings(settings));
+  add("local-intelligence:probe", emptySchema, () => dependencies.application.probeLocalProcessors());
+  add("local-intelligence:process-asset", idSchema, async (assetId) => {
+    const job = await dependencies.application.enqueueMediaProcessing(assetId);
+    dependencies.getRunner()?.wake();
+    return job;
+  });
+  add("local-intelligence:process-historical", emptySchema, async () => {
+    const jobs = await dependencies.application.enqueueHistoricalMediaProcessing();
+    dependencies.getRunner()?.wake();
+    return jobs;
+  });
+  add("local-intelligence:get-artifact", idSchema, (artifactId) =>
+    dependencies.application.getDerivedArtifactDetail(artifactId));
   add("reviews:list", emptySchema, () => dependencies.application.listReviews());
   add("reviews:get", idSchema, (id) => dependencies.application.getReview(id));
   add("reviews:generate", reviewSchema, (input) => dependencies.application.generateReview(input as ReviewGenerateInput));
@@ -424,6 +461,22 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   });
   add("imports:list", emptySchema, () => dependencies.application.listImportRuns());
   add("imports:get", idSchema, (id) => dependencies.application.getImportRun(id));
+  add("import-folder:status", emptySchema, () => dependencies.importFolder.status());
+  add("import-folder:choose", emptySchema, async () => {
+    const selection = await dialog.showOpenDialog(dependencies.window, {
+      title: "Choose a Day One import folder", properties: ["openDirectory"]
+    });
+    if (selection.canceled || !selection.filePaths[0]) return null;
+    return dependencies.importFolder.choose(selection.filePaths[0]);
+  });
+  add("import-folder:set-enabled", z.boolean(), (enabled) => dependencies.importFolder.setEnabled(enabled));
+  add("import-folder:scan", emptySchema, () => dependencies.importFolder.scanNow());
+  add("reminders:list", emptySchema, () => dependencies.application.listReminders());
+  add("reminders:settings", emptySchema, () => dependencies.application.getReviewAutomationSettings());
+  add("reminders:update-settings", reviewAutomationSchema, (settings) =>
+    dependencies.application.updateReviewAutomationSettings(settings));
+  add("reminders:read", idSchema, (id) => dependencies.application.markReminderRead(id));
+  add("reminders:dismiss", idSchema, (id) => dependencies.application.dismissReminder(id));
 
   add("backfill:list", emptySchema, () => dependencies.application.listBackfillRuns());
   add("backfill:start", startBackfillSchema, (input) => {
@@ -477,6 +530,11 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     const job = dependencies.application.retryJob(jobId);
     dependencies.getRunner()?.wake();
     return job;
+  });
+  add("jobs:cancel", idSchema, (jobId) => {
+    const runner = dependencies.getRunner();
+    if (!runner) throw new AppError("JOB_STATE_CONFLICT", "The workspace job runner is not active.");
+    return runner.cancel(jobId);
   });
 
   return () => {

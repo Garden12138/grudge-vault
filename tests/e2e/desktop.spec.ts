@@ -1,28 +1,42 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { _electron as electron, expect, test } from "@playwright/test";
 
-test("completes the Phase 5 memory, Evidence, Case Binder, security, and Agent loop", async () => {
+test("completes the Phase 6 import, media, memory, Evidence, Case Binder, security, and Agent loop", async () => {
   const root = await mkdtemp(join(tmpdir(), "grudge-vault-e2e-"));
   const workspace = join(root, "workspace");
   const userData = join(root, "user-data");
   const fixture = resolve("fixtures/assets/phase-zero-demo.txt");
   const dayOneFixture = resolve("fixtures/dayone/synthetic-minimal.zip");
+  const mediaFixture = join(root, "phase-six-demo.png");
+  const importFolder = join(root, "dayone-import-folder");
+  const current = new Date();
+  const reviewMonthStart = new Date(current.getFullYear(), current.getMonth() - 1, 1);
+  const reviewMonthEnd = new Date(current.getFullYear(), current.getMonth(), 0);
+  const localDate = (value: Date) => `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
+  const automaticReviewDate = localDate(new Date(reviewMonthStart.getFullYear(), reviewMonthStart.getMonth(), 15));
+  const automaticReviewRange = `${localDate(reviewMonthStart)} — ${localDate(reviewMonthEnd)}`;
+  await mkdir(importFolder);
+  await copyFile(dayOneFixture, join(importFolder, "incremental-dayone.zip"));
+  await writeFile(mediaFixture, Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"
+  ));
   const expectedHash = createHash("sha256").update(await readFile(fixture)).digest("hex");
   const entry = resolve("apps/desktop/out-e2e/main/main.js");
   const inheritedEnvironment = Object.fromEntries(
     Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined)
   );
 
-  const launch = () => electron.launch({
+  const launch = (disableScheduler = false) => electron.launch({
     args: [entry, `--user-data-dir=${userData}`],
-    env: { ...inheritedEnvironment, GRUDGE_VAULT_E2E_WORKSPACE: workspace }
+    env: { ...inheritedEnvironment, GRUDGE_VAULT_E2E_WORKSPACE: workspace,
+      ...(disableScheduler ? { GRUDGE_VAULT_E2E_DISABLE_SCHEDULER: "1" } : {}) }
   });
 
   try {
-    let application = await launch();
+    let application = await launch(true);
     let page = await application.firstWindow();
     await page.evaluate(() => window.localStorage.setItem("grudge-vault.language", "en"));
     await page.reload();
@@ -32,11 +46,55 @@ test("completes the Phase 5 memory, Evidence, Case Binder, security, and Agent l
     await page.locator("#asset-file-input").setInputFiles(fixture);
     await expect(page.getByText(expectedHash)).toBeVisible();
     await expect(page.getByText("verified", { exact: true }).first()).toBeVisible();
+    await page.locator("#asset-file-input").setInputFiles(mediaFixture);
+    await expect(page.getByText("phase-six-demo.png", { exact: true })).toBeVisible();
+    await page.getByRole("navigation").getByRole("button", { name: "Search", exact: true }).click();
+    await page.getByLabel("Unified search").fill("E2E OCR attribution");
+    await page.locator(".phase-three-panel").getByRole("button", { name: "Search", exact: true }).click();
+    const ocrHit = page.locator(".memory-results article").filter({ hasText: "OCR" }).first();
+    await expect(ocrHit).toContainText("E2E OCR attribution evidence", { timeout: 15_000 });
+    await ocrHit.getByRole("button", { name: "Open source", exact: true }).click();
+    await expect(page.locator(".source-modal")).toContainText("E2E OCR attribution evidence");
+    await page.locator(".source-modal").getByRole("button", { name: "×", exact: true }).click();
 
     await page.getByRole("button", { name: "Chat", exact: true }).click();
     await page.getByLabel("Conversation title").fill("Work notes");
     await page.getByLabel("Conversation title").press("Enter");
     await expect(page.getByText("Work notes", { exact: true })).toBeVisible();
+
+    await page.getByLabel("Describe what just happened…").fill(`On ${automaticReviewDate} I saved an automatic review seed.`);
+    await page.getByRole("button", { name: "Quick record", exact: true }).click();
+    await page.getByRole("button", { name: "Save record" }).click();
+    await page.getByRole("button", { name: "Open event" }).click();
+    await page.getByRole("button", { name: "Confirm event" }).click();
+    await page.getByRole("button", { name: "Chat", exact: true }).click();
+    await page.getByText("Work notes", { exact: true }).click();
+    await page.getByLabel("Describe what just happened…").fill("The unresolved attribution issue still needs a date.");
+    await page.getByRole("button", { name: "Quick record", exact: true }).click();
+    await page.getByRole("button", { name: "Save record" }).click();
+    await page.getByRole("button", { name: "Open event" }).click();
+    await page.getByRole("button", { name: "Confirm event" }).click();
+    await page.getByRole("button", { name: "Review", exact: true }).click();
+    const priority = page.locator(".review-controls select[aria-label='Priority']").first();
+    await expect(priority).toBeVisible();
+    await priority.selectOption("important");
+    await expect(priority).toHaveValue("important");
+
+    await application.close();
+    application = await launch();
+    page = await application.firstWindow();
+    await expect(page.getByText("Automated Vault", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Review", exact: true }).click();
+    const monthlyReminder = page.locator(".review-controls .mini-list article").filter({ hasText: "monthly_review" }).first();
+    await expect(monthlyReminder).toBeVisible({ timeout: 15_000 });
+    await monthlyReminder.getByRole("button", { name: "Open", exact: true }).click();
+    await expect(page.locator(".phase-three-panel").getByRole("heading", { name: automaticReviewRange, exact: true })).toBeVisible();
+    const clarificationReminder = page.locator(".review-controls .mini-list article").filter({ hasText: "clarification_digest" }).first();
+    await expect(clarificationReminder).toBeVisible();
+    await clarificationReminder.getByRole("button", { name: "Open", exact: true }).click();
+
+    await page.getByRole("button", { name: "Chat", exact: true }).click();
+    await page.getByText("Work notes", { exact: true }).click();
     await page.getByLabel("Describe what just happened…").fill("On 2026-08-20 Alex omitted my name from the report.");
     await page.getByRole("button", { name: "Quick record", exact: true }).click();
     await page.getByRole("button", { name: "Save record" }).click();
@@ -65,9 +123,9 @@ test("completes the Phase 5 memory, Evidence, Case Binder, security, and Agent l
         configurable: true,
         value: async () => ({ canceled: false, filePaths: [filePath] })
       });
-    }, dayOneFixture);
+    }, importFolder);
     await page.getByRole("button", { name: "Backfill", exact: true }).click();
-    await page.getByRole("button", { name: "Choose JSON ZIP", exact: true }).click();
+    await page.getByRole("button", { name: "Choose folder", exact: true }).click();
     const latestImport = page.locator(".import-panel .run-list article").first();
     await expect(latestImport.locator(".status")).toHaveText("succeeded", { timeout: 15_000 });
     await expect(latestImport).toContainText("+1");
@@ -167,6 +225,11 @@ test("completes the Phase 5 memory, Evidence, Case Binder, security, and Agent l
     }
 
     await page.getByRole("button", { name: "Backfill", exact: true }).click();
+    await application.evaluate(({ dialog }, filePath) => {
+      Object.defineProperty(dialog, "showOpenDialog", {
+        configurable: true, value: async () => ({ canceled: false, filePaths: [filePath] })
+      });
+    }, dayOneFixture);
     await page.getByRole("button", { name: "Choose JSON ZIP", exact: true }).click();
     await expect(page.locator(".import-panel .run-list article")).toHaveCount(2);
     const repeatedImport = page.locator(".import-panel .run-list article").first();
@@ -204,16 +267,17 @@ test("completes the Phase 5 memory, Evidence, Case Binder, security, and Agent l
     await page.getByRole("button", { name: "Save Agent settings", exact: true }).click();
     await page.getByRole("button", { name: "Chat", exact: true }).click();
     await page.getByRole("button", { name: "Agent", exact: true }).click();
-    await page.getByLabel("Describe what just happened…").fill("E2E_ENHANCED_TOOL: What should I do about attribution risk?");
+    await page.getByLabel("Describe what just happened…").fill("attribution");
     await page.getByRole("button", { name: "Ask Agent", exact: true }).click();
     const consent = page.locator(".consent-modal");
     await expect(consent).toContainText("conversation_text");
     await expect(consent).toContainText("event_fields");
+    await expect(consent).toContainText("ocr_excerpt");
     await consent.getByRole("button", { name: "Allow and continue", exact: true }).click();
     await expect(page.getByText("Injected Enhanced answer with locally grounded citations.", { exact: true })).toBeVisible();
     const enhancedTurn = page.locator(".agent-turn").last();
-    await enhancedTurn.getByRole("button", { name: "Work notes", exact: true }).first().click();
-    await expect(page.locator(".source-modal")).toContainText("On 2026-08-20 Alex omitted my name from the report.");
+    await enhancedTurn.getByRole("button", { name: "phase-six-demo.png · OCR", exact: true }).click();
+    await expect(page.locator(".source-modal")).toContainText("E2E OCR attribution evidence");
     await page.locator(".source-modal").getByRole("button", { name: "×", exact: true }).click();
 
     await page.getByRole("button", { name: "Settings", exact: true }).click();

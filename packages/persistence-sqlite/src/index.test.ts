@@ -5,7 +5,8 @@ import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import type { AgentRun, Event, EventRevision, Source, SourceItem } from "@grudge-vault/domain";
 import {
-  DEFAULT_MIGRATIONS, SqliteAgentRepository, SqliteJobRepository, SqliteMemoryRepository, openDatabase, runMigrations
+  DEFAULT_MIGRATIONS, SqliteAgentRepository, SqliteAssetRepository, SqliteJobRepository, SqliteMemoryRepository,
+  SqlitePhaseSixRepository, openDatabase, runMigrations
 } from "./index";
 
 function sampleEvent(overrides: Partial<Event> = {}): Event {
@@ -38,7 +39,7 @@ describe("SQLite foundation", () => {
       runMigrations(database);
       expect(database.pragma("journal_mode", { simple: true })).toBe("wal");
       expect(database.pragma("foreign_keys", { simple: true })).toBe(1);
-      expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 6 });
+      expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 7 });
       expect(database.prepare("SELECT count(*) AS count FROM pragma_module_list WHERE name = 'fts5'").get()).toEqual({ count: 1 });
       database.close();
     } finally {
@@ -59,7 +60,7 @@ describe("SQLite foundation", () => {
     runMigrations(database, [DEFAULT_MIGRATIONS[0]!]);
     expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 1 });
     runMigrations(database);
-    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 6 });
+    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 7 });
     expect(database.prepare("SELECT name FROM sqlite_master WHERE name = 'events'").get()).toEqual({ name: "events" });
     database.close();
   });
@@ -115,7 +116,59 @@ describe("SQLite foundation", () => {
       "agent_actions", "agent_credentials", "agent_model_calls", "agent_model_settings",
       "agent_runs", "agent_tool_calls", "external_context_disclosures"
     ]);
-    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 6 });
+    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 7 });
+    database.close();
+  });
+
+  it("upgrades a Phase 5 database with Phase 6 derived projections, import dedupe, automation, and reminders", () => {
+    const database = new Database(":memory:");
+    runMigrations(database, DEFAULT_MIGRATIONS.slice(0, 6));
+    runMigrations(database);
+    const tables = database.prepare(`
+      SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (
+        'current_derived_artifacts', 'import_folder_entries', 'automation_runs', 'reminders'
+      ) ORDER BY name
+    `).all() as Array<{ name: string }>;
+    expect(tables.map(({ name }) => name)).toEqual([
+      "automation_runs", "current_derived_artifacts", "import_folder_entries", "reminders"
+    ]);
+    const columns = database.prepare("PRAGMA table_info(source_search_documents)").all() as Array<{ name: string }>;
+    expect(columns.map(({ name }) => name)).toEqual(expect.arrayContaining(["derived_artifact_id", "source_asset_id"]));
+    database.close();
+  });
+
+  it("retains derived history while searching only the current artifact and deduplicates reminders", () => {
+    const database = new Database(":memory:");
+    database.pragma("foreign_keys = ON");
+    runMigrations(database);
+    const memory = new SqliteMemoryRepository(database);
+    const assets = new SqliteAssetRepository(database);
+    const phase6 = new SqlitePhaseSixRepository(database, memory);
+    const now = "2026-08-25T00:00:00.000Z";
+    assets.upsert({ id: "asset-ocr", sha256: "a".repeat(64), byteSize: 1, mimeType: "image/png", originalFileName: "note.png",
+      vaultFormat: 2, integrityStatus: "verified", availabilityStatus: "available", createdAt: now });
+    const activate = (id: string, inputHash: string, text: string) => phase6.activateDerivedArtifact({
+      id, sourceAssetId: "asset-ocr", kind: "ocr", sha256: inputHash, byteSize: text.length,
+      mimeType: "application/vnd.grudge-vault.media+json", processorIdentity: "fake-ocr", processorVersion: 1,
+      configHash: inputHash, inputHash, current: false, createdAt: now
+    }, { kind: "ocr", id: "derived:asset-ocr:ocr", title: "note.png · OCR", content: text,
+      contentHash: inputHash, derivedArtifactId: id, sourceAssetId: "asset-ocr", sourceRefs: [] }, now);
+    activate("artifact-1", "1".repeat(64), "first version phrase");
+    activate("artifact-2", "2".repeat(64), "second current phrase");
+    expect(phase6.getDerivedArtifact("artifact-1")?.current).toBe(false);
+    expect(phase6.getCurrentDerivedArtifact("asset-ocr", "ocr")?.id).toBe("artifact-2");
+    expect(memory.searchUnifiedKeyword({ text: "second current phrase" })[0]).toMatchObject({
+      kind: "ocr", derivedArtifactId: "artifact-2", sourceAssetId: "asset-ocr"
+    });
+    expect(memory.searchUnifiedKeyword({ text: "first version phrase" })).toHaveLength(0);
+
+    const reminder = { id: "reminder-1", kind: "monthly_review" as const, scheduleKey: "review:month:2026-07",
+      status: "unread" as const, dueAt: now, reviewId: "review-1", clarificationIds: [], createdAt: now, updatedAt: now };
+    phase6.saveAutomationRun({ scheduleKey: reminder.scheduleKey, kind: reminder.kind, reviewId: reminder.reviewId, createdAt: now });
+    phase6.saveReminder(reminder);
+    phase6.saveReminder({ ...reminder, id: "reminder-2" });
+    expect(phase6.listReminders()).toHaveLength(1);
+    expect(phase6.updateReminderStatus("reminder-1", "read", now).status).toBe("read");
     database.close();
   });
 
@@ -263,6 +316,35 @@ describe("SQLite foundation", () => {
     expect(retried.attempts).toBe(1);
     expect(retried.maxAttempts).toBe(4);
     expect(jobs.claimNext("2026-01-01T00:00:02.000Z", "2026-01-01T00:00:32.000Z")?.attempts).toBe(2);
+    database.close();
+  });
+
+  it("persists queued and running job cancellation and abandons the active attempt", () => {
+    const database = new Database(":memory:");
+    runMigrations(database);
+    const jobs = new SqliteJobRepository(database);
+    const queued = jobs.enqueue("media.process", { assetId: "asset-1" }, "2026-01-01T00:00:00.000Z");
+    expect(jobs.cancel(queued.id, "2026-01-01T00:00:01.000Z").state).toBe("cancelled");
+    const running = jobs.enqueue("media.process", { assetId: "asset-2" }, "2026-01-01T00:00:02.000Z");
+    jobs.claimNext("2026-01-01T00:00:02.000Z", "2026-01-01T00:00:32.000Z");
+    expect(jobs.cancel(running.id, "2026-01-01T00:00:03.000Z").state).toBe("cancelled");
+    expect(database.prepare("SELECT outcome FROM job_attempts WHERE job_id = ?").get(running.id)).toEqual({ outcome: "abandoned" });
+    expect(() => jobs.cancel(running.id, "2026-01-01T00:00:04.000Z")).toThrowError(/queued or running/);
+    database.close();
+  });
+
+  it("requeues an interrupted job without consuming its final processing attempt", () => {
+    const database = new Database(":memory:");
+    runMigrations(database);
+    const jobs = new SqliteJobRepository(database);
+    const queued = jobs.enqueue("media.process", { assetId: "asset-1" }, "2026-01-01T00:00:00.000Z", 1);
+    jobs.claimNext("2026-01-01T00:00:00.000Z", "2026-01-01T00:00:30.000Z");
+    expect(jobs.interrupt(queued.id, "Workspace locked", "2026-01-01T00:00:01.000Z")).toMatchObject({
+      state: "queued", attempts: 1, maxAttempts: 2
+    });
+    expect(jobs.claimNext("2026-01-01T00:00:01.000Z", "2026-01-01T00:00:31.000Z")).toMatchObject({ attempts: 2 });
+    expect(database.prepare("SELECT outcome FROM job_attempts WHERE job_id = ? AND attempt_number = 1").get(queued.id))
+      .toEqual({ outcome: "abandoned" });
     database.close();
   });
 });

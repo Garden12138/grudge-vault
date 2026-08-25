@@ -117,3 +117,22 @@ Automated Adapter tests use injected `fetch`/model doubles and never contact a r
 12. Create and restore a v2 snapshot during mixed-key migration and after Binder audit creation. Confirm all Phase 5 database state and encrypted objects survive, while `.gvrecovery` remains outside the snapshot.
 
 Release sign-off uses Node 24 and pnpm 11.23 for `lint`, `typecheck`, unit/integration tests, the Phase 5 E2E path, and the production build. Native packaging remains a macOS/Windows/Linux CI responsibility.
+
+## Phase 6 acceptance path
+
+1. Upgrade representative v1 and SQLite v6 workspaces. Confirm SQLite reaches v7 while `workspace.json` and backup manifest remain v2; current and historical derived objects, Reminders, and resumable media jobs survive snapshot restore.
+2. In **Settings**, choose Tesseract, `pdftoppm`, FFmpeg, `whisper-cli`, and a Whisper model only through system dialogs. Probe required flags, versions, and Tesseract languages. Confirm no binary, language pack, or model is downloaded.
+3. Process PNG/JPEG/WebP/TIFF/PDF fixtures through injected OCR adapters. Verify TSV page order, words, confidence, boxes, language/config hashes, encrypted JSON, and searchable current OCR text.
+4. Process MP3/MP4/WAV/OGG/WebM/FLAC fixtures through injected ASR adapters. Verify FFmpeg requests 16 kHz mono 16-bit WAV, Whisper uses one processor and bounded CPU threads, and JSON timestamps remain ordered.
+5. Repeat an identical task and confirm input-hash reuse. Change language/resource/model settings and confirm a new immutable version becomes current only after success; force failure and verify the former search projection remains current.
+6. Cancel queued and running OCR/ASR tasks, lock during processing, and force timeout, oversized stdout/JSON, and temporary-space exhaustion. Confirm the child terminates, the job persists as `cancelled` or is requeued on lock, and plaintext temp files are removed.
+7. Import a new supported attachment after a healthy engine is configured and confirm automatic queueing. Use the displayed count and explicit confirmation before processing historical attachments.
+8. In **Backfill**, choose an external folder and enable it. Confirm immediate scanning and later filesystem-event plus five-minute reconciliation process only stable top-level regular `.zip` files.
+9. Verify archive SHA-256 behavior for duplicate content, rename, and same-name content change. A bad ZIP records one failed run and waits for manual retry. Remove the directory, lock/unlock, and confirm watcher status recovers without exposing the external path to SQLite, backup, job payload, or logs.
+10. Freeze the clock across month, quarter, ISO-week, year, and timezone boundaries. Confirm only the latest completed month/quarter are considered on first upgraded startup and stable schedule keys prevent duplicate Review or Reminder rows.
+11. With no important or rights-related open Clarification, confirm no weekly Reminder is created. Add eligible Clarifications and verify one aggregate application Reminder opens Review/Inbox.
+12. Enable system notifications explicitly. Confirm notification text contains no workspace, body, person, or amount; unsupported/refused notification environments leave the in-app Reminder authoritative.
+13. Search OCR/Transcript text and open its encrypted derived preview. Ask the Agent to retrieve it and verify schema v3 returns source kind and derived reference; Enhanced must request consent again for the `ocr_excerpt` category.
+14. Run the injected-adapter E2E path: Incremental Day One import → media derivation → OCR/Transcript search → Agent citation → automatic Review → Reminder navigation.
+
+Release sign-off uses Node 24.10+ and pnpm 11.23 for `lint`, `typecheck`, all unit/integration/E2E tests, the production build, and macOS/Windows/Linux packaging. Validation under Node 25 or pnpm 7 is informative only.

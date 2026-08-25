@@ -376,7 +376,7 @@ export interface TimelineResult {
   total: number;
 }
 
-export type UnifiedSearchKind = "event" | "journal_entry" | "transcript";
+export type UnifiedSearchKind = "event" | "journal_entry" | "ocr" | "transcript";
 
 export interface UnifiedSearchQuery {
   text: string;
@@ -397,6 +397,8 @@ export interface UnifiedSearchHit {
   occurredAt?: string;
   eventId?: EntityId;
   sourceItemId?: EntityId;
+  derivedArtifactId?: EntityId;
+  sourceAssetId?: EntityId;
   sourceRefs: EntityId[];
   keywordScore?: number;
   semanticScore?: number;
@@ -412,12 +414,14 @@ export interface SearchDocument {
   occurredAt?: string;
   eventId?: EntityId;
   sourceItemId?: EntityId;
+  derivedArtifactId?: EntityId;
+  sourceAssetId?: EntityId;
   sourceRefs: EntityId[];
 }
 
 export interface SourceReferenceDetail {
   sourceItemId: EntityId;
-  kind: "journal_entry" | "message" | "manual" | "transcript";
+  kind: "journal_entry" | "message" | "manual" | "ocr" | "transcript";
   title: string;
   excerpt: string;
   recordedAt: IsoDateTime;
@@ -425,6 +429,7 @@ export interface SourceReferenceDetail {
   contentHash?: string;
   conversationId?: EntityId;
   messageId?: EntityId;
+  derivedArtifactId?: EntityId;
   eventIds: EntityId[];
   assetIds: EntityId[];
 }
@@ -545,11 +550,12 @@ export type AgentDataCategory =
   | "event_fields"
   | "source_excerpt"
   | "asset_metadata"
+  | "ocr_excerpt"
   | "transcript_excerpt";
 
 export interface AgentCitation {
   id: EntityId;
-  kind: "event" | "source" | "asset" | "transcript";
+  kind: "event" | "source" | "asset" | "ocr" | "transcript";
   targetId: EntityId;
   label: string;
   excerpt?: string;
@@ -728,8 +734,129 @@ export interface DerivedArtifact {
   mimeType: string;
   processorIdentity: string;
   processorVersion: number;
+  configHash: string;
   inputHash: string;
+  current: boolean;
   createdAt: IsoDateTime;
+}
+
+export type MediaProcessorKind = "ocr" | "transcript";
+export type MediaResourceProfile = "conservative" | "balanced" | "performance";
+
+export interface MediaProcessingSettings {
+  autoProcessNew: boolean;
+  ocrLanguages: string[];
+  resourceProfile: MediaResourceProfile;
+  whisperGpu: "auto" | "cpu";
+}
+
+export interface ProcessorCapability {
+  configured: boolean;
+  available: boolean;
+  identity?: string;
+  version?: string;
+  languages?: string[];
+  displayNames: string[];
+  warnings: string[];
+}
+
+export interface LocalProcessorStatus {
+  settings: MediaProcessingSettings;
+  ocr: ProcessorCapability;
+  asr: ProcessorCapability;
+  eligibleHistoricalAssets: number;
+  pendingJobs: number;
+}
+
+export interface OcrWordV1 {
+  text: string;
+  confidence?: number;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+export interface OcrPageV1 {
+  page: number;
+  text: string;
+  words: OcrWordV1[];
+}
+
+export interface OcrArtifactV1 {
+  formatVersion: 1;
+  kind: "ocr";
+  sourceAssetId: EntityId;
+  sourceSha256: string;
+  language: string;
+  processorIdentity: string;
+  processorVersion: number;
+  engineVersions: Record<string, string>;
+  configHash: string;
+  text: string;
+  pages: OcrPageV1[];
+  createdAt: IsoDateTime;
+}
+
+export interface TranscriptSegmentV1 {
+  startMs: number;
+  endMs: number;
+  text: string;
+}
+
+export interface TranscriptArtifactV1 {
+  formatVersion: 1;
+  kind: "transcript";
+  sourceAssetId: EntityId;
+  sourceSha256: string;
+  language: string;
+  processorIdentity: string;
+  processorVersion: number;
+  engineVersions: Record<string, string>;
+  modelSha256: string;
+  configHash: string;
+  text: string;
+  segments: TranscriptSegmentV1[];
+  createdAt: IsoDateTime;
+}
+
+export type MediaArtifactPayloadV1 = OcrArtifactV1 | TranscriptArtifactV1;
+
+export interface DerivedArtifactDetail {
+  artifact: DerivedArtifact;
+  payload: MediaArtifactPayloadV1;
+}
+
+export interface ImportFolderStatus {
+  configured: boolean;
+  enabled: boolean;
+  displayPath?: string;
+  watching: boolean;
+  lastScannedAt?: IsoDateTime;
+  importedCount: number;
+  failedCount: number;
+  lastError?: string;
+}
+
+export interface ReviewAutomationSettings {
+  monthly: boolean;
+  quarterly: boolean;
+  clarificationWeekly: boolean;
+  systemNotifications: boolean;
+}
+
+export type ReminderKind = "monthly_review" | "quarterly_review" | "clarification_digest";
+
+export interface Reminder {
+  id: EntityId;
+  kind: ReminderKind;
+  scheduleKey: string;
+  status: "unread" | "read" | "dismissed";
+  dueAt: IsoDateTime;
+  reviewId?: EntityId;
+  clarificationIds: EntityId[];
+  createdAt: IsoDateTime;
+  updatedAt: IsoDateTime;
 }
 
 export interface EvidenceReferenceImpact {

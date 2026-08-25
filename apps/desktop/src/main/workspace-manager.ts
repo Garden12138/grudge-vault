@@ -556,6 +556,7 @@ export class LocalWorkspaceManager implements WorkspaceManagerPort {
         memory: openedDatabase.memory,
         agents: openedDatabase.agents,
         phase5: openedDatabase.phase5,
+        phase6: openedDatabase.phase6,
         dayOne: openedDatabase.dayOne,
         vault,
         backupDatabase: (destinationPath) => openedDatabase.backup(destinationPath),

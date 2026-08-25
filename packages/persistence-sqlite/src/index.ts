@@ -16,8 +16,10 @@ import type {
 } from "@grudge-vault/domain";
 import { AppError, type CandidateMergeInput, type CandidateMergeResult } from "@grudge-vault/shared";
 import { SqlitePhaseFiveRepository } from "./phase5";
+import { SqlitePhaseSixRepository } from "./phase6";
 
 export { SqlitePhaseFiveRepository } from "./phase5";
+export { SqlitePhaseSixRepository } from "./phase6";
 
 export interface Migration {
   version: number;
@@ -802,6 +804,116 @@ export const DEFAULT_MIGRATIONS: readonly Migration[] = [
       ) STRICT;
       CREATE INDEX binder_exports_case_idx ON binder_exports(case_id, generated_at);
     `
+  },
+  {
+    version: 7,
+    name: "phase-six-local-intelligence",
+    sql: `
+      ALTER TABLE source_search_documents RENAME TO source_search_documents_phase5;
+      CREATE TABLE source_search_documents (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK(kind IN ('journal_entry', 'ocr', 'transcript')),
+        title TEXT NOT NULL,
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+        occurred_at TEXT,
+        event_id TEXT REFERENCES events(id),
+        source_item_id TEXT REFERENCES source_items(id),
+        derived_artifact_id TEXT,
+        source_asset_id TEXT REFERENCES assets(id),
+        source_refs_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      INSERT INTO source_search_documents(
+        id,kind,title,content,content_hash,occurred_at,event_id,source_item_id,
+        derived_artifact_id,source_asset_id,source_refs_json,updated_at
+      ) SELECT id,kind,title,content,content_hash,occurred_at,event_id,source_item_id,
+        NULL,NULL,source_refs_json,updated_at FROM source_search_documents_phase5;
+      DROP TABLE source_search_documents_phase5;
+      CREATE INDEX source_search_documents_source_idx ON source_search_documents(source_item_id, kind);
+      CREATE INDEX source_search_documents_artifact_idx ON source_search_documents(derived_artifact_id, kind);
+
+      ALTER TABLE embeddings RENAME TO embeddings_phase5;
+      CREATE TABLE embeddings (
+        generation_id TEXT NOT NULL REFERENCES embedding_generations(id) ON DELETE CASCADE,
+        document_kind TEXT NOT NULL CHECK(document_kind IN ('event', 'journal_entry', 'ocr', 'transcript')),
+        document_id TEXT NOT NULL,
+        content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+        vector BLOB NOT NULL,
+        PRIMARY KEY(generation_id, document_kind, document_id)
+      ) STRICT;
+      INSERT INTO embeddings SELECT * FROM embeddings_phase5;
+      DROP TABLE embeddings_phase5;
+
+      ALTER TABLE derived_artifacts RENAME TO derived_artifacts_phase5;
+      CREATE TABLE derived_artifacts (
+        id TEXT PRIMARY KEY,
+        source_asset_id TEXT NOT NULL REFERENCES assets(id),
+        kind TEXT NOT NULL CHECK(kind IN ('ocr', 'transcript', 'key_frames', 'thumbnail', 'redacted_copy', 'other')),
+        sha256 TEXT NOT NULL CHECK(length(sha256) = 64),
+        byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+        mime_type TEXT NOT NULL,
+        processor_identity TEXT NOT NULL,
+        processor_version INTEGER NOT NULL CHECK(processor_version > 0),
+        config_hash TEXT NOT NULL CHECK(length(config_hash) = 64),
+        input_hash TEXT NOT NULL CHECK(length(input_hash) = 64),
+        created_at TEXT NOT NULL,
+        UNIQUE(source_asset_id, kind, input_hash)
+      ) STRICT;
+      INSERT INTO derived_artifacts(
+        id,source_asset_id,kind,sha256,byte_size,mime_type,processor_identity,
+        processor_version,config_hash,input_hash,created_at
+      ) SELECT id,source_asset_id,kind,sha256,byte_size,mime_type,processor_identity,
+        processor_version,input_hash,input_hash,created_at FROM derived_artifacts_phase5;
+      DROP TABLE derived_artifacts_phase5;
+      CREATE INDEX derived_artifacts_source_idx ON derived_artifacts(source_asset_id, created_at);
+
+      CREATE TABLE current_derived_artifacts (
+        source_asset_id TEXT NOT NULL REFERENCES assets(id),
+        kind TEXT NOT NULL CHECK(kind IN ('ocr', 'transcript')),
+        artifact_id TEXT NOT NULL REFERENCES derived_artifacts(id),
+        activated_at TEXT NOT NULL,
+        PRIMARY KEY(source_asset_id, kind)
+      ) STRICT;
+      INSERT INTO current_derived_artifacts(source_asset_id,kind,artifact_id,activated_at)
+      SELECT source_asset_id,kind,id,created_at FROM derived_artifacts candidate
+      WHERE kind IN ('ocr','transcript') AND NOT EXISTS (
+        SELECT 1 FROM derived_artifacts newer
+        WHERE newer.source_asset_id = candidate.source_asset_id AND newer.kind = candidate.kind
+          AND (newer.created_at > candidate.created_at OR (newer.created_at = candidate.created_at AND newer.id > candidate.id))
+      );
+
+      CREATE TABLE import_folder_entries (
+        id TEXT PRIMARY KEY,
+        archive_sha256 TEXT NOT NULL UNIQUE CHECK(length(archive_sha256) = 64),
+        asset_id TEXT NOT NULL REFERENCES assets(id),
+        import_run_id TEXT NOT NULL REFERENCES import_runs(id),
+        file_name TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE automation_runs (
+        schedule_key TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK(kind IN ('monthly_review', 'quarterly_review', 'clarification_digest')),
+        review_id TEXT,
+        from_date TEXT,
+        to_date TEXT,
+        created_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE reminders (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK(kind IN ('monthly_review', 'quarterly_review', 'clarification_digest')),
+        schedule_key TEXT NOT NULL UNIQUE REFERENCES automation_runs(schedule_key),
+        status TEXT NOT NULL CHECK(status IN ('unread', 'read', 'dismissed')),
+        due_at TEXT NOT NULL,
+        review_id TEXT,
+        clarification_ids_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX reminders_status_idx ON reminders(status, due_at);
+    `
   }
 ];
 
@@ -1012,6 +1124,7 @@ export class SqliteJobRepository implements JobRepositoryPort {
   fail(id: string, error: string, now: string, retryAt?: string): Job {
     return this.database.transaction(() => {
       const current = this.getRequired(id);
+      if (current.state === "cancelled") return current;
       const willRetry = retryAt !== undefined && current.attempts < current.maxAttempts;
       this.database.prepare(`
         UPDATE jobs SET state = ?, progress = 0, available_at = ?, lease_until = NULL,
@@ -1036,6 +1149,34 @@ export class SqliteJobRepository implements JobRepositoryPort {
       WHERE id = ?
     `).run(now, now, id);
     return this.getRequired(id);
+  }
+
+  cancel(id: string, now: string): Job {
+    const current = this.getRequired(id);
+    if (current.state !== "queued" && current.state !== "running") {
+      throw new AppError("JOB_STATE_CONFLICT", "Only queued or running jobs can be cancelled.");
+    }
+    return this.database.transaction(() => {
+      this.database.prepare(`UPDATE jobs SET state='cancelled',lease_until=NULL,updated_at=? WHERE id=?`).run(now, id);
+      this.database.prepare(`UPDATE job_attempts SET finished_at=?,outcome='abandoned',error='Cancelled by user.'
+        WHERE job_id=? AND finished_at IS NULL`).run(now, id);
+      return this.getRequired(id);
+    })();
+  }
+
+  interrupt(id: string, error: string, now: string): Job {
+    const current = this.getRequired(id);
+    if (current.state === "cancelled") return current;
+    if (current.state !== "running") {
+      throw new AppError("JOB_STATE_CONFLICT", "Only a running job can be interrupted.");
+    }
+    return this.database.transaction(() => {
+      this.database.prepare(`UPDATE jobs SET state='queued',progress=0,max_attempts=max_attempts+1,
+        available_at=?,lease_until=NULL,last_error=?,updated_at=? WHERE id=?`).run(now, error, now, id);
+      this.database.prepare(`UPDATE job_attempts SET finished_at=?,outcome='abandoned',error=?
+        WHERE job_id=? AND finished_at IS NULL`).run(now, error, id);
+      return this.getRequired(id);
+    })();
   }
 
   private getRequired(id: string): Job {
@@ -1125,6 +1266,8 @@ function mapSearchDocument(row: Record<string, unknown>): SearchDocument {
   if (row.occurred_at) value.occurredAt = String(row.occurred_at);
   if (row.event_id) value.eventId = String(row.event_id);
   if (row.source_item_id) value.sourceItemId = String(row.source_item_id);
+  if (row.derived_artifact_id) value.derivedArtifactId = String(row.derived_artifact_id);
+  if (row.source_asset_id) value.sourceAssetId = String(row.source_asset_id);
   return value;
 }
 
@@ -1694,7 +1837,7 @@ export class SqliteMemoryRepository implements MemoryRepositoryPort {
         keywordScore: 1 / (index + 1), combinedScore: 1 / (index + 1)
       };
     }) : [];
-    const sourceKinds = (query.kinds ?? ["journal_entry", "transcript"]).filter((kind) => kind !== "event");
+    const sourceKinds = (query.kinds ?? ["journal_entry", "ocr", "transcript"]).filter((kind) => kind !== "event");
     if (!sourceKinds.length) return eventHits.slice(0, limit);
     const conditions = [`d.kind IN (${sourceKinds.map(() => "?").join(",")})`];
     const parameters: unknown[] = [...sourceKinds];
@@ -1703,19 +1846,25 @@ export class SqliteMemoryRepository implements MemoryRepositoryPort {
     if (query.from) { conditions.push("d.occurred_at IS NOT NULL AND d.occurred_at >= ?"); parameters.push(query.from); }
     if (query.to) { conditions.push("d.occurred_at IS NOT NULL AND d.occurred_at <= ?"); parameters.push(query.to); }
     if (query.status) {
-      conditions.push(`EXISTS (
+      conditions.push(`(EXISTS (
         SELECT 1 FROM event_sources es JOIN events linked ON linked.id = es.event_id
         WHERE es.source_item_id = d.source_item_id AND linked.status = ?
-      )`);
-      parameters.push(query.status);
+      ) OR EXISTS (
+        SELECT 1 FROM event_assets ea JOIN events linked ON linked.id = ea.event_id
+        WHERE ea.asset_id = d.source_asset_id AND linked.status = ?
+      ))`);
+      parameters.push(query.status, query.status);
     }
     if (query.personId) {
       const personIds = this.listIdentityPersonIds(query.personId);
-      conditions.push(`EXISTS (
+      conditions.push(`(EXISTS (
         SELECT 1 FROM event_sources es JOIN event_people ep ON ep.event_id = es.event_id
         WHERE es.source_item_id = d.source_item_id AND ep.person_id IN (${personIds.map(() => "?").join(",")})
-      )`);
-      parameters.push(...personIds);
+      ) OR EXISTS (
+        SELECT 1 FROM event_assets ea JOIN event_people ep ON ep.event_id = ea.event_id
+        WHERE ea.asset_id = d.source_asset_id AND ep.person_id IN (${personIds.map(() => "?").join(",")})
+      ))`);
+      parameters.push(...personIds, ...personIds);
     }
     parameters.push(limit);
     const rows = this.database.prepare(`
@@ -1731,6 +1880,8 @@ export class SqliteMemoryRepository implements MemoryRepositoryPort {
         ...(document.occurredAt ? { occurredAt: document.occurredAt } : {}),
         ...(document.eventId ? { eventId: document.eventId } : {}),
         ...(document.sourceItemId ? { sourceItemId: document.sourceItemId } : {}),
+        ...(document.derivedArtifactId ? { derivedArtifactId: document.derivedArtifactId } : {}),
+        ...(document.sourceAssetId ? { sourceAssetId: document.sourceAssetId } : {}),
         sourceRefs: document.sourceRefs, keywordScore: 1 / (index + 1), combinedScore: 1 / (index + 1)
       };
     });
@@ -1758,13 +1909,17 @@ export class SqliteMemoryRepository implements MemoryRepositoryPort {
     this.database.transaction(() => {
       this.database.prepare(`
         INSERT INTO source_search_documents(
-          id, kind, title, content, content_hash, occurred_at, event_id, source_item_id, source_refs_json, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          id, kind, title, content, content_hash, occurred_at, event_id, source_item_id,
+          derived_artifact_id, source_asset_id, source_refs_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, title = excluded.title, content = excluded.content,
           content_hash = excluded.content_hash, occurred_at = excluded.occurred_at, event_id = excluded.event_id,
-          source_item_id = excluded.source_item_id, source_refs_json = excluded.source_refs_json, updated_at = excluded.updated_at
+          source_item_id = excluded.source_item_id, derived_artifact_id = excluded.derived_artifact_id,
+          source_asset_id = excluded.source_asset_id, source_refs_json = excluded.source_refs_json,
+          updated_at = excluded.updated_at
       `).run(document.id, document.kind, document.title, document.content, document.contentHash,
         document.occurredAt ?? null, document.eventId ?? null, document.sourceItemId ?? null,
+        document.derivedArtifactId ?? null, document.sourceAssetId ?? null,
         JSON.stringify(document.sourceRefs), now);
       this.database.prepare("DELETE FROM fts_sources WHERE document_id = ?").run(document.id);
       this.database.prepare("INSERT INTO fts_sources(document_id, title, content) VALUES (?, ?, ?)")
@@ -1785,15 +1940,16 @@ export class SqliteMemoryRepository implements MemoryRepositoryPort {
       WHERE si.id = ?
     `).get(id) as Record<string, unknown> | undefined;
     if (!row) {
-      const transcript = this.database.prepare(
-        "SELECT * FROM source_search_documents WHERE id = ? AND kind = 'transcript'"
-      ).get(id) as Record<string, unknown> | undefined;
-      if (!transcript) return undefined;
-      const document = mapSearchDocument(transcript);
+      const derived = this.database.prepare(
+        "SELECT * FROM source_search_documents WHERE (id = ? OR derived_artifact_id = ?) AND kind IN ('ocr','transcript')"
+      ).get(id, id) as Record<string, unknown> | undefined;
+      if (!derived) return undefined;
+      const document = mapSearchDocument(derived);
       return {
-        sourceItemId: document.sourceItemId ?? document.id, kind: "transcript", title: document.title,
-        excerpt: document.content.slice(0, 4000), recordedAt: document.occurredAt ?? String(transcript.updated_at),
-        eventIds: document.eventId ? [document.eventId] : [], assetIds: []
+        sourceItemId: document.sourceItemId ?? document.id, kind: document.kind as "ocr" | "transcript", title: document.title,
+        excerpt: document.content.slice(0, 4000), recordedAt: document.occurredAt ?? String(derived.updated_at),
+        ...(document.derivedArtifactId ? { derivedArtifactId: document.derivedArtifactId } : {}),
+        eventIds: document.eventId ? [document.eventId] : [], assetIds: document.sourceAssetId ? [document.sourceAssetId] : []
       };
     }
     const eventIds = (this.database.prepare("SELECT event_id FROM event_sources WHERE source_item_id = ? ORDER BY event_id")
@@ -2589,6 +2745,7 @@ export class SqliteWorkspaceDatabase {
   readonly dayOne: SqliteDayOneRepository;
   readonly agents: SqliteAgentRepository;
   readonly phase5: SqlitePhaseFiveRepository;
+  readonly phase6: SqlitePhaseSixRepository;
 
   constructor(readonly database: Database.Database) {
     this.assets = new SqliteAssetRepository(database);
@@ -2597,6 +2754,7 @@ export class SqliteWorkspaceDatabase {
     this.dayOne = new SqliteDayOneRepository(database, this.memory);
     this.agents = new SqliteAgentRepository(database);
     this.phase5 = new SqlitePhaseFiveRepository(database, this.memory);
+    this.phase6 = new SqlitePhaseSixRepository(database, this.memory);
   }
 
   ensureWorkspace(workspace: Workspace): void {

@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type {
   AgentAction, AgentModelSettings, AgentRun, Asset, BackfillRun, CandidateDetail, CandidateSummary, Conversation, Event, EventDetail,
-  EmbeddingIndexStatus, EventRelation, EventRevision, ImportRun, ImportRunDetail, Job, Message, Person,
-  PersonIdentityDetail, PersonMergeSuggestion, ReviewRun, SourceReferenceDetail, StatementKind,
+  EmbeddingIndexStatus, EventRelation, EventRevision, ImportFolderStatus, ImportRun, ImportRunDetail, Job, LocalProcessorStatus,
+  MediaProcessingSettings, Message, Person, PersonIdentityDetail, PersonMergeSuggestion, Reminder, ReviewAutomationSettings,
+  ReviewRun, SourceReferenceDetail, StatementKind,
   TemporalValue, TimelineResult, UnifiedSearchHit, Workspace, WorkspaceLockState
 } from "@grudge-vault/domain";
 import type { EventWriteFields, IpcResult } from "@grudge-vault/shared";
@@ -217,6 +218,10 @@ export function App() {
   const [reviewTo, setReviewTo] = useState(today);
   const [globalClarifications, setGlobalClarifications] = useState<import("@grudge-vault/domain").Clarification[]>([]);
   const [sourceDetail, setSourceDetail] = useState<SourceReferenceDetail>();
+  const [processorStatus, setProcessorStatus] = useState<LocalProcessorStatus>();
+  const [importFolderStatus, setImportFolderStatus] = useState<ImportFolderStatus>();
+  const [reminders, setReminders] = useState<Reminder[]>([]);
+  const [reviewAutomation, setReviewAutomation] = useState<ReviewAutomationSettings>();
   const agentRunByAssistantMessage = useMemo(() => new Map(
     agentRuns.filter(({ assistantMessageId }) => Boolean(assistantMessageId)).map((run) => [run.assistantMessageId!, run])
   ), [agentRuns]);
@@ -235,12 +240,15 @@ export function App() {
 
   const refreshLists = useCallback(async () => {
     const [conversationResult, eventResult, peopleResult, assetResult, jobResult, importResult, backfillResult, candidateResult,
-      embeddingResult, reviewResult, clarificationResult, identityResult, agentSettingsResult] = await Promise.all([
+      embeddingResult, reviewResult, clarificationResult, identityResult, agentSettingsResult, processorResult,
+      importFolderResult, reminderResult, reviewAutomationResult] = await Promise.all([
       window.grudgeVault.conversations.list(), window.grudgeVault.events.search({}),
       window.grudgeVault.people.list(), window.grudgeVault.assets.list(), window.grudgeVault.jobs.list(),
       window.grudgeVault.imports.list(), window.grudgeVault.backfill.list(), window.grudgeVault.candidates.list(),
       window.grudgeVault.search.getEmbeddingStatus(), window.grudgeVault.reviews.list(), window.grudgeVault.clarifications.list(),
-      window.grudgeVault.people.listIdentities(), window.grudgeVault.agent.getSettings()
+      window.grudgeVault.people.listIdentities(), window.grudgeVault.agent.getSettings(),
+      window.grudgeVault.localIntelligence.status(), window.grudgeVault.importFolder.status(),
+      window.grudgeVault.reminders.list(), window.grudgeVault.reminders.getSettings()
     ]);
     if (conversationResult.ok) {
       setConversations(conversationResult.data);
@@ -275,6 +283,10 @@ export function App() {
       setAgentEnhancedBaseUrl(settings.enhancedEndpoint?.baseUrl ?? "https://api.openai.com/v1");
       setAgentEnhancedModel(settings.enhancedEndpoint?.model ?? "");
     } else setError(agentSettingsResult.error.message);
+    if (processorResult.ok) setProcessorStatus(processorResult.data); else setError(processorResult.error.message);
+    if (importFolderResult.ok) setImportFolderStatus(importFolderResult.data); else setError(importFolderResult.error.message);
+    if (reminderResult.ok) setReminders(reminderResult.data); else setError(reminderResult.error.message);
+    if (reviewAutomationResult.ok) setReviewAutomation(reviewAutomationResult.data); else setError(reviewAutomationResult.error.message);
   }, []);
 
   const refresh = useCallback(async () => {
@@ -295,6 +307,19 @@ export function App() {
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => { document.documentElement.lang = language; }, [language]);
   useEffect(() => window.grudgeVault.jobs.onChanged(() => void refreshLists()), [refreshLists]);
+  useEffect(() => window.grudgeVault.reminders.onDue((reminderId, shouldOpen) => {
+    void refreshLists();
+    if (!shouldOpen) return;
+    setView("review");
+    void Promise.all([window.grudgeVault.reminders.list(), window.grudgeVault.reviews.list()]).then(async ([reminderResult, reviewResult]) => {
+      if (!reminderResult.ok) return setError(reminderResult.error.message);
+      const reminder = reminderResult.data.find(({ id }) => id === reminderId);
+      if (!reminder) return;
+      const readResult = await window.grudgeVault.reminders.markRead(reminder.id);
+      if (readResult.ok) setReminders((items) => items.map((item) => item.id === readResult.data.id ? readResult.data : item));
+      if (reminder.reviewId && reviewResult.ok) setSelectedReview(reviewResult.data.find(({ id }) => id === reminder.reviewId));
+    });
+  }), [refreshLists]);
   useEffect(() => {
     if (!selectedConversationId) { setMessages([]); setAgentRuns([]); setPendingAgentRun(undefined); return; }
     void Promise.all([
@@ -320,6 +345,7 @@ export function App() {
     setPreview(undefined); setSourceDetail(undefined); setWorkspace(null); setMessages([]); setEvents([]); setPeople([]);
     setPersonIdentities([]); setAssets([]); setImportDetail(undefined); setCandidateDetail(undefined); setSelectedReview(undefined);
     setAgentRuns([]); setPendingAgentRun(undefined); setConversations([]); setTimeline(undefined); setUnifiedHits([]);
+    setProcessorStatus(undefined); setImportFolderStatus(undefined); setReminders([]); setReviewAutomation(undefined);
     setLockState((current) => current.status === "open"
       ? { status: "locked", workspaceId: current.workspace.id, workspaceName: current.workspace.name }
       : current);
@@ -544,6 +570,74 @@ export function App() {
       setNotice(t("importQueued"));
       await refreshLists();
     }
+  };
+
+  const chooseImportFolder = async () => {
+    const result = await window.grudgeVault.importFolder.choose();
+    if (!result.ok) return setError(result.error.message);
+    if (result.data) setImportFolderStatus(result.data);
+  };
+
+  const updateImportFolder = async (enabled: boolean) => {
+    const result = await window.grudgeVault.importFolder.setEnabled(enabled);
+    if (!result.ok) return setError(result.error.message);
+    setImportFolderStatus(result.data);
+  };
+
+  const scanImportFolder = async () => {
+    const result = await window.grudgeVault.importFolder.scanNow();
+    if (!result.ok) return setError(result.error.message);
+    setImportFolderStatus(result.data);
+    await refreshLists();
+  };
+
+  const chooseProcessorPath = async (kind: "tesseract" | "poppler" | "ffmpeg" | "whisper" | "whisper_model") => {
+    const result = await window.grudgeVault.localIntelligence.choosePath(kind);
+    if (!result.ok) return setError(result.error.message);
+    if (result.data) setProcessorStatus(result.data);
+  };
+
+  const updateMediaSettings = async (patch: Partial<MediaProcessingSettings>) => {
+    if (!processorStatus) return;
+    const result = await window.grudgeVault.localIntelligence.updateSettings({ ...processorStatus.settings, ...patch });
+    if (!result.ok) return setError(result.error.message);
+    setProcessorStatus(result.data);
+  };
+
+  const probeProcessors = async () => {
+    const result = await window.grudgeVault.localIntelligence.probe();
+    if (!result.ok) return setError(result.error.message);
+    setProcessorStatus(result.data);
+  };
+
+  const processHistoricalMedia = async () => {
+    const count = processorStatus?.eligibleHistoricalAssets ?? 0;
+    if (count === 0) return;
+    const message = language === "zh-CN" ? `将为 ${count} 个历史附件创建本地处理任务，继续吗？`
+      : `Create local processing tasks for ${count} historical attachments?`;
+    if (!window.confirm(message)) return;
+    const result = await window.grudgeVault.localIntelligence.processHistorical();
+    if (!result.ok) return setError(result.error.message);
+    setNotice(language === "zh-CN" ? `已排队 ${result.data.length} 个媒体任务。` : `${result.data.length} media tasks queued.`);
+    await refreshLists();
+  };
+
+  const updateAutomation = async (patch: Partial<ReviewAutomationSettings>) => {
+    if (!reviewAutomation) return;
+    const result = await window.grudgeVault.reminders.updateSettings({ ...reviewAutomation, ...patch });
+    if (!result.ok) return setError(result.error.message);
+    setReviewAutomation(result.data);
+  };
+
+  const openReminder = async (reminder: Reminder) => {
+    const result = await window.grudgeVault.reminders.markRead(reminder.id);
+    if (!result.ok) return setError(result.error.message);
+    setReminders((items) => items.map((item) => item.id === result.data.id ? result.data : item));
+    if (reminder.reviewId) {
+      const review = reviews.find(({ id }) => id === reminder.reviewId);
+      if (review) setSelectedReview(review);
+    }
+    setView("review");
   };
 
   const startBackfill = async () => {
@@ -1022,7 +1116,9 @@ export function App() {
             <article key={`${hit.kind}:${hit.id}`}><div><em className="kind-badge">{hit.kind === "event" ? t("events") : hit.kind === "journal_entry" ? t("journalEntry") : t("transcript")}</em>
               <strong>{hit.title}</strong><p>{hit.excerpt}</p><span>{hit.occurredAt ?? t("unknown")}</span></div>
               <div className="row-actions permanent">{hit.eventId && <button onClick={() => void openEvent(hit.eventId!)}>{t("openEvent")}</button>}
-                {(hit.sourceItemId ?? hit.sourceRefs[0]) && <button onClick={() => void openSource((hit.sourceItemId ?? hit.sourceRefs[0])!)}>{t("openSource")}</button>}</div>
+                {(hit.derivedArtifactId ?? hit.sourceItemId ?? hit.sourceRefs[0]) && <button onClick={() => void openSource(
+                  (hit.derivedArtifactId ?? hit.sourceItemId ?? hit.sourceRefs[0])!
+                )}>{t("openSource")}</button>}</div>
             </article>)}</div>
         </section>
       </div>}
@@ -1086,6 +1182,23 @@ export function App() {
             <article key={review.id} className={selectedReview?.id === review.id ? "selected" : ""} onClick={() => setSelectedReview(review)}>
               <div><strong>{review.from} — {review.to}</strong><span>{new Date(review.createdAt).toLocaleString(language)}</span></div>
               {review.stale && <em className="status failed">stale</em>}</article>)}</div>}
+          {reviewAutomation && <section className="subsection"><h3>{language === "zh-CN" ? "持续回顾" : "Continuous review"}</h3>
+            <div className="people-picker"><label className="check"><input type="checkbox" checked={reviewAutomation.monthly}
+              onChange={(event) => void updateAutomation({ monthly: event.target.checked })} />{language === "zh-CN" ? "月度回顾" : "Monthly reviews"}</label>
+              <label className="check"><input type="checkbox" checked={reviewAutomation.quarterly}
+                onChange={(event) => void updateAutomation({ quarterly: event.target.checked })} />{language === "zh-CN" ? "季度回顾" : "Quarterly reviews"}</label>
+              <label className="check"><input type="checkbox" checked={reviewAutomation.clarificationWeekly}
+                onChange={(event) => void updateAutomation({ clarificationWeekly: event.target.checked })} />{language === "zh-CN" ? "每周高价值待补全提醒" : "Weekly high-value clarification digest"}</label>
+              <label className="check"><input type="checkbox" checked={reviewAutomation.systemNotifications}
+                onChange={(event) => void updateAutomation({ systemNotifications: event.target.checked })} />{language === "zh-CN" ? "系统通知（仅通用文案）" : "System notifications (generic text only)"}</label></div></section>}
+          <section className="subsection"><h3>{language === "zh-CN" ? "应用内提醒" : "In-app reminders"}</h3>
+            {reminders.filter(({ status }) => status !== "dismissed").length === 0 ? <p className="muted">{language === "zh-CN" ? "暂无到期提醒。" : "No due reminders."}</p> :
+              <div className="mini-list">{reminders.filter(({ status }) => status !== "dismissed").map((reminder) => <article key={reminder.id}>
+                <div><strong>{reminder.kind}</strong><span>{new Date(reminder.dueAt).toLocaleString(language)} · {reminder.status}</span></div>
+                <button onClick={() => void openReminder(reminder)}>{language === "zh-CN" ? "打开" : "Open"}</button>
+                <button onClick={() => void window.grudgeVault.reminders.dismiss(reminder.id).then(async (result) => {
+                  if (!result.ok) setError(result.error.message); else await refreshLists();
+                })}>{t("dismiss")}</button></article>)}</div>}</section>
           <section className="subsection"><h3>{t("globalClarifications")}</h3><div className="mini-list">{globalClarifications.filter(({ status }) => status === "open").map((item) =>
             <article key={item.id}><div><strong>{item.question}</strong><span>{item.reason}</span></div>
               <select aria-label={t("priority")} value={item.priority} onChange={(event) => void changeClarificationPriority(item.id, event.target.value as typeof item.priority)}>
@@ -1111,6 +1224,17 @@ export function App() {
         <section className="panel import-panel">
           <div className="section-heading"><div><p className="eyebrow">DAY ONE SOURCE MEMORY</p><h2>{t("dayOneImports")}</h2></div>
             <button className="primary" disabled={busy} onClick={() => void chooseDayOneZip()}>{t("chooseDayOneZip")}</button></div>
+          {importFolderStatus && <section className="subsection"><div className="subsection-heading"><div><p className="eyebrow">INCREMENTAL IMPORT FOLDER</p>
+            <h3>{language === "zh-CN" ? "Day One 增量目录" : "Incremental Day One folder"}</h3></div></div>
+            <p className="path-value">{importFolderStatus.displayPath ?? (language === "zh-CN" ? "尚未选择目录" : "No folder selected")}</p>
+            <p className="muted">{language === "zh-CN" ? "仅处理顶层常规 ZIP；原始路径只保存在本机配置中。" : "Only top-level regular ZIP files are processed; the original path stays in machine-local settings."}</p>
+            <div className="row-actions permanent"><button onClick={() => void chooseImportFolder()}>{language === "zh-CN" ? "选择目录" : "Choose folder"}</button>
+              <label className="check"><input type="checkbox" disabled={!importFolderStatus.configured} checked={importFolderStatus.enabled}
+                onChange={(event) => void updateImportFolder(event.target.checked)} />{language === "zh-CN" ? "启用监听" : "Watch folder"}</label>
+              <button disabled={!importFolderStatus.configured} onClick={() => void scanImportFolder()}>{language === "zh-CN" ? "立即扫描" : "Scan now"}</button></div>
+            <p className="muted">{importFolderStatus.watching ? (language === "zh-CN" ? "监听中" : "Watching") : (language === "zh-CN" ? "未监听" : "Not watching")}
+              {` · ${importFolderStatus.importedCount} imported · ${importFolderStatus.failedCount} failed`}</p>
+            {importFolderStatus.lastError && <p className="error-banner">{importFolderStatus.lastError}</p>}</section>}
           {importRuns.length === 0 ? <div className="empty compact">{t("noImports")}</div> : <div className="run-list">{importRuns.map((run) =>
             <article key={run.id} className={selectedImportId === run.id ? "selected" : ""} onClick={() => setSelectedImportId(run.id)}>
               <div><strong>{run.archiveFileName}</strong><span>{new Date(run.createdAt).toLocaleString(language)}</span></div>
@@ -1189,13 +1313,19 @@ export function App() {
             <div><strong>{asset.originalFileName}</strong><span>{formatBytes(asset.byteSize)} · {asset.mimeType}</span></div><code>{asset.sha256}</code>
             <em className={`status ${asset.integrityStatus}`}>{asset.integrityStatus}</em>
             <div className="row-actions"><button onClick={() => void previewAsset(asset.id)}>{t("preview")}</button><button onClick={() => void window.grudgeVault.assets.exportCopy(asset.id)}>{t("exportCopy")}</button>
-              <button onClick={() => void window.grudgeVault.assets.verify(asset.id)}>{t("verify")}</button></div></article>)}</div>}
+              <button onClick={() => void window.grudgeVault.assets.verify(asset.id)}>{t("verify")}</button>
+              <button onClick={() => void window.grudgeVault.localIntelligence.processAsset(asset.id).then(async (result) => {
+                if (!result.ok) setError(result.error.message); else await refreshLists();
+              })}>{language === "zh-CN" ? "本地处理" : "Process locally"}</button></div></article>)}</div>}
         </section>
         <aside className="panel"><div className="section-heading"><div><p className="eyebrow">JOBS</p><h2>{t("tasks")}</h2></div></div>
           {jobs.length === 0 ? <div className="empty compact">{t("noJobs")}</div> : jobs.map((job) => <article className="job-row" key={job.id}>
             <div><strong>{job.type}</strong><span>{t("attempt")} {job.attempts}/{job.maxAttempts}</span></div><em className={`status ${job.state}`}>{job.state}</em>
             <progress max={1} value={job.progress ?? 0} />{job.lastError && <p>{job.lastError}</p>}
-            {job.state === "failed" && <button onClick={() => void window.grudgeVault.jobs.retry(job.id)}>{t("retry")}</button>}</article>)}</aside>
+            {job.state === "failed" && <button onClick={() => void window.grudgeVault.jobs.retry(job.id)}>{t("retry")}</button>}
+            {(job.state === "queued" || job.state === "running") && <button onClick={() => void window.grudgeVault.jobs.cancel(job.id).then(async (result) => {
+              if (!result.ok) setError(result.error.message); else await refreshLists();
+            })}>{t("cancel")}</button>}</article>)}</aside>
       </div>}
 
       {view === "settings" && <div className="settings-grid">
@@ -1204,6 +1334,32 @@ export function App() {
         <section className="panel settings-card"><p className="eyebrow">LANGUAGE</p><h2>{t("language")}</h2>
           <div className="language-pills"><button className={language === "zh-CN" ? "active" : ""} onClick={() => setAppLanguage("zh-CN")}>{t("chinese")}</button>
             <button className={language === "en" ? "active" : ""} onClick={() => setAppLanguage("en")}>{t("english")}</button></div></section>
+        {processorStatus && <section className="panel settings-card"><p className="eyebrow">LOCAL MEDIA INTELLIGENCE</p>
+          <h2>{language === "zh-CN" ? "本地媒体引擎" : "Local media engines"}</h2>
+          <p>{language === "zh-CN" ? "仅运行用户选择的本地程序和模型；不会下载或联网。" : "Only user-selected local programs and models run; nothing is downloaded or sent online."}</p>
+          <div className="settings-list"><article><div><strong>OCR · {processorStatus.ocr.available ? "ready" : "unavailable"}</strong>
+            <span>{processorStatus.ocr.displayNames.join(" · ") || (language === "zh-CN" ? "未配置" : "Not configured")}</span></div>
+            <button onClick={() => void chooseProcessorPath("tesseract")}>Tesseract</button><button onClick={() => void chooseProcessorPath("poppler")}>Poppler</button></article>
+            <article><div><strong>ASR · {processorStatus.asr.available ? "ready" : "unavailable"}</strong>
+              <span>{processorStatus.asr.displayNames.join(" · ") || (language === "zh-CN" ? "未配置" : "Not configured")}</span></div>
+              <button onClick={() => void chooseProcessorPath("ffmpeg")}>FFmpeg</button><button onClick={() => void chooseProcessorPath("whisper")}>whisper.cpp</button>
+              <button onClick={() => void chooseProcessorPath("whisper_model")}>{language === "zh-CN" ? "模型" : "Model"}</button></article></div>
+          <label className="field"><span>{language === "zh-CN" ? "OCR 语言（+ 分隔）" : "OCR languages (+ separated)"}</span>
+            <input key={processorStatus.settings.ocrLanguages.join("+")} defaultValue={processorStatus.settings.ocrLanguages.join("+")}
+              onBlur={(event) => void updateMediaSettings({ ocrLanguages: event.target.value.split("+").map((item) => item.trim()).filter(Boolean) })} /></label>
+          <label className="field"><span>{language === "zh-CN" ? "资源档位" : "Resource profile"}</span><select value={processorStatus.settings.resourceProfile}
+            onChange={(event) => void updateMediaSettings({ resourceProfile: event.target.value as MediaProcessingSettings["resourceProfile"] })}>
+            <option value="conservative">conservative</option><option value="balanced">balanced</option><option value="performance">performance</option></select></label>
+          <div className="people-picker"><label className="check"><input type="checkbox" checked={processorStatus.settings.autoProcessNew}
+            onChange={(event) => void updateMediaSettings({ autoProcessNew: event.target.checked })} />{language === "zh-CN" ? "自动处理新附件" : "Automatically process new attachments"}</label>
+            <label className="check"><input type="checkbox" checked={processorStatus.settings.whisperGpu === "auto"}
+              onChange={(event) => void updateMediaSettings({ whisperGpu: event.target.checked ? "auto" : "cpu" })} />{language === "zh-CN" ? "Whisper 自动使用 GPU" : "Whisper GPU auto"}</label></div>
+          {[...processorStatus.ocr.warnings, ...processorStatus.asr.warnings].map((warning) => <p className="warning-copy" key={warning}>{warning}</p>)}
+          <div className="landing-actions"><button onClick={() => void probeProcessors()}>{language === "zh-CN" ? "重新探测" : "Probe again"}</button>
+            <button disabled={processorStatus.eligibleHistoricalAssets === 0} onClick={() => void processHistoricalMedia()}>{language === "zh-CN"
+              ? `处理历史附件（${processorStatus.eligibleHistoricalAssets}）` : `Process historical (${processorStatus.eligibleHistoricalAssets})`}</button></div>
+          <p className="muted">{language === "zh-CN" ? "OCR/转写搜索正文会存储在未加密 SQLite 元数据中。" : "OCR/transcript search text is stored in unencrypted SQLite metadata."}</p>
+        </section>}
         <section className="panel settings-card agent-settings-card"><p className="eyebrow">HARNESS AGENT</p><h2>{t("agentSettings")}</h2>
           <p>{t("agentSettingsHelp")}</p>
           <label className="field"><span>{t("agentExecutionMode")}</span><select value={agentMode}

@@ -9,5 +9,6 @@
     { "path": "../../packages/object-vault" },
     { "path": "../../packages/persistence-sqlite" }
     ,{ "path": "../../packages/importer-dayone" }
+    ,{ "path": "../../packages/media-pipeline" }
   ]
 }

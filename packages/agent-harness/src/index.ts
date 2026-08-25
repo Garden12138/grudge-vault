@@ -35,7 +35,7 @@ import {
   type UpdateEventInput
 } from "@grudge-vault/shared";
 
-export const AGENT_TOOL_SCHEMA_VERSION = 2;
+export const AGENT_TOOL_SCHEMA_VERSION = 3;
 export const AGENT_RESPONSE_VERSION = 1;
 export const AGENT_REDACTION_POLICY_VERSION = 1;
 export const MAX_AGENT_MODEL_ROUNDS = 4;
@@ -82,7 +82,7 @@ export class AgentToolRegistry {
 export function createDefaultAgentToolRegistry(): AgentToolRegistry {
   const registry = new AgentToolRegistry();
   const add = (name: string, description: string, intents: AgentIntent[], write: boolean, schema: z.ZodType) =>
-    registry.register({ name, version: 2, description, intents, write, schema });
+    registry.register({ name, version: AGENT_TOOL_SCHEMA_VERSION, description, intents, write, schema });
   add("record_source", "Confirm that the current conversation message is preserved as a local source.", ["record"], false, z.object({}));
   add("propose_event", "Propose a candidate Event for user approval.", ["record"], true, z.object({
     title: z.string().trim().min(1).max(120), narrative: textSchema,
@@ -137,9 +137,9 @@ export function createDefaultAgentToolRegistry(): AgentToolRegistry {
   return registry;
 }
 
-export function exportAgentToolSchemasV2(intent?: AgentIntent): Array<{
+export function exportAgentToolSchemasV3(intent?: AgentIntent): Array<{
   name: string;
-  version: 2;
+  version: 3;
   description: string;
   intents: AgentIntent[];
   write: boolean;
@@ -150,12 +150,14 @@ export function exportAgentToolSchemasV2(intent?: AgentIntent): Array<{
     .flatMap((value) => registry.definitions(value))
     .filter((tool, index, all) => all.findIndex(({ name }) => name === tool.name) === index);
   return tools.map(({ name, description, intents, write, jsonSchema }) => ({
-    name, version: 2, description, intents, write, schema: jsonSchema
+    name, version: 3, description, intents, write, schema: jsonSchema
   }));
 }
 
-/** @deprecated Consumers should advertise the v2 registry. */
-export const exportAgentToolSchemasV1 = exportAgentToolSchemasV2;
+/** @deprecated Consumers should advertise the v3 registry. */
+export const exportAgentToolSchemasV2 = exportAgentToolSchemasV3;
+/** @deprecated Consumers should advertise the v3 registry. */
+export const exportAgentToolSchemasV1 = exportAgentToolSchemasV3;
 
 export function routeAgentIntent(content: string): AgentIntent {
   const text = content.normalize("NFKC").toLocaleLowerCase("en-US");
@@ -367,9 +369,11 @@ function eventCitation(event: Event): AgentCitation {
 }
 
 function sourceCitation(source: SourceReferenceDetail): AgentCitation {
+  const kind = source.kind === "transcript" ? "transcript" : source.kind === "ocr" ? "ocr" : "source";
+  const targetId = source.derivedArtifactId ?? source.sourceItemId;
   return {
-    id: `citation:source:${source.sourceItemId}`, kind: source.kind === "transcript" ? "transcript" : "source",
-    targetId: source.sourceItemId, label: source.title, excerpt: source.excerpt.slice(0, 240), available: true
+    id: `citation:source:${targetId}`, kind,
+    targetId, label: source.title, excerpt: source.excerpt.slice(0, 240), available: true
   };
 }
 
@@ -823,14 +827,16 @@ export class AgentHarness {
       const hits = await this.application.unifiedSearch({ text: String(value.query), semantic: false, limit: 8 });
       output = hits.map((hit, index) => {
         const ref = `search_result_${index + 1}`;
-        const target = hit.eventId ?? hit.sourceItemId;
+        const target = hit.eventId ?? hit.sourceItemId ?? hit.derivedArtifactId ?? (hit.kind === "ocr" || hit.kind === "transcript" ? hit.id : undefined);
         if (target) snapshot.aliases.set(ref, target);
         return {
-          ref, title: redactExternalText(hit.title, snapshot.personNames),
-          excerpt: redactExternalText(hit.excerpt, snapshot.personNames).slice(0, 1000)
+          ref, kind: hit.kind, title: redactExternalText(hit.title, snapshot.personNames),
+          excerpt: redactExternalText(hit.excerpt, snapshot.personNames).slice(0, 1000),
+          ...(hit.derivedArtifactId ? { derivedArtifactRef: ref } : {}),
+          ...(hit.sourceAssetId ? { sourceAssetRef: `asset:${hit.sourceAssetId}` } : {})
         };
       });
-      call.outputRefs = hits.flatMap((hit) => [hit.eventId, hit.sourceItemId]).filter((id): id is string => Boolean(id));
+      call.outputRefs = hits.flatMap((hit) => [hit.eventId, hit.sourceItemId, hit.derivedArtifactId]).filter((id): id is string => Boolean(id));
     } else if (name === "get_event" || name === "analyze_event") {
       const refs = name === "get_event" ? [String(value.eventRef)] : value.eventRefs as string[];
       const events = refs.slice(0, 8).map((ref) => this.application.getEvent(resolve(ref)).event);
@@ -989,6 +995,12 @@ export class AgentHarness {
     for (const sourceRef of [...new Set(events.flatMap(({ sourceRefs }) => sourceRefs))].slice(0, 8)) {
       try { sources.push(this.application.getSourceReference(sourceRef)); } catch { /* source removed */ }
     }
+    for (const hit of hits.filter(({ kind }) => kind === "ocr" || kind === "transcript")) {
+      try {
+        const source = this.application.getSourceReference(hit.id);
+        if (!sources.some(({ sourceItemId }) => sourceItemId === source.sourceItemId)) sources.push(source);
+      } catch { /* stale derived search result */ }
+    }
     const caseAssetIds = new Set(cases.flatMap(({ assetRefs }) => assetRefs));
     const evidence = (intent === "evidence" ? this.application.listEvidence()
       .filter(({ asset }) => caseAssetIds.size === 0 || caseAssetIds.has(asset.id)) : []).slice(0, 8);
@@ -1038,13 +1050,17 @@ export class AgentHarness {
     const categories: AgentDataCategory[] = ["conversation_text"];
     if (events.length) categories.push("event_fields");
     if (sources.some(({ kind }) => kind === "transcript")) categories.push("transcript_excerpt");
-    if (sources.some(({ kind }) => kind !== "transcript")) categories.push("source_excerpt");
+    if (sources.some(({ kind }) => kind === "ocr")) categories.push("ocr_excerpt");
+    if (sources.some(({ kind }) => kind !== "transcript" && kind !== "ocr")) categories.push("source_excerpt");
     if (assets.length) categories.push("asset_metadata");
     const categoryCounts: Partial<Record<AgentDataCategory, number>> = {
       conversation_text: messages.length + 1,
       ...(events.length ? { event_fields: events.length } : {}),
-      ...(sources.filter(({ kind }) => kind !== "transcript").length ? {
-        source_excerpt: sources.filter(({ kind }) => kind !== "transcript").length
+      ...(sources.filter(({ kind }) => kind !== "transcript" && kind !== "ocr").length ? {
+        source_excerpt: sources.filter(({ kind }) => kind !== "transcript" && kind !== "ocr").length
+      } : {}),
+      ...(sources.filter(({ kind }) => kind === "ocr").length ? {
+        ocr_excerpt: sources.filter(({ kind }) => kind === "ocr").length
       } : {}),
       ...(sources.filter(({ kind }) => kind === "transcript").length ? {
         transcript_excerpt: sources.filter(({ kind }) => kind === "transcript").length

@@ -1,7 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { lstat, rename, unlink } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { lstat, mkdir, mkdtemp, rename, rm, unlink } from "node:fs/promises";
+import { basename, extname, join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { setImmediate } from "node:timers";
@@ -11,11 +11,12 @@ import type {
   Case, CaseBinderExportResult, CaseBinderPreview, CaseBinderProfile, CaseDetail, CaseRevision,
   CandidateExtraction, CandidateSummary, Clarification, Conversation, EmbeddingGeneration,
   EmbeddingIndexStatus, Event, EventRelation, EventRevision,
-  EventSearchQuery, EvidenceDetail, EvidenceReferenceImpact, ImportIssue, ImportRun, ImportRunDetail, IntegrityScan, Job,
+  DerivedArtifactDetail, EventSearchQuery, EvidenceDetail, EvidenceReferenceImpact, ImportIssue, ImportRun, ImportRunDetail, IntegrityScan, Job,
   LegalVerificationResult, Message, Person, PersonAlias,
   PersonIdentityDetail, PersonMergeRecord, PersonMergeSuggestion, ReviewRun, Source,
   SourceItem, SourceReferenceDetail, SourceVersion, TimelineQuery, TimelineResult,
   RecoveryPackageSummary, UnifiedSearchHit, UnifiedSearchQuery, Workspace, WorkspaceCryptoStatus,
+  LocalProcessorStatus, MediaProcessingSettings, MediaProcessorKind, Reminder, ReviewAutomationSettings,
   WorkspaceLockState, WorkspaceSecuritySettings
 } from "@grudge-vault/domain";
 import {
@@ -40,11 +41,17 @@ import {
   PhaseFiveService, type CaseSummaryPdfPort, type CryptoMigrationRecord,
   type LegalInformationAdapterPort, type PhaseFiveRepositoryPort
 } from "./phase5";
+import {
+  DEFAULT_MEDIA_PROCESSING_SETTINGS, DEFAULT_REVIEW_AUTOMATION_SETTINGS,
+  isoWeekScheduleKey, latestCompletedMonth, latestCompletedQuarter,
+  type MediaPipelinePort, type PhaseSixRepositoryPort
+} from "./phase6";
 
 export * from "./memory";
 export * from "./dayone";
 export * from "./phase3";
 export * from "./phase5";
+export * from "./phase6";
 
 export interface StoredObject {
   sha256: string;
@@ -90,6 +97,8 @@ export interface JobRepositoryPort {
   succeed(id: string, now: string): Job;
   fail(id: string, error: string, now: string, retryAt?: string): Job;
   retry(id: string, now: string): Job;
+  cancel(id: string, now: string): Job;
+  interrupt(id: string, error: string, now: string): Job;
 }
 
 export interface WorkspaceSession {
@@ -101,6 +110,7 @@ export interface WorkspaceSession {
   memory: MemoryRepositoryPort;
   agents: AgentRepositoryPort;
   phase5?: PhaseFiveRepositoryPort;
+  phase6?: PhaseSixRepositoryPort;
   dayOne: import("./dayone").DayOneRepositoryPort;
   vault: ObjectVaultPort;
   backupDatabase(destinationPath: string): Promise<void>;
@@ -203,7 +213,8 @@ export class GrudgeVaultApplication {
     private readonly draftGenerator: EventDraftGeneratorPort = new DeterministicEventDraftGenerator(),
     private readonly dayOneImporter?: DayOneImporterPort,
     private readonly embeddingAdapter?: EmbeddingAdapterPort,
-    phaseFiveOptions: { pdf?: CaseSummaryPdfPort; legal?: LegalInformationAdapterPort } = {}
+    phaseFiveOptions: { pdf?: CaseSummaryPdfPort; legal?: LegalInformationAdapterPort } = {},
+    private readonly mediaPipeline?: MediaPipelinePort
   ) {
     this.phaseFive = new PhaseFiveService(() => {
       const session = this.requireSession();
@@ -1016,6 +1027,7 @@ export class GrudgeVaultApplication {
       const result = session.assets.upsert(candidate);
       if (!result.deduplicated) {
         session.jobs.enqueue("asset.verify", { assetId: result.asset.id, sha256: result.asset.sha256 }, now);
+        await this.enqueueAutomaticMedia(result.asset);
       }
       return result;
     } catch (error) {
@@ -1026,9 +1038,13 @@ export class GrudgeVaultApplication {
 
   async createDayOneImport(filePath: string): Promise<ImportRun> {
     const imported = await this.importAsset(filePath);
+    return this.createDayOneImportForAsset(imported.asset);
+  }
+
+  private createDayOneImportForAsset(asset: Asset): ImportRun {
     const now = new Date().toISOString();
     const run: ImportRun = {
-      id: randomUUID(), archiveAssetId: imported.asset.id, archiveFileName: imported.asset.originalFileName,
+      id: randomUUID(), archiveAssetId: asset.id, archiveFileName: asset.originalFileName,
       state: "queued", progress: 0,
       counts: { totalEntries: 0, newEntries: 0, updatedEntries: 0, skippedEntries: 0, mediaImported: 0, mediaMissing: 0, errorCount: 0 },
       createdAt: now, updatedAt: now
@@ -1327,6 +1343,207 @@ export class GrudgeVaultApplication {
     return this.requireSession().jobs.retry(jobId, new Date().toISOString());
   }
 
+  async getLocalProcessorStatus(): Promise<LocalProcessorStatus> {
+    const session = this.requireSession();
+    if (!this.mediaPipeline) return {
+      settings: DEFAULT_MEDIA_PROCESSING_SETTINGS,
+      ocr: { configured: false, available: false, displayNames: [], warnings: ["No OCR pipeline is installed."] },
+      asr: { configured: false, available: false, displayNames: [], warnings: ["No ASR pipeline is installed."] },
+      eligibleHistoricalAssets: 0, pendingJobs: 0
+    };
+    const base = await this.mediaPipeline.getStatus();
+    const eligibleHistoricalAssets = session.assets.list().filter((asset) => {
+      const kind = this.mediaPipeline!.kindFor(asset);
+      return asset.availabilityStatus === "available" && Boolean(kind)
+        && !session.phase6?.getCurrentDerivedArtifact(asset.id, kind!);
+    }).length;
+    const pendingJobs = session.jobs.list().filter(({ type, state }) =>
+      type === "media.process" && (state === "queued" || state === "running")).length;
+    return { ...base, eligibleHistoricalAssets, pendingJobs };
+  }
+
+  async updateMediaProcessingSettings(settings: MediaProcessingSettings): Promise<LocalProcessorStatus> {
+    if (!this.mediaPipeline) throw new AppError("LOCAL_PROCESSOR_UNAVAILABLE", "No local media pipeline is installed.");
+    await this.mediaPipeline.updateSettings(settings);
+    return this.getLocalProcessorStatus();
+  }
+
+  async probeLocalProcessors(): Promise<LocalProcessorStatus> {
+    if (!this.mediaPipeline) throw new AppError("LOCAL_PROCESSOR_UNAVAILABLE", "No local media pipeline is installed.");
+    await this.mediaPipeline.probe();
+    return this.getLocalProcessorStatus();
+  }
+
+  async enqueueMediaProcessing(assetId: string): Promise<Job> {
+    const session = this.requireSession();
+    if (!this.mediaPipeline || !session.phase6) throw new AppError("LOCAL_PROCESSOR_UNAVAILABLE", "Local media processing is unavailable.");
+    const asset = session.assets.findById(assetId);
+    if (!asset) throw new AppError("ASSET_NOT_FOUND", "The asset no longer exists.");
+    if (asset.availabilityStatus !== "available") throw new AppError("EVIDENCE_UNAVAILABLE", "The original is not available for processing.");
+    const fingerprint = await this.mediaPipeline.fingerprint(asset);
+    const existingJob = session.jobs.list().find(({ type, state, payload }) => {
+      const value = payload as { assetId?: unknown; inputHash?: unknown };
+      return type === "media.process" && (state === "queued" || state === "running")
+        && value.assetId === assetId && value.inputHash === fingerprint.inputHash;
+    });
+    if (existingJob) return existingJob;
+    return session.jobs.enqueue("media.process", {
+      assetId, kind: fingerprint.kind, inputHash: fingerprint.inputHash
+    }, new Date().toISOString(), 3);
+  }
+
+  async enqueueHistoricalMediaProcessing(): Promise<Job[]> {
+    if (!this.mediaPipeline) throw new AppError("LOCAL_PROCESSOR_UNAVAILABLE", "Local media processing is unavailable.");
+    const session = this.requireSession();
+    const jobs: Job[] = [];
+    for (const asset of session.assets.list()) {
+      const kind = this.mediaPipeline.kindFor(asset);
+      if (!kind || asset.availabilityStatus !== "available" || session.phase6?.getCurrentDerivedArtifact(asset.id, kind)) continue;
+      jobs.push(await this.enqueueMediaProcessing(asset.id));
+    }
+    return jobs;
+  }
+
+  async runMediaProcessing(assetId: string, expectedInputHash: string, context: JobHandlerContext): Promise<void> {
+    const session = this.requireSession();
+    if (!this.mediaPipeline || !session.phase6) throw new AppError("LOCAL_PROCESSOR_UNAVAILABLE", "Local media processing is unavailable.");
+    const asset = session.assets.findById(assetId);
+    if (!asset) throw new AppError("ASSET_NOT_FOUND", "The asset no longer exists.");
+    if (asset.availabilityStatus !== "available") throw new AppError("EVIDENCE_UNAVAILABLE", "The original is no longer available.");
+    const fingerprint = await this.mediaPipeline.fingerprint(asset);
+    if (fingerprint.inputHash !== expectedInputHash) {
+      throw new AppError("MEDIA_PROCESSING_FAILED", "The local processor configuration changed before the task started.", true);
+    }
+    const existing = session.phase6.findDerivedArtifact(asset.id, fingerprint.kind, fingerprint.inputHash);
+    if (existing?.current) { context.reportProgress(1); return; }
+    if (existing) {
+      const detail = await this.getDerivedArtifactDetail(existing.id);
+      session.phase6.activateDerivedArtifact(existing, {
+        kind: existing.kind as MediaProcessorKind, id: `derived:${asset.id}:${existing.kind}`,
+        title: `${asset.originalFileName} · ${existing.kind === "ocr" ? "OCR" : "Transcript"}`,
+        content: detail.payload.text, contentHash: createHash("sha256").update(detail.payload.text).digest("hex"),
+        derivedArtifactId: existing.id, sourceAssetId: asset.id, sourceRefs: []
+      }, new Date().toISOString());
+      context.reportProgress(1);
+      return;
+    }
+    const temporaryRoot = join(session.workspace.rootPath, "vault", "tmp");
+    await mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
+    const temporaryDirectory = await mkdtemp(join(temporaryRoot, "media-"));
+    const suffix = extname(asset.originalFileName).replace(/[^.A-Za-z0-9]/g, "").slice(0, 12) || ".bin";
+    const inputPath = join(temporaryDirectory, `input${suffix}`);
+    try {
+      await pipeline(await session.vault.open(asset.sha256, session.keyRing ?? session.key), createWriteStream(inputPath, { flags: "wx", mode: 0o600 }));
+      context.reportProgress(0.05);
+      const result = await this.mediaPipeline.process({ asset, inputPath, temporaryDirectory, signal: context.signal,
+        reportProgress: (progress) => context.reportProgress(0.05 + progress * 0.9) });
+      if (result.inputHash !== expectedInputHash) throw new AppError("MEDIA_PROCESSING_FAILED", "The processor returned an unexpected input hash.");
+      const payload = Buffer.from(JSON.stringify(result.payload), "utf8");
+      if (payload.length > 64 * 1024 * 1024) throw new AppError("MEDIA_PROCESSING_FAILED", "The derived artifact exceeds 64 MiB.");
+      const stored = await session.vault.putStream(Readable.from(payload), session.keyRing ?? session.key, payload.length);
+      const now = new Date().toISOString();
+      const artifact = session.phase6.activateDerivedArtifact({
+        id: randomUUID(), sourceAssetId: asset.id, kind: result.kind, sha256: stored.sha256,
+        byteSize: stored.byteSize, mimeType: "application/vnd.grudge-vault.media+json",
+        processorIdentity: result.processorIdentity, processorVersion: result.processorVersion,
+        configHash: result.configHash, inputHash: result.inputHash, current: true, createdAt: now
+      }, {
+        kind: result.kind, id: `derived:${asset.id}:${result.kind}`,
+        title: `${asset.originalFileName} · ${result.kind === "ocr" ? "OCR" : "Transcript"}`,
+        content: result.payload.text, contentHash: createHash("sha256").update(result.payload.text).digest("hex"),
+        derivedArtifactId: "pending", sourceAssetId: asset.id, sourceRefs: []
+      }, now);
+      if (!artifact.current) throw new AppError("MEDIA_PROCESSING_FAILED", "The derived artifact was not activated.");
+      context.reportProgress(1);
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
+  }
+
+  async getDerivedArtifactDetail(artifactId: string): Promise<DerivedArtifactDetail> {
+    const session = this.requireSession();
+    const artifact = session.phase6?.getDerivedArtifact(artifactId);
+    if (!artifact) throw new AppError("ENTITY_NOT_FOUND", "The derived artifact no longer exists.");
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of await session.vault.open(artifact.sha256, session.keyRing ?? session.key)) {
+      const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += value.length;
+      if (size > 64 * 1024 * 1024) throw new AppError("MEDIA_PROCESSING_FAILED", "The derived artifact exceeds the preview limit.");
+      chunks.push(value);
+    }
+    let payload: DerivedArtifactDetail["payload"];
+    try { payload = JSON.parse(Buffer.concat(chunks).toString("utf8")) as DerivedArtifactDetail["payload"]; }
+    catch (cause) { throw new AppError("MEDIA_PROCESSING_FAILED", "The derived artifact is invalid.", false, { cause }); }
+    if (payload.formatVersion !== 1 || payload.kind !== artifact.kind || payload.sourceAssetId !== artifact.sourceAssetId) {
+      throw new AppError("MEDIA_PROCESSING_FAILED", "The derived artifact metadata does not match its index.");
+    }
+    return { artifact, payload };
+  }
+
+  getReviewAutomationSettings(): ReviewAutomationSettings {
+    return this.requireSession().memory.getSetting<ReviewAutomationSettings>("review.automation")
+      ?? DEFAULT_REVIEW_AUTOMATION_SETTINGS;
+  }
+
+  updateReviewAutomationSettings(settings: ReviewAutomationSettings): ReviewAutomationSettings {
+    this.requireSession().memory.setSetting("review.automation", settings, new Date().toISOString());
+    return settings;
+  }
+
+  listReminders(): Reminder[] { return this.requirePhaseSix().listReminders(); }
+  markReminderRead(id: string): Reminder { return this.requirePhaseSix().updateReminderStatus(id, "read", new Date().toISOString()); }
+  dismissReminder(id: string): Reminder { return this.requirePhaseSix().updateReminderStatus(id, "dismissed", new Date().toISOString()); }
+
+  runReviewAutomation(now = new Date()): Reminder[] {
+    const repository = this.requirePhaseSix();
+    const settings = this.getReviewAutomationSettings();
+    const created: Reminder[] = [];
+    const scheduleReview = (kind: "monthly_review" | "quarterly_review", period: { key: string; from: string; to: string }) => {
+      if (repository.getAutomationRun(period.key)) return;
+      const review = this.generateReview({ from: period.from, to: period.to });
+      repository.saveAutomationRun({ scheduleKey: period.key, kind, reviewId: review.id, from: period.from, to: period.to, createdAt: now.toISOString() });
+      if (review.eventIds.length === 0) return;
+      created.push(repository.saveReminder({
+        id: randomUUID(), kind, scheduleKey: period.key, status: "unread", dueAt: now.toISOString(), reviewId: review.id,
+        clarificationIds: [], createdAt: now.toISOString(), updatedAt: now.toISOString()
+      }));
+    };
+    if (settings.monthly) scheduleReview("monthly_review", latestCompletedMonth(now));
+    if (settings.quarterly) scheduleReview("quarterly_review", latestCompletedQuarter(now));
+    if (settings.clarificationWeekly) {
+      const key = isoWeekScheduleKey(now);
+      if (!repository.getAutomationRun(key)) {
+        const clarificationIds = this.listClarifications().filter(({ status, priority }) =>
+          status === "open" && (priority === "important" || priority === "rights_related")).map(({ id }) => id);
+        if (clarificationIds.length) {
+          repository.saveAutomationRun({ scheduleKey: key, kind: "clarification_digest", createdAt: now.toISOString() });
+          created.push(repository.saveReminder({
+          id: randomUUID(), kind: "clarification_digest", scheduleKey: key, status: "unread", dueAt: now.toISOString(),
+          clarificationIds, createdAt: now.toISOString(), updatedAt: now.toISOString()
+          }));
+        }
+      }
+    }
+    return created;
+  }
+
+  async ingestWatchedDayOne(filePath: string): Promise<ImportRun | undefined> {
+    const repository = this.requirePhaseSix();
+    const imported = await this.importAsset(filePath);
+    if (repository.hasImportFolderArchive(imported.asset.sha256)) return undefined;
+    const run = this.createDayOneImportForAsset(imported.asset);
+    repository.saveImportFolderEntry({
+      id: randomUUID(), archiveSha256: imported.asset.sha256, assetId: imported.asset.id,
+      importRunId: run.id, fileName: imported.asset.originalFileName, createdAt: new Date().toISOString()
+    });
+    return run;
+  }
+
+  getImportFolderCounts(): { imported: number; failed: number } {
+    return this.requirePhaseSix().countImportFolderEntries();
+  }
+
   listEvidence(): EvidenceDetail[] { return this.phaseFive.listEvidence(); }
   getEvidence(assetId: string): EvidenceDetail { return this.phaseFive.getEvidence(assetId); }
   getEvidenceImpact(assetId: string): EvidenceReferenceImpact { return this.phaseFive.getEvidenceImpact(assetId); }
@@ -1376,6 +1593,12 @@ export class GrudgeVaultApplication {
     return this.commitNewEvent(proposal, "Created from chat message", now, { clarifications });
   }
 
+  private requirePhaseSix(): PhaseSixRepositoryPort {
+    const repository = this.requireSession().phase6;
+    if (!repository) throw new AppError("INTERNAL_ERROR", "Phase 6 storage is unavailable.");
+    return repository;
+  }
+
   private reencryptAgentCredentials(targetKeyId: string): void {
     const session = this.requireSession();
     const target = session.keyRing?.keys.get(targetKeyId);
@@ -1397,8 +1620,24 @@ export class GrudgeVaultApplication {
       mimeType: lookupMimeType(fileName) || "application/octet-stream", originalFileName: basename(fileName),
       vaultFormat: stored.vaultFormat, integrityStatus: "pending", availabilityStatus: "available", createdAt: now
     });
-    if (!result.deduplicated) session.jobs.enqueue("asset.verify", { assetId: result.asset.id, sha256: result.asset.sha256 }, now);
+    if (!result.deduplicated) {
+      session.jobs.enqueue("asset.verify", { assetId: result.asset.id, sha256: result.asset.sha256 }, now);
+      await this.enqueueAutomaticMedia(result.asset);
+    }
     return result;
+  }
+
+  private async enqueueAutomaticMedia(asset: Asset): Promise<void> {
+    if (!this.mediaPipeline?.getSettings().autoProcessNew || !this.mediaPipeline.kindFor(asset)) return;
+    try {
+      const status = await this.mediaPipeline.getStatus();
+      const kind = this.mediaPipeline.kindFor(asset);
+      if ((kind === "ocr" && status.ocr.available) || (kind === "transcript" && status.asr.available)) {
+        await this.enqueueMediaProcessing(asset.id);
+      }
+    } catch (error) {
+      if (!(error instanceof AppError) || error.code !== "LOCAL_PROCESSOR_UNAVAILABLE") throw error;
+    }
   }
 
   private createDayOneCandidate(sourceVersion: SourceVersion, journalDate: string, assetRefs: string[]): Event | undefined {
@@ -1634,6 +1873,7 @@ export class JobRunner {
   private readonly onChanged: () => void;
   private pollTimer: NodeJS.Timeout | undefined;
   private runningAbort: AbortController | undefined;
+  private runningJobId: string | undefined;
   private draining = false;
   private stopped = true;
   private drainPromise: Promise<void> | undefined;
@@ -1668,6 +1908,13 @@ export class JobRunner {
     this.runningAbort?.abort();
   }
 
+  cancel(jobId: string): Job {
+    const job = this.repository.cancel(jobId, this.now().toISOString());
+    if (this.runningJobId === jobId) this.runningAbort?.abort();
+    this.onChanged();
+    return job;
+  }
+
   async stopAndWait(): Promise<void> {
     this.stop();
     await this.drainPromise;
@@ -1698,6 +1945,7 @@ export class JobRunner {
     const handler = this.handlers[job.type];
     const abort = new AbortController();
     this.runningAbort = abort;
+    this.runningJobId = job.id;
     const heartbeat = setInterval(() => {
       const now = this.now();
       this.repository.heartbeat(job.id, new Date(now.getTime() + this.leaseMs).toISOString(), now.toISOString());
@@ -1714,9 +1962,11 @@ export class JobRunner {
       });
       const finished = this.now().toISOString();
       if (!this.stopped) this.repository.succeed(job.id, finished);
-      else this.repository.fail(job.id, "Interrupted while locking workspace", finished, finished);
+      else this.repository.interrupt(job.id, "Interrupted while locking workspace", finished);
     } catch (error) {
-      if (!this.stopped || abort.signal.aborted) {
+      if (this.stopped && abort.signal.aborted) {
+        this.repository.interrupt(job.id, "Interrupted while locking workspace", this.now().toISOString());
+      } else if (!this.stopped || abort.signal.aborted) {
         const now = this.now();
         const retryDelays = [1_000, 5_000];
         const attemptWithinCycle = (job.attempts - 1) % 3;
@@ -1727,6 +1977,7 @@ export class JobRunner {
     } finally {
       clearInterval(heartbeat);
       this.runningAbort = undefined;
+      this.runningJobId = undefined;
       this.onChanged();
     }
   }

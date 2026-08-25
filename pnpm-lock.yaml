@@ -106,6 +106,9 @@ importers:
       '@grudge-vault/importer-dayone':
         specifier: workspace:*
         version: link:../../packages/importer-dayone
+      '@grudge-vault/media-pipeline':
+        specifier: workspace:*
+        version: link:../../packages/media-pipeline
       '@grudge-vault/object-vault':
         specifier: workspace:*
         version: link:../../packages/object-vault
@@ -184,6 +187,18 @@ importers:
       yazl:
         specifier: 3.3.1
         version: 3.3.1
+
+  packages/media-pipeline:
+    dependencies:
+      '@grudge-vault/application':
+        specifier: workspace:*
+        version: link:../application
+      '@grudge-vault/domain':
+        specifier: workspace:*
+        version: link:../domain
+      '@grudge-vault/shared':
+        specifier: workspace:*
+        version: link:../shared
 
   packages/object-vault:
     dependencies:

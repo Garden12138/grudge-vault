@@ -1,0 +1,12 @@
+{
+  "name": "@grudge-vault/media-pipeline",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@grudge-vault/application": "workspace:*",
+    "@grudge-vault/domain": "workspace:*",
+    "@grudge-vault/shared": "workspace:*"
+  }
+}

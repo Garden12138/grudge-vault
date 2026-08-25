@@ -21,9 +21,9 @@
 | Phase 3 | 关联、检索与回顾 | 可以从人物和时间线理解重复发生的问题 | Beta Foundation |
 | Phase 4 | Harness Agent 与策略分析 | 可以通过对话检索记忆、分析事件并形成行动选项 | First Useful Beta |
 | Phase 5 | Evidence Vault 与 Case | 可以面向权益问题整理来源、缺口和材料包 | Evidence Beta |
-| Phase 6 | 本地智能与持续记忆 | 更自动的处理、回顾和多数据源接入 | Ongoing |
+| Phase 6 | 本地智能与持续记忆 | 本地媒体理解、增量导入和主动回顾 | Core complete |
 
-Phase 5 Evidence Beta 已于 2026-08-25 完成。Phase 1 已经能可靠记账，Phase 2 能利用既有 Day One 数据，Phase 3—4 形成长期记忆与 Harness Agent，Phase 5 补齐 Evidence、Case、可恢复安全迁移和可独立校验 Binder。
+Phase 6 Core 已于 2026-08-25 完成。Phase 1 已经能可靠记账，Phase 2 能利用既有 Day One 数据，Phase 3—4 形成长期记忆与 Harness Agent，Phase 5 补齐 Evidence 与 Case，Phase 6 接通离线媒体派生、增量 Day One 目录和持续回顾。
 
 ## 3. Phase 0：可运行基础
 
@@ -225,20 +225,26 @@ Phase 5 Evidence Beta 已于 2026-08-25 完成。Phase 1 已经能可靠记账�
 
 ## 9. Phase 6：本地智能与持续记忆
 
+> 实施状态：Core 已于 2026-08-25 落地；内置模型分发、视频理解、新数据源与新客户端仍属后续范围。
+
 ### 目标
 
 在基础闭环稳定后提高自动化程度，让产品长期陪伴使用，而不牺牲可解释性和用户控制。
 
-### 候选方向
+### 已交付 Core
 
-- 本地 LLM、Embedding、OCR 和 ASR 的安装与硬件适配；
-- Day One Import Folder 监听和增量处理；
-- 图片 OCR、音频时间戳转写、视频音轨与关键帧；
-- 主动月度/季度 Review 和高价值待补全提醒；
-- 新数据源 Adapter，例如 Markdown、聊天导出、邮件归档或任务系统；
-- 可选的多设备加密同步；
-- CLI、移动伴侣端或浏览器采集入口；
-- 可配置 Agent Skill 与第三方工具插件。
+- 用户选择的 Tesseract/Poppler/FFmpeg/whisper.cpp 与模型能力探测，不自动联网或下载；
+- 图片/PDF OCR、音频时间戳转写、加密派生物、输入哈希复用和当前搜索投影；
+- Day One Import Folder 的初扫、监听、5 分钟对账、稳定性检查、SHA-256 去重和锁定生命周期；
+- 月度/季度 Review、每周高价值 Clarification 摘要、持久 Reminder 和通用系统通知；
+- SQLite v7、Agent Tool Registry v3、媒体任务单项取消和失败安全索引切换。
+
+### 后续候选
+
+- 内置本地 LLM、Embedding 与媒体模型分发；
+- 视频音轨、关键帧与像素级脱敏；
+- Markdown、聊天、邮件或任务系统等新数据源；
+- 多设备加密同步、CLI、移动端、浏览器入口和第三方 Skill/插件。
 
 这一阶段按用户反馈排序，不预先承诺所有方向。优先选择能显著减少记录成本或提高历史记忆价值的能力。
 

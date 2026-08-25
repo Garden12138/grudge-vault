@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
+import type { IpcRendererEvent } from "electron";
 import { AppError, toSerializedError, type GrudgeVaultApi, type IpcResult } from "@grudge-vault/shared";
 
 const invoke = <T>(channel: string, input?: unknown) => ipcRenderer.invoke(channel, input) as Promise<IpcResult<T>>;
@@ -83,6 +84,15 @@ const api: GrudgeVaultApi = {
     setSemanticEnabled: (enabled) => invoke("search:semantic-enabled", enabled),
     rebuildEmbeddings: () => invoke("search:rebuild-embeddings")
   },
+  localIntelligence: {
+    status: () => invoke("local-intelligence:status"),
+    choosePath: (kind) => invoke("local-intelligence:choose-path", kind),
+    updateSettings: (settings) => invoke("local-intelligence:update-settings", settings),
+    probe: () => invoke("local-intelligence:probe"),
+    processAsset: (assetId) => invoke("local-intelligence:process-asset", assetId),
+    processHistorical: () => invoke("local-intelligence:process-historical"),
+    getArtifact: (artifactId) => invoke("local-intelligence:get-artifact", artifactId)
+  },
   reviews: {
     list: () => invoke("reviews:list"),
     get: (id) => invoke("reviews:get", id),
@@ -153,6 +163,24 @@ const api: GrudgeVaultApi = {
     list: () => invoke("imports:list"),
     get: (id) => invoke("imports:get", id)
   },
+  importFolder: {
+    status: () => invoke("import-folder:status"),
+    choose: () => invoke("import-folder:choose"),
+    setEnabled: (enabled) => invoke("import-folder:set-enabled", enabled),
+    scanNow: () => invoke("import-folder:scan")
+  },
+  reminders: {
+    list: () => invoke("reminders:list"),
+    getSettings: () => invoke("reminders:settings"),
+    updateSettings: (settings) => invoke("reminders:update-settings", settings),
+    markRead: (id) => invoke("reminders:read", id),
+    dismiss: (id) => invoke("reminders:dismiss", id),
+    onDue: (callback) => {
+      const listener = (_event: IpcRendererEvent, reminderId: string, shouldOpen = false) => callback(reminderId, shouldOpen);
+      ipcRenderer.on("reminders:due", listener);
+      return () => ipcRenderer.removeListener("reminders:due", listener);
+    }
+  },
   backfill: {
     list: () => invoke("backfill:list"),
     start: (input) => invoke("backfill:start", input),
@@ -174,6 +202,7 @@ const api: GrudgeVaultApi = {
   jobs: {
     list: () => invoke("jobs:list"),
     retry: (jobId) => invoke("jobs:retry", jobId),
+    cancel: (jobId) => invoke("jobs:cancel", jobId),
     onChanged: (callback) => {
       const listener = () => callback();
       ipcRenderer.on("jobs:changed", listener);

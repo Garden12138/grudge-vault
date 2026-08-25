@@ -477,6 +477,8 @@ UI 应展示导入批次、处理进度、失败原因和重试入口。部分�
 
 SQLite 元数据加密可以根据威胁模型和分发环境选择合适实现；接口从首版预留，但不让某个加密库渗透领域层。
 
+Phase 6 的 OCR/Transcript 完整 JSON 作为认证加密对象保存，但为支持 FTS5 和可选 Embedding，当前版本派生正文会复制到未加密 SQLite 搜索元数据。Tesseract、Poppler、FFmpeg、whisper.cpp、Whisper 模型与外部 Import Folder 的绝对路径只写入用户数据目录下权限为 `0600` 的 `local-intelligence.json`，不进入工作区 SQLite、快照、Job payload 或日志。Main Process 只接受系统对话框产生的路径，并以绝对可执行文件、`shell: false`、最小环境、超时、输出和临时空间上限启动子进程。
+
 ### 10.2 备份与恢复
 
 工作区导出应包含数据库快照、保险库对象、manifest 和版本信息。恢复流程先校验 manifest 与哈希，再迁移数据库。用户可以选择导出加密包或由自己管理的明文互操作格式。

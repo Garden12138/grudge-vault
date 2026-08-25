@@ -16,6 +16,7 @@ import type {
   CandidateSummary,
   Clarification,
   Conversation,
+  DerivedArtifactDetail,
   Emotion,
   Event,
   EventDetail,
@@ -31,14 +32,19 @@ import type {
   Job,
   ImportRun,
   ImportRunDetail,
+  ImportFolderStatus,
   IntegrityScan,
   Message,
+  LocalProcessorStatus,
+  MediaProcessingSettings,
   Person,
   PersonAlias,
   PersonIdentityDetail,
   PersonMergeRecord,
   PersonMergeSuggestion,
   ReviewRun,
+  Reminder,
+  ReviewAutomationSettings,
   SourceReferenceDetail,
   Statement,
   TemporalValue,
@@ -86,6 +92,10 @@ export const APP_ERROR_CODES = [
   "PERSON_MERGE_CONFLICT",
   "RELATION_STATE_CONFLICT",
   "EMBEDDING_UNAVAILABLE",
+  "LOCAL_PROCESSOR_UNAVAILABLE",
+  "MEDIA_PROCESSING_FAILED",
+  "IMPORT_FOLDER_UNAVAILABLE",
+  "REMINDER_NOT_FOUND",
   "AGENT_CONSENT_REQUIRED",
   "AGENT_RUN_STATE_CONFLICT",
   "AGENT_ACTION_CONFLICT",
@@ -93,6 +103,7 @@ export const APP_ERROR_CODES = [
   "AGENT_MODEL_UNAVAILABLE",
   "AGENT_TOOL_FAILED",
   "JOB_NOT_RETRYABLE",
+  "JOB_STATE_CONFLICT",
   "VALIDATION_FAILED",
   "INTERNAL_ERROR"
 ] as const;
@@ -281,6 +292,8 @@ export interface RecoveryImportInput {
   passphrase: string;
 }
 
+export type LocalProcessorPathKind = "tesseract" | "poppler" | "ffmpeg" | "whisper" | "whisper_model";
+
 export interface GrudgeVaultApi {
   workspace: {
     current(): Promise<IpcResult<Workspace | null>>;
@@ -357,6 +370,15 @@ export interface GrudgeVaultApi {
     setSemanticEnabled(enabled: boolean): Promise<IpcResult<EmbeddingIndexStatus>>;
     rebuildEmbeddings(): Promise<IpcResult<Job>>;
   };
+  localIntelligence: {
+    status(): Promise<IpcResult<LocalProcessorStatus>>;
+    choosePath(kind: LocalProcessorPathKind): Promise<IpcResult<LocalProcessorStatus | null>>;
+    updateSettings(settings: MediaProcessingSettings): Promise<IpcResult<LocalProcessorStatus>>;
+    probe(): Promise<IpcResult<LocalProcessorStatus>>;
+    processAsset(assetId: string): Promise<IpcResult<Job>>;
+    processHistorical(): Promise<IpcResult<Job[]>>;
+    getArtifact(artifactId: string): Promise<IpcResult<DerivedArtifactDetail>>;
+  };
   reviews: {
     list(): Promise<IpcResult<ReviewRun[]>>;
     get(id: string): Promise<IpcResult<ReviewRun>>;
@@ -406,6 +428,20 @@ export interface GrudgeVaultApi {
     list(): Promise<IpcResult<ImportRun[]>>;
     get(id: string): Promise<IpcResult<ImportRunDetail>>;
   };
+  importFolder: {
+    status(): Promise<IpcResult<ImportFolderStatus>>;
+    choose(): Promise<IpcResult<ImportFolderStatus | null>>;
+    setEnabled(enabled: boolean): Promise<IpcResult<ImportFolderStatus>>;
+    scanNow(): Promise<IpcResult<ImportFolderStatus>>;
+  };
+  reminders: {
+    list(): Promise<IpcResult<Reminder[]>>;
+    getSettings(): Promise<IpcResult<ReviewAutomationSettings>>;
+    updateSettings(settings: ReviewAutomationSettings): Promise<IpcResult<ReviewAutomationSettings>>;
+    markRead(id: string): Promise<IpcResult<Reminder>>;
+    dismiss(id: string): Promise<IpcResult<Reminder>>;
+    onDue(callback: (reminderId: string, shouldOpen: boolean) => void): () => void;
+  };
   backfill: {
     list(): Promise<IpcResult<BackfillRun[]>>;
     start(input: StartBackfillInput): Promise<IpcResult<BackfillRun>>;
@@ -427,6 +463,7 @@ export interface GrudgeVaultApi {
   jobs: {
     list(): Promise<IpcResult<Job[]>>;
     retry(jobId: string): Promise<IpcResult<Job>>;
+    cancel(jobId: string): Promise<IpcResult<Job>>;
     onChanged(callback: () => void): () => void;
   };
 }

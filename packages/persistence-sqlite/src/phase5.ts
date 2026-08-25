@@ -26,7 +26,8 @@ function artifactFromRow(row: Record<string, unknown>): DerivedArtifact {
     id: String(row.id), sourceAssetId: String(row.source_asset_id), kind: row.kind as DerivedArtifact["kind"],
     sha256: String(row.sha256), byteSize: Number(row.byte_size), mimeType: String(row.mime_type),
     processorIdentity: String(row.processor_identity), processorVersion: Number(row.processor_version),
-    inputHash: String(row.input_hash), createdAt: String(row.created_at)
+    configHash: String(row.config_hash ?? row.input_hash), inputHash: String(row.input_hash),
+    current: Boolean(row.is_current), createdAt: String(row.created_at)
   };
 }
 
@@ -168,15 +169,19 @@ export class SqlitePhaseFiveRepository implements PhaseFiveRepositoryPort {
 
   listDerivedArtifacts(assetId?: string): DerivedArtifact[] {
     const rows = assetId
-      ? this.database.prepare("SELECT * FROM derived_artifacts WHERE source_asset_id = ? ORDER BY created_at DESC").all(assetId)
-      : this.database.prepare("SELECT * FROM derived_artifacts ORDER BY created_at DESC").all();
+      ? this.database.prepare(`SELECT da.*, EXISTS(
+          SELECT 1 FROM current_derived_artifacts current WHERE current.artifact_id = da.id
+        ) AS is_current FROM derived_artifacts da WHERE da.source_asset_id = ? ORDER BY da.created_at DESC`).all(assetId)
+      : this.database.prepare(`SELECT da.*, EXISTS(
+          SELECT 1 FROM current_derived_artifacts current WHERE current.artifact_id = da.id
+        ) AS is_current FROM derived_artifacts da ORDER BY da.created_at DESC`).all();
     return (rows as Record<string, unknown>[]).map(artifactFromRow);
   }
 
   saveDerivedArtifact(artifact: DerivedArtifact): DerivedArtifact {
     this.database.prepare(`INSERT INTO derived_artifacts(
-      id,source_asset_id,kind,sha256,byte_size,mime_type,processor_identity,processor_version,input_hash,created_at
-    ) VALUES (@id,@sourceAssetId,@kind,@sha256,@byteSize,@mimeType,@processorIdentity,@processorVersion,@inputHash,@createdAt)`)
+      id,source_asset_id,kind,sha256,byte_size,mime_type,processor_identity,processor_version,config_hash,input_hash,created_at
+    ) VALUES (@id,@sourceAssetId,@kind,@sha256,@byteSize,@mimeType,@processorIdentity,@processorVersion,@configHash,@inputHash,@createdAt)`)
       .run(artifact);
     return artifact;
   }

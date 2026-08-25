@@ -21,6 +21,7 @@
       "@grudge-vault/object-vault": ["packages/object-vault/src/index.ts"]
       ,"@grudge-vault/importer-dayone": ["packages/importer-dayone/src/index.ts"]
       ,"@grudge-vault/agent-harness": ["packages/agent-harness/src/index.ts"]
+      ,"@grudge-vault/media-pipeline": ["packages/media-pipeline/src/index.ts"]
     }
   }
 }

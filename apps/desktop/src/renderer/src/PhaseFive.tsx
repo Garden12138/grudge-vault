@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import type {
-  Asset, Case, CaseBinderPreview, CaseDetail, EvidenceDetail, Event, IntegrityScan, Person,
+  Asset, Case, CaseBinderPreview, CaseDetail, DerivedArtifactDetail, EvidenceDetail, Event, IntegrityScan, Person,
   WorkspaceCryptoStatus, WorkspaceSecuritySettings
 } from "@grudge-vault/domain";
 import type { CaseWriteFields } from "@grudge-vault/shared";
@@ -19,6 +19,7 @@ export function EvidencePanel({ language, onError, onNotice }: CommonProps) {
   const [selected, setSelected] = useState<EvidenceDetail>();
   const [scans, setScans] = useState<IntegrityScan[]>([]);
   const [replacementId, setReplacementId] = useState("");
+  const [derivedPreview, setDerivedPreview] = useState<DerivedArtifactDetail>();
 
   const refresh = useCallback(async () => {
     const [items, scanItems] = await Promise.all([window.grudgeVault.evidence.list(), window.grudgeVault.evidence.listScans()]);
@@ -32,6 +33,7 @@ export function EvidencePanel({ language, onError, onNotice }: CommonProps) {
 
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => window.grudgeVault.jobs.onChanged(() => void refresh()), [refresh]);
+  useEffect(() => { setDerivedPreview(undefined); }, [selected?.asset.id]);
 
   const startScan = async () => {
     const result = await window.grudgeVault.evidence.startScan();
@@ -64,6 +66,20 @@ export function EvidencePanel({ language, onError, onNotice }: CommonProps) {
     await refresh();
   };
 
+  const processMedia = async () => {
+    if (!selected) return;
+    const result = await window.grudgeVault.localIntelligence.processAsset(selected.asset.id);
+    if (!result.ok) return onError(result.error.message);
+    onNotice(copy(language, "本地媒体处理已排队。", "Local media processing queued."));
+    await refresh();
+  };
+
+  const previewDerived = async (id: string) => {
+    const result = await window.grudgeVault.localIntelligence.getArtifact(id);
+    if (!result.ok) return onError(result.error.message);
+    setDerivedPreview(result.data);
+  };
+
   return <div className="phase-five-grid evidence-view">
     <aside className="panel phase-five-index">
       <div className="section-heading"><div><p className="eyebrow">EVIDENCE VAULT</p><h2>{copy(language, "证据原件", "Evidence")}</h2></div>
@@ -79,7 +95,8 @@ export function EvidencePanel({ language, onError, onNotice }: CommonProps) {
     </aside>
     <section className="panel phase-five-detail">{!selected ? <div className="empty">{copy(language, "尚无证据原件。", "No evidence originals yet.")}</div> : <>
       <div className="section-heading"><div><p className="eyebrow">ORIGINAL · {selected.availabilityStatus}</p><h2>{selected.asset.originalFileName}</h2></div>
-        <div className="row-actions permanent"><button onClick={() => void window.grudgeVault.assets.exportCopy(selected.asset.id)}>{copy(language, "导出副本", "Export copy")}</button>
+        <div className="row-actions permanent"><button onClick={() => void processMedia()}>{copy(language, "处理 / 重新处理", "Process / reprocess")}</button>
+          <button onClick={() => void window.grudgeVault.assets.exportCopy(selected.asset.id)}>{copy(language, "导出副本", "Export copy")}</button>
           {selected.availabilityStatus !== "deleted" && <button onClick={() => void deleteOriginal()}>{copy(language, "删除原件", "Delete original")}</button>}</div></div>
       <div className="evidence-metadata"><div><span>SHA-256</span><code>{selected.asset.sha256}</code></div>
         <div><span>{copy(language, "可用性", "Availability")}</span><strong>{selected.availabilityStatus}</strong></div>
@@ -97,7 +114,13 @@ export function EvidencePanel({ language, onError, onNotice }: CommonProps) {
         <article key={`${eventId}:${statement.id}`}><div><strong>{statement.kind}</strong><span>{statement.text}</span></div></article>)}</div></section>
       <section className="subsection"><h3>{copy(language, "派生物（非原件）", "Derived artifacts (not originals)")}</h3>
         {selected.derivedArtifacts.length === 0 ? <p className="muted">{copy(language, "暂无派生物。", "No derived artifacts.")}</p> : <div className="mini-list">{selected.derivedArtifacts.map((item) =>
-          <article key={item.id}><div><strong>{item.kind}</strong><span>{item.processorIdentity} v{item.processorVersion} · {item.sha256}</span></div></article>)}</div>}</section>
+          <article key={item.id}><div><strong>{item.kind} · {item.current ? "current" : "history"}</strong><span>{item.processorIdentity} v{item.processorVersion} · {item.sha256}</span></div>
+            <button onClick={() => void previewDerived(item.id)}>{copy(language, "预览", "Preview")}</button></article>)}</div>}
+        {derivedPreview && <div className="source-card"><div className="section-heading"><div><p className="eyebrow">{derivedPreview.payload.kind} · v{derivedPreview.payload.formatVersion}</p>
+          <h3>{copy(language, "派生文本预览", "Derived text preview")}</h3></div><button onClick={() => setDerivedPreview(undefined)}>×</button></div>
+          <pre>{derivedPreview.payload.text}</pre>{derivedPreview.payload.kind === "ocr"
+            ? <p className="muted">{derivedPreview.payload.pages.length} pages · {derivedPreview.payload.language}</p>
+            : <p className="muted">{derivedPreview.payload.segments.length} segments · {derivedPreview.payload.language}</p>}</div>}</section>
     </>}</section>
   </div>;
 }

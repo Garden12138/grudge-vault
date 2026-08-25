@@ -23,7 +23,7 @@ import {
   MAX_AGENT_MODEL_ROUNDS,
   OpenAiCompatibleChatAdapter,
   createDefaultAgentToolRegistry,
-  exportAgentToolSchemasV2,
+  exportAgentToolSchemasV3,
   redactExternalText,
   routeAgentIntent,
   type AgentModelAdapterPort
@@ -77,11 +77,11 @@ describe("Phase 4 Agent Harness", () => {
 
   it("exports versioned schemas and rejects unknown, unauthorized, and invalid tool calls", () => {
     const registry = createDefaultAgentToolRegistry();
-    expect(AGENT_TOOL_SCHEMA_VERSION).toBe(2);
+    expect(AGENT_TOOL_SCHEMA_VERSION).toBe(3);
     expect(registry.definitions("record").every(({ version, jsonSchema }) =>
-      version === 2 && jsonSchema.type === "object")).toBe(true);
-    expect(exportAgentToolSchemasV2("strategy").every(({ version, schema }) =>
-      version === 2 && schema.type === "object")).toBe(true);
+      version === 3 && jsonSchema.type === "object")).toBe(true);
+    expect(exportAgentToolSchemasV3("strategy").every(({ version, schema }) =>
+      version === 3 && schema.type === "object")).toBe(true);
     expect(registry.definitions("evidence").map(({ name }) => name)).toEqual(expect.arrayContaining([
       "get_evidence", "get_case", "build_case_timeline", "list_case_gaps", "prepare_case_bundle"
     ]));
