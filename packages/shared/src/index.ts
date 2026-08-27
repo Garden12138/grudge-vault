@@ -164,13 +164,13 @@ export interface UpdateEventInput extends EventWriteFields {
 export interface SendMessageInput {
   conversationId: string;
   content: string;
-  createDraft: boolean;
+  intent: "record" | "source";
 }
 
 export interface SendMessageResult {
   message: Message;
-  draft?: Event;
-  draftError?: SerializedAppError;
+  event?: Event;
+  eventError?: SerializedAppError;
 }
 
 export interface ClarificationAnswerInput {
@@ -308,6 +308,7 @@ export interface GrudgeVaultApi {
     recover(input: RecoveryImportInput): Promise<IpcResult<Workspace | null>>;
     rotateKey(): Promise<IpcResult<WorkspaceCryptoStatus>>;
     cryptoStatus(): Promise<IpcResult<WorkspaceCryptoStatus>>;
+    reveal(): Promise<IpcResult<boolean>>;
     onLocked(callback: () => void): () => void;
   };
   conversations: {

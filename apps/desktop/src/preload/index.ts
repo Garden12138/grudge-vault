@@ -18,6 +18,7 @@ const api: GrudgeVaultApi = {
     recover: (input) => invoke("workspace:recover", input),
     rotateKey: () => invoke("workspace:rotate-key"),
     cryptoStatus: () => invoke("workspace:crypto-status"),
+    reveal: () => invoke("workspace:reveal"),
     onLocked: (callback) => {
       const listener = () => callback();
       ipcRenderer.on("workspace:locked", listener);

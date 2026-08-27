@@ -188,7 +188,7 @@ describe("Phase 4 Agent Harness", () => {
     const approved = harness.approveAction(result.run.actions[0]!.id);
     expect(approved.status).toBe("approved");
     const event = context.application.getEvent(approved.resultRefs[0]!).event;
-    expect(event.status).toBe("candidate");
+    expect(event.status).toBe("confirmed");
     expect(event.sourceRefs).toContain(result.userMessage.sourceItemId);
     expect(context.application.listEventRevisions(event.id)[0]?.actor).toBe("agent");
     expect(context.application.listMessages(conversation.id)[0]?.content).toContain("报告遗漏");
@@ -203,9 +203,9 @@ describe("Phase 4 Agent Harness", () => {
     databases.push(context.database);
     const conversation = context.application.createConversation("Revision guard");
     const recorded = await context.application.sendMessage({
-      conversationId: conversation.id, content: "A report omitted my name", createDraft: true
+      conversationId: conversation.id, content: "A report omitted my name", intent: "record"
     });
-    const confirmed = context.application.confirmEvent(recorded.draft!.id, recorded.draft!.currentRevision);
+    const confirmed = recorded.event!;
     const adapter: AgentModelAdapterPort = {
       identity: "fake.writer", version: 1,
       async run(input) {
@@ -268,9 +268,8 @@ describe("Phase 4 Agent Harness", () => {
     context.application.createPerson("Alex");
     const recorded = await context.application.sendMessage({
       conversationId: conversation.id,
-      content: "Alex omitted my name; mail alex@example.com; see /Users/me/private/report.pdf.", createDraft: true
+      content: "Alex omitted my name; mail alex@example.com; see /Users/me/private/report.pdf.", intent: "record"
     });
-    context.application.confirmEvent(recorded.draft!.id, recorded.draft!.currentRevision);
     let modelContext = "";
     const adapter: AgentModelAdapterPort = {
       identity: "fake.enhanced", version: 1,
@@ -306,7 +305,7 @@ describe("Phase 4 Agent Harness", () => {
     expect(storedCredential).not.toContain("top-secret-key");
     expect(JSON.stringify(context.application.getAgentSettings())).not.toContain("top-secret-key");
 
-    const current = context.application.getEvent(recorded.draft!.id).event;
+    const current = context.application.getEvent(recorded.event!.id).event;
     context.session.assets.upsert({
       id: "asset-1", sha256: "a".repeat(64), byteSize: 4, mimeType: "text/plain",
       originalFileName: "secret.txt", vaultFormat: 1, integrityStatus: "verified", availabilityStatus: "available",
@@ -331,17 +330,16 @@ describe("Phase 4 Agent Harness", () => {
     databases.push(context.database);
     const conversation = context.application.createConversation("Clarify");
     const recorded = await context.application.sendMessage({
-      conversationId: conversation.id, content: "Someone omitted my name from the report", createDraft: true
+      conversationId: conversation.id, content: "Someone omitted my name from the report", intent: "record"
     });
-    context.application.confirmEvent(recorded.draft!.id, recorded.draft!.currentRevision);
     const harness = new AgentHarness(context.application);
     const review = await harness.send({ conversationId: conversation.id, content: "请回顾并列出待补全问题" });
     expect(review.run.analysis?.suggestedQuestions).toHaveLength(1);
     const answer = await harness.send({ conversationId: conversation.id, content: "大约在 2026 年 8 月" });
     expect(answer.run.intent).toBe("clarify");
     expect(answer.run.actions[0]?.status).toBe("approved");
-    expect(context.application.listClarifications(recorded.draft!.id)[0]?.status).toBe("answered");
-    expect(context.application.listEventRevisions(recorded.draft!.id)[0]?.actor).toBe("agent");
+    expect(context.application.listClarifications(recorded.event!.id)[0]?.status).toBe("answered");
+    expect(context.application.listEventRevisions(recorded.event!.id)[0]?.actor).toBe("agent");
   });
 
   it("rejects guessed object ids from model tools and returns a deterministic fallback", async () => {

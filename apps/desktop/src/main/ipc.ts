@@ -1,4 +1,4 @@
-import { dialog, ipcMain, type BrowserWindow, type IpcMainInvokeEvent } from "electron";
+import { dialog, ipcMain, shell, type BrowserWindow, type IpcMainInvokeEvent } from "electron";
 import { z, ZodError, type ZodType } from "zod";
 import type { GrudgeVaultApplication, JobRunner, WorkspaceManagerPort } from "@grudge-vault/application";
 import type { AgentHarness } from "@grudge-vault/agent-harness";
@@ -211,6 +211,12 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
 
   add("workspace:current", emptySchema, () => dependencies.application.getCurrentWorkspace());
   add("workspace:status", emptySchema, () => dependencies.application.getWorkspaceStatus());
+  add("workspace:reveal", emptySchema, () => {
+    const workspace = dependencies.application.getCurrentWorkspace();
+    if (!workspace) throw new AppError("NO_ACTIVE_WORKSPACE", "Open a workspace before revealing its location.");
+    shell.showItemInFolder(workspace.rootPath);
+    return true;
+  });
   add("workspace:create", titleSchema, async (name) => {
     const selection = await dialog.showOpenDialog(dependencies.window, {
       title: "Choose an empty folder for the workspace", properties: ["openDirectory", "createDirectory"]
@@ -273,7 +279,7 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   add("conversations:delete", idSchema, (id) => dependencies.application.deleteConversation(id));
   add("conversations:messages", idSchema, (id) => dependencies.application.listMessages(id));
   add("conversations:send", z.object({
-    conversationId: idSchema, content: z.string().trim().min(1).max(100_000), createDraft: z.boolean()
+    conversationId: idSchema, content: z.string().trim().min(1).max(100_000), intent: z.enum(["record", "source"])
   }), (input) => dependencies.application.sendMessage(input as SendMessageInput));
 
   add("agent:send", z.object({

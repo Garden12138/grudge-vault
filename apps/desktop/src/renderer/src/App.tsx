@@ -9,8 +9,15 @@ import type {
 import type { EventWriteFields, IpcResult } from "@grudge-vault/shared";
 import { detectLanguage, translator, type Language } from "./i18n";
 import { CasesPanel, EvidencePanel, WorkspaceSecurityPanel } from "./PhaseFive";
+import { MaterialsPage, MemoryPage, RecordPage, ReviewPage, SettingsPage } from "./ProductPages";
 
 type View = "chat" | "events" | "search" | "timeline" | "people" | "review" | "backfill" | "vault" | "evidence" | "cases" | "settings";
+type SettingsSection = "general" | "data" | "intelligence" | "advanced";
+
+interface FactInput { id: string; kind: Extract<StatementKind, "fact.confirmed" | "fact.disputed" | "fact.unknown">; text: string }
+interface TextInput { id: string; text: string }
+interface EmotionInput { id: string; label: string; intensity?: 1 | 2 | 3 | 4 | 5 }
+interface InterestInput { id: string; label: string; description: string }
 
 interface EventForm {
   title: string;
@@ -19,10 +26,10 @@ interface EventForm {
   temporalValue: string;
   temporalEnd: string;
   narrative: string;
-  facts: string;
-  interpretations: string;
-  emotions: string;
-  interests: string;
+  facts: FactInput[];
+  interpretations: TextInput[];
+  emotions: EmotionInput[];
+  interests: InterestInput[];
   personIds: string[];
 }
 
@@ -35,7 +42,7 @@ interface PreviewState {
 
 const EMPTY_FORM: EventForm = {
   title: "", status: "candidate", temporalKind: "unknown", temporalValue: "", temporalEnd: "",
-  narrative: "", facts: "", interpretations: "", emotions: "", interests: "", personIds: []
+  narrative: "", facts: [], interpretations: [], emotions: [], interests: [], personIds: []
 };
 
 function formatBytes(bytes: number): string {
@@ -59,6 +66,24 @@ function formatJournalTimestamp(value: string, language: Language, timeZone?: st
   }
 }
 
+function productError(language: Language, message: string): string {
+  const normalized = message.toLowerCase();
+  if (normalized.includes("changed") || normalized.includes("revision") || normalized.includes("stale")) {
+    return language === "zh-CN" ? "内容刚刚有更新，请核对后再试。" : "This content was just updated. Review it and try again.";
+  }
+  if (normalized.includes("locked") || normalized.includes("keychain") || normalized.includes("key store")) {
+    return language === "zh-CN" ? "账本已锁定，请先解锁。" : "Your journal is locked. Unlock it first.";
+  }
+  if (normalized.includes("not found") || normalized.includes("missing")) {
+    return language === "zh-CN" ? "没有找到需要的内容，它可能已被移动或删除。" : "That content could not be found. It may have been moved or deleted.";
+  }
+  if (normalized.includes("required") || normalized.includes("invalid")) {
+    return language === "zh-CN" ? "请检查填写的内容后再试。" : "Check the information you entered and try again.";
+  }
+  if (normalized.includes("cancel")) return language === "zh-CN" ? "操作已取消。" : "The action was cancelled.";
+  return language === "zh-CN" ? "操作没有完成，请重试。" : "The action did not finish. Please try again.";
+}
+
 function eventToForm(event: Event): EventForm {
   const temporal = event.occurredAt;
   let temporalValue = "";
@@ -70,16 +95,13 @@ function eventToForm(event: Event): EventForm {
     temporalValue = temporal.from ?? "";
     temporalEnd = temporal.to ?? "";
   }
-  const facts = event.facts.map(({ kind, text }) => {
-    const prefix = kind === "fact.disputed" ? "[disputed] " : kind === "fact.unknown" ? "[unknown] " : "[confirmed] ";
-    return `${prefix}${text}`;
-  }).join("\n");
   return {
     title: event.title, status: event.status, temporalKind: temporal.kind,
-    temporalValue, temporalEnd, narrative: event.narrative ?? "", facts,
-    interpretations: event.interpretations.map(({ text }) => text).join("\n"),
-    emotions: event.emotions.map(({ label, intensity }) => `${label}${intensity ? `|${intensity}` : ""}`).join("\n"),
-    interests: event.interests.map(({ label, description }) => `${label}${description ? `|${description}` : ""}`).join("\n"),
+    temporalValue, temporalEnd, narrative: event.narrative ?? "",
+    facts: event.facts.map(({ id, kind, text }) => ({ id, kind: kind as FactInput["kind"], text })),
+    interpretations: event.interpretations.map(({ id, text }) => ({ id, text })),
+    emotions: event.emotions.map(({ id, label, intensity }) => ({ id, label, ...(intensity ? { intensity } : {}) })),
+    interests: event.interests.map(({ id, label, description }) => ({ id, label, description: description ?? "" })),
     personIds: event.participants.map(({ personId }) => personId)
   };
 }
@@ -98,42 +120,21 @@ function temporalFromForm(form: EventForm): TemporalValue {
   return { kind: "unknown" };
 }
 
-function nonEmptyLines(value: string): string[] {
-  return value.split("\n").map((line) => line.trim()).filter(Boolean);
-}
-
 function formFields(form: EventForm, current?: Event): EventWriteFields {
   const sourceRefs = current?.sourceRefs ?? [];
-  const facts = nonEmptyLines(form.facts).map((line) => {
-    let kind: StatementKind = "fact.confirmed";
-    let text = line;
-    if (/^\[disputed\]/i.test(line)) { kind = "fact.disputed"; text = line.replace(/^\[disputed\]\s*/i, ""); }
-    else if (/^\[unknown\]/i.test(line)) { kind = "fact.unknown"; text = line.replace(/^\[unknown\]\s*/i, ""); }
-    else text = line.replace(/^\[confirmed\]\s*/i, "");
-    return { id: window.crypto.randomUUID(), kind, text, sourceRefs };
-  });
   return {
     title: form.title.trim(), status: form.status, occurredAt: temporalFromForm(form),
-    ...(form.narrative.trim() ? { narrative: form.narrative.trim() } : {}), facts,
-    interpretations: nonEmptyLines(form.interpretations).map((text) => ({
-      id: window.crypto.randomUUID(), kind: "interpretation.user" as const, text, sourceRefs
+    ...(form.narrative.trim() ? { narrative: form.narrative.trim() } : {}),
+    facts: form.facts.filter(({ text }) => text.trim()).map(({ id, kind, text }) => ({ id, kind, text: text.trim(), sourceRefs })),
+    interpretations: form.interpretations.filter(({ text }) => text.trim()).map(({ id, text }) => ({
+      id, kind: "interpretation.user" as const, text: text.trim(), sourceRefs
     })),
-    emotions: nonEmptyLines(form.emotions).map((line) => {
-      const [label = "", rawIntensity] = line.split("|", 2);
-      const numeric = Number(rawIntensity);
-      const emotion = { id: window.crypto.randomUUID(), label: label.trim(), sourceRefs };
-      if (Number.isInteger(numeric) && numeric >= 1 && numeric <= 5) {
-        return { ...emotion, intensity: numeric as 1 | 2 | 3 | 4 | 5 };
-      }
-      return emotion;
-    }),
-    interests: nonEmptyLines(form.interests).map((line) => {
-      const [label = "", description] = line.split("|", 2);
-      return {
-        id: window.crypto.randomUUID(), label: label.trim(), sourceRefs,
-        ...(description?.trim() ? { description: description.trim() } : {})
-      };
-    }),
+    emotions: form.emotions.filter(({ label }) => label.trim()).map(({ id, label, intensity }) => ({
+      id, label: label.trim(), ...(intensity ? { intensity } : {}), sourceRefs
+    })),
+    interests: form.interests.filter(({ label }) => label.trim()).map(({ id, label, description }) => ({
+      id, label: label.trim(), ...(description.trim() ? { description: description.trim() } : {}), sourceRefs
+    })),
     participants: form.personIds.map((personId) => ({ personId })),
     sourceRefs, assetRefs: current?.assetRefs ?? []
   };
@@ -147,17 +148,24 @@ export function App() {
   const [recoveryPassphrase, setRecoveryPassphrase] = useState("");
   const [workspaceName, setWorkspaceName] = useState(language === "zh-CN" ? "我的记仇账本" : "My Grudge Vault");
   const [view, setView] = useState<View>("chat");
-  const [error, setError] = useState<string>();
+  const [error, setErrorState] = useState<string>();
+  const [diagnosticError, setDiagnosticError] = useState<string>();
   const [notice, setNotice] = useState<string>();
   const [busy, setBusy] = useState(false);
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
+  const [showTopics, setShowTopics] = useState(false);
+  const setError = useCallback((message?: string) => {
+    setDiagnosticError(message);
+    setErrorState(message ? productError(language, message) : undefined);
+  }, [language]);
 
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [selectedConversationId, setSelectedConversationId] = useState<string>();
   const [messages, setMessages] = useState<Message[]>([]);
   const [newConversationTitle, setNewConversationTitle] = useState("");
   const [messageText, setMessageText] = useState("");
-  const [composerMode, setComposerMode] = useState<"agent" | "quick" | "source">("agent");
-  const [lastDraft, setLastDraft] = useState<Event>();
+  const [composerMode, setComposerMode] = useState<"agent" | "record" | "source">("record");
+  const [lastEvent, setLastEvent] = useState<Event>();
   const [agentRuns, setAgentRuns] = useState<AgentRun[]>([]);
   const [pendingAgentRun, setPendingAgentRun] = useState<AgentRun>();
   const [agentSettings, setAgentSettings] = useState<AgentModelSettings>();
@@ -236,7 +244,7 @@ export function App() {
     });
     if (result.ok) setEvents(result.data);
     else setError(result.error.message);
-  }, [queryFrom, queryPerson, queryStatus, queryText, queryTo]);
+  }, [queryFrom, queryPerson, queryStatus, queryText, queryTo, setError]);
 
   const refreshLists = useCallback(async () => {
     const [conversationResult, eventResult, peopleResult, assetResult, jobResult, importResult, backfillResult, candidateResult,
@@ -251,9 +259,15 @@ export function App() {
       window.grudgeVault.reminders.list(), window.grudgeVault.reminders.getSettings()
     ]);
     if (conversationResult.ok) {
-      setConversations(conversationResult.data);
-      setSelectedConversationId((current) => current && conversationResult.data.some(({ id }) => id === current)
-        ? current : conversationResult.data[0]?.id);
+      let availableConversations = conversationResult.data;
+      if (availableConversations.length === 0) {
+        const created = await window.grudgeVault.conversations.create(language === "zh-CN" ? "日常记录" : "Daily notes");
+        if (created.ok) availableConversations = [created.data];
+        else setError(created.error.message);
+      }
+      setConversations(availableConversations);
+      setSelectedConversationId((current) => current && availableConversations.some(({ id }) => id === current)
+        ? current : availableConversations[0]?.id);
     } else setError(conversationResult.error.message);
     if (eventResult.ok) setEvents(eventResult.data); else setError(eventResult.error.message);
     if (peopleResult.ok) setPeople(peopleResult.data); else setError(peopleResult.error.message);
@@ -287,7 +301,7 @@ export function App() {
     if (importFolderResult.ok) setImportFolderStatus(importFolderResult.data); else setError(importFolderResult.error.message);
     if (reminderResult.ok) setReminders(reminderResult.data); else setError(reminderResult.error.message);
     if (reviewAutomationResult.ok) setReviewAutomation(reviewAutomationResult.data); else setError(reviewAutomationResult.error.message);
-  }, []);
+  }, [language, setError]);
 
   const refresh = useCallback(async () => {
     const status = await window.grudgeVault.workspace.status();
@@ -302,7 +316,7 @@ export function App() {
     setWorkspace(current.data);
     if (!current.data) return;
     await refreshLists();
-  }, [refreshLists]);
+  }, [refreshLists, setError]);
 
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => { document.documentElement.lang = language; }, [language]);
@@ -319,7 +333,7 @@ export function App() {
       if (readResult.ok) setReminders((items) => items.map((item) => item.id === readResult.data.id ? readResult.data : item));
       if (reminder.reviewId && reviewResult.ok) setSelectedReview(reviewResult.data.find(({ id }) => id === reminder.reviewId));
     });
-  }), [refreshLists]);
+  }), [refreshLists, setError]);
   useEffect(() => {
     if (!selectedConversationId) { setMessages([]); setAgentRuns([]); setPendingAgentRun(undefined); return; }
     void Promise.all([
@@ -332,13 +346,13 @@ export function App() {
         setPendingAgentRun(runResult.data.find(({ status }) => status === "awaiting_consent"));
       } else setError(runResult.error.message);
     });
-  }, [selectedConversationId]);
+  }, [selectedConversationId, setError]);
   useEffect(() => {
     if (!selectedImportId) return setImportDetail(undefined);
     void window.grudgeVault.imports.get(selectedImportId).then((result) => {
       if (result.ok) setImportDetail(result.data); else setError(result.error.message);
     });
-  }, [selectedImportId, importRuns]);
+  }, [selectedImportId, importRuns, setError]);
   useEffect(() => () => { if (preview?.url) URL.revokeObjectURL(preview.url); }, [preview]);
   const clearSensitiveRendererState = useCallback(() => {
     if (preview?.url) URL.revokeObjectURL(preview.url);
@@ -399,7 +413,7 @@ export function App() {
 
   const sendMessage = async () => {
     if (!selectedConversationId || !messageText.trim()) return;
-    setBusy(true); setError(undefined); setLastDraft(undefined);
+    setBusy(true); setError(undefined); setLastEvent(undefined);
     if (composerMode === "agent") {
       const result = await window.grudgeVault.agent.send({ conversationId: selectedConversationId, content: messageText });
       setBusy(false);
@@ -411,14 +425,16 @@ export function App() {
       return;
     }
     const result = await window.grudgeVault.conversations.send({
-      conversationId: selectedConversationId, content: messageText, createDraft: composerMode === "quick"
+      conversationId: selectedConversationId, content: messageText, intent: composerMode === "record" ? "record" : "source"
     });
     setBusy(false);
     if (!result.ok) return setError(result.error.message);
     setMessageText("");
     setMessages((current) => [...current, result.data.message]);
-    if (result.data.draft) setLastDraft(result.data.draft);
-    if (result.data.draftError) setNotice(t("draftFailed"));
+    if (result.data.event) setLastEvent(result.data.event);
+    if (result.data.eventError || (composerMode === "record" && !result.data.event)) {
+      setNotice(language === "zh-CN" ? "内容已保存，但暂未整理成记录。" : "The text was saved but could not be organized into a record yet.");
+    } else if (composerMode === "record") setNotice(language === "zh-CN" ? "已记下来。" : "Saved to your memory.");
     await refreshLists();
   };
 
@@ -477,7 +493,7 @@ export function App() {
 
   const createManualEvent = async () => {
     const result = await window.grudgeVault.events.create({
-      title: language === "zh-CN" ? "新事件" : "New event", status: "candidate",
+      title: language === "zh-CN" ? "新记录" : "New record", status: "confirmed",
       occurredAt: { kind: "unknown" }, facts: [], interpretations: [], emotions: [], interests: [],
       participants: [], sourceRefs: [], assetRefs: [], reason: "Manual event created"
     });
@@ -691,19 +707,12 @@ export function App() {
     await refreshLists();
   };
 
-  const editPerson = async (person: Person) => {
-    const displayName = window.prompt(t("personName"), person.displayName);
-    if (!displayName?.trim()) return;
-    const notes = window.prompt(t("personNotes"), person.notes ?? "") ?? person.notes;
-    const result = await window.grudgeVault.people.update({
-      id: person.id, displayName, ...(notes === undefined ? {} : { notes })
-    });
-    if (!result.ok) setError(result.error.message); else await refreshLists();
-  };
-
   const runUnifiedSearch = async () => {
     const result = await window.grudgeVault.search.query({ text: unifiedQuery, semantic: semanticSearch, limit: 50 });
-    if (!result.ok) setError(result.error.message); else setUnifiedHits(result.data);
+    if (!result.ok) setError(result.error.message); else {
+      setUnifiedHits(result.data);
+      setView("search");
+    }
   };
 
   const toggleSemanticSearch = async (enabled: boolean) => {
@@ -871,8 +880,8 @@ export function App() {
     return <main className="landing locked-landing"><section className="landing-card">
       <div className="language-pills"><button className={language === "zh-CN" ? "active" : ""} onClick={() => setAppLanguage("zh-CN")}>中文</button>
         <button className={language === "en" ? "active" : ""} onClick={() => setAppLanguage("en")}>EN</button></div>
-      <p className="eyebrow">WORKSPACE LOCKED</p><h1>{language === "zh-CN" ? "工作区已锁定" : "Workspace locked"}</h1>
-      <p className="lede">{language === "zh-CN" ? "实体正文、预览和本地路径已从界面清除。使用系统钥匙串解锁。" : "Entity content, previews, and local paths have been cleared. Unlock with the OS key store."}</p>
+      <h1>{language === "zh-CN" ? "账本已锁定" : "Journal locked"}</h1>
+      <p className="lede">{language === "zh-CN" ? "为保护你的记录，请使用这台设备的安全凭证解锁。" : "To protect your records, unlock with this device's secure credentials."}</p>
       {error && <div className="error-banner" role="alert">{error}</div>}
       <div className="landing-actions"><button className="primary" disabled={busy} onClick={() => void unlock()}>{language === "zh-CN" ? "使用系统钥匙串解锁" : "Unlock with OS key store"}</button></div>
       <details className="recovery-unlock"><summary>{language === "zh-CN" ? "钥匙串不可用？重新绑定恢复包" : "Key store unavailable? Rebind a recovery package"}</summary>
@@ -905,52 +914,60 @@ export function App() {
 
   return <main className="app-shell">
     <aside className="app-sidebar">
-      <div className="brand"><p className="eyebrow">GRUDGE VAULT</p><h1>{t("appName")}</h1></div>
-      <nav>
-        {(["chat", "events", "search", "timeline", "people", "review", "backfill", "vault", "evidence", "cases", "settings"] as View[]).map((item) =>
-          <button key={item} className={view === item ? "active" : ""} onClick={() => {
-            setView(item);
-            if (item === "timeline") void loadTimeline();
-            if (item === "people") {
-              void loadMergeSuggestions();
-              if (!selectedPerson && personIdentities[0]) void openPerson(personIdentities[0].canonicalPerson.id);
-            }
-          }}>{t(item)}</button>)}
+      <div className="brand"><h1>{t("appName")}</h1></div>
+      <nav aria-label={language === "zh-CN" ? "主要功能" : "Main navigation"}>
+        <button className={view === "chat" ? "active" : ""} onClick={() => setView("chat")}>{language === "zh-CN" ? "记录" : "Record"}</button>
+        <button className={["events", "search", "timeline", "people"].includes(view) ? "active" : ""} onClick={() => setView("events")}>{language === "zh-CN" ? "记忆" : "Memory"}</button>
+        <button className={view === "review" ? "active" : ""} onClick={() => setView("review")}>{language === "zh-CN" ? "回顾" : "Review"}</button>
+        <button className={["vault", "evidence", "cases"].includes(view) ? "active" : ""} onClick={() => setView("vault")}>{language === "zh-CN" ? "材料" : "Materials"}</button>
+        <button className={["settings", "backfill"].includes(view) ? "active" : ""} onClick={() => { setSettingsSection("general"); setView("settings"); }}>{language === "zh-CN" ? "设置" : "Settings"}</button>
       </nav>
-      <div className="workspace-card"><strong>{workspace.name}</strong><span>{workspace.rootPath}</span><em>{t("encryptedLocally")}</em></div>
+      <div className="workspace-card"><strong>{workspace.name}</strong><em>{language === "zh-CN" ? "数据保存在本机" : "Data stays on this device"}</em></div>
     </aside>
     <section className="workspace-view">
+      <header className="workspace-topbar"><form className="global-search" onSubmit={(event) => { event.preventDefault(); void runUnifiedSearch(); }}>
+        <input aria-label={language === "zh-CN" ? "搜索记忆" : "Search memory"} placeholder={language === "zh-CN" ? "搜索记录、Day One 和材料文字…" : "Search records, Day One, and material text…"}
+          value={unifiedQuery} onChange={(event) => setUnifiedQuery(event.target.value)} />
+        <button type="submit" disabled={!unifiedQuery.trim()}>{language === "zh-CN" ? "搜索" : "Search"}</button>
+      </form></header>
+      {["events", "search", "timeline", "people"].includes(view) && <nav className="section-tabs" aria-label={language === "zh-CN" ? "记忆页面" : "Memory pages"}>
+        <button className={view === "events" ? "active" : ""} onClick={() => setView("events")}>{language === "zh-CN" ? "全部记录" : "All records"}</button>
+        <button className={view === "search" ? "active" : ""} onClick={() => setView("search")}>{language === "zh-CN" ? "搜索结果" : "Search results"}</button>
+        <button className={view === "people" ? "active" : ""} onClick={() => { setView("people"); void loadMergeSuggestions(); if (!selectedPerson && personIdentities[0]) void openPerson(personIdentities[0].canonicalPerson.id); }}>{language === "zh-CN" ? "人物" : "People"}</button>
+        <button className={view === "timeline" ? "active" : ""} onClick={() => { setView("timeline"); void loadTimeline(); }}>{language === "zh-CN" ? "时间线" : "Timeline"}</button>
+      </nav>}
+      {["vault", "evidence", "cases"].includes(view) && <nav className="section-tabs" aria-label={language === "zh-CN" ? "材料页面" : "Material pages"}>
+        <button className={view === "vault" ? "active" : ""} onClick={() => setView("vault")}>{language === "zh-CN" ? "全部材料" : "All materials"}</button>
+        <button className={view === "evidence" ? "active" : ""} onClick={() => setView("evidence")}>{language === "zh-CN" ? "材料详情" : "Material details"}</button>
+        <button className={view === "cases" ? "active" : ""} onClick={() => setView("cases")}>{language === "zh-CN" ? "材料包" : "Material packages"}</button>
+      </nav>}
+      {["settings", "backfill"].includes(view) && <nav className="section-tabs" aria-label={language === "zh-CN" ? "设置页面" : "Settings pages"}>
+        {(["general", "data", "intelligence", "advanced"] as SettingsSection[]).map((section) => <button key={section}
+          className={settingsSection === section ? "active" : ""} onClick={() => { setSettingsSection(section); setView(section === "data" ? "backfill" : "settings"); }}>
+          {language === "zh-CN" ? ({ general: "常规", data: "数据", intelligence: "智能功能", advanced: "高级设置" } as const)[section]
+            : ({ general: "General", data: "Data", intelligence: "Smart features", advanced: "Advanced" } as const)[section]}</button>)}
+      </nav>}
       {(error || notice) && <div className={error ? "error-banner sticky" : "notice-banner sticky"} role="alert">
         <span>{error ?? notice}</span><button onClick={() => { setError(undefined); setNotice(undefined); }}>×</button>
       </div>}
 
-      {view === "chat" && <div className="chat-layout">
-        <aside className="conversation-panel panel">
-          <div className="section-heading"><div><p className="eyebrow">CHAT SOURCES</p><h2>{t("conversations")}</h2></div></div>
-          <div className="inline-create"><input aria-label={t("conversationTitle")} placeholder={t("conversationTitle")}
-            value={newConversationTitle} onChange={(event) => setNewConversationTitle(event.target.value)}
-            onKeyDown={(event) => { if (event.key === "Enter") void createConversationAction(); }} />
-            <button onClick={() => void createConversationAction()}>＋</button></div>
-          <div className="conversation-list">{conversations.map((conversation) =>
-            <article key={conversation.id} className={selectedConversationId === conversation.id ? "selected" : ""}
-              onClick={() => setSelectedConversationId(conversation.id)}>
-              <strong>{conversation.title}</strong><span>{new Date(conversation.updatedAt).toLocaleString(language)}</span>
-              <div className="row-actions">
-                <button onClick={(event) => { event.stopPropagation(); const title = window.prompt(t("conversationTitle"), conversation.title); if (title?.trim()) void window.grudgeVault.conversations.rename(conversation.id, title).then(refreshLists); }}>{t("rename")}</button>
-                <button onClick={(event) => { event.stopPropagation(); if (window.confirm(t("deletedConversationWarning"))) void window.grudgeVault.conversations.delete(conversation.id).then(refreshLists); }}>{t("delete")}</button>
-              </div>
-            </article>)}</div>
-        </aside>
-        <section className="chat-main panel">
+      {view === "chat" && <RecordPage className="record-page">
+        <section className="chat-main record-panel panel">
+          <div className="record-heading"><div><h2>{language === "zh-CN" ? "把这件事记下来" : "Write it down"}</h2>
+            <p>{language === "zh-CN" ? "写下发生了什么，保存后会直接进入你的记忆。" : "Describe what happened. It will go straight into your memory."}</p></div>
+            <button className="topic-toggle" onClick={() => setShowTopics((current) => !current)}>{conversations.find(({ id }) => id === selectedConversationId)?.title ?? (language === "zh-CN" ? "日常记录" : "Daily notes")}⌄</button></div>
+          {showTopics && <div className="topic-menu"><div className="inline-create"><input aria-label={t("conversationTitle")} placeholder={language === "zh-CN" ? "新主题名称" : "New topic name"}
+            value={newConversationTitle} onChange={(event) => setNewConversationTitle(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void createConversationAction(); }} /><button onClick={() => void createConversationAction()}>＋</button></div>
+            <div className="conversation-list">{conversations.map((conversation) => <article key={conversation.id} className={selectedConversationId === conversation.id ? "selected" : ""} onClick={() => { setSelectedConversationId(conversation.id); setShowTopics(false); }}>
+              <strong>{conversation.title}</strong><div className="row-actions"><button onClick={(event) => { event.stopPropagation(); const title = window.prompt(t("conversationTitle"), conversation.title); if (title?.trim()) void window.grudgeVault.conversations.rename(conversation.id, title).then(refreshLists); }}>{t("rename")}</button>
+                <button onClick={(event) => { event.stopPropagation(); if (window.confirm(t("deletedConversationWarning"))) void window.grudgeVault.conversations.delete(conversation.id).then(refreshLists); }}>{t("delete")}</button></div></article>)}</div></div>}
           {!selectedConversationId ? <div className="empty">{t("noConversation")}</div> : <>
-            <div className="message-list">{messages.length === 0 ? <div className="empty">{t("noMessages")}</div> : messages.map((message) => {
+            {messages.length > 0 && <details className="message-history"><summary>{language === "zh-CN" ? `查看这个主题的历史（${messages.length}）` : `View topic history (${messages.length})`}</summary><div className="message-list">{messages.map((message) => {
               const run = agentRunByAssistantMessage.get(message.id);
               return <article className={`message-bubble ${message.role}`} key={message.id}>
                 <p>{message.content ?? t("sourceDeleted")}</p>
                 <span>{new Date(message.createdAt).toLocaleString(language)}</span>
                 {run && <div className="agent-turn">
-                  <div className="agent-run-meta"><em>{run.intent}</em><em className={`status ${run.status}`}>{run.status}</em>
-                    {run.errorCode && <span>{t("agentFallback")}: {run.errorCode}</span>}</div>
                   {run.analysis && <div className="agent-analysis">{[
                     [t("confirmedFacts"), run.analysis.confirmedFacts],
                     [t("unknownFacts"), run.analysis.disputedOrUnknown],
@@ -972,14 +989,14 @@ export function App() {
                     </article>)}</div></section>}
                   {(run.analysis.actionPlan ?? []).length > 0 && <section><h4>{t("actionPlan")}</h4><ol>
                     {(run.analysis.actionPlan ?? []).map((step) => <li key={step}>{step}</li>)}</ol></section>}</div>}
-                  {run.citations.length > 0 && <div className="agent-citations"><strong>{t("citations")}</strong>
+                  {run.citations.length > 0 && <div className="agent-citations"><strong>{language === "zh-CN" ? "相关记录" : "Related records"}</strong>
                     {run.citations.map((citation) => <button key={citation.id} disabled={!citation.available} onClick={() => {
                       if (citation.kind === "event") void openEvent(citation.targetId);
                       else if (citation.kind === "asset") void previewAsset(citation.targetId);
                       else void openSource(citation.targetId);
-                    }}>{citation.label}{citation.available ? "" : ` · ${t("invalidCitation")}`}</button>)}</div>}
+                    }}>{citation.label.replace(" · OCR", language === "zh-CN" ? " · 材料文字" : " · Material text").replace(" · ASR", language === "zh-CN" ? " · 录音文字" : " · Audio text")}{citation.available ? "" : ` · ${t("invalidCitation")}`}</button>)}</div>}
                   {run.actions.map((action) => <div className={`agent-action ${action.status}`} key={action.id}>
-                    <strong>{action.summary}</strong><em>{action.status}</em>
+                    <strong>{action.summary}</strong>
                     {action.status === "pending" && <div className="row-actions permanent">
                       <button className="primary" onClick={() => void resolveAgentAction(action, true)}>{t("approveAction")}</button>
                       <button onClick={() => void resolveAgentAction(action, false)}>{t("reject")}</button>
@@ -987,58 +1004,54 @@ export function App() {
                   </div>)}
                 </div>}
               </article>;
-            })}</div>
-            {lastDraft && <div className="draft-card"><div><strong>{t("draftCreated")}</strong><span>{lastDraft.title}</span></div>
-              <button onClick={() => void openEvent(lastDraft.id)}>{t("openEvent")}</button></div>}
+            })}</div></details>}
+            {lastEvent && <div className="record-success"><div><strong>{language === "zh-CN" ? "已记下来" : "Saved"}</strong><span>{lastEvent.title}</span></div>
+              <button onClick={() => void openEvent(lastEvent.id)}>{language === "zh-CN" ? "补充时间、人物或材料" : "Add time, people, or materials"}</button></div>}
             <div className="composer"><textarea aria-label={t("messagePlaceholder")} placeholder={t("messagePlaceholder")}
               value={messageText} onChange={(event) => setMessageText(event.target.value)} />
-              <div><div className="composer-modes">
-                <button className={composerMode === "agent" ? "active" : ""} onClick={() => setComposerMode("agent")}>{t("agentMode")}</button>
-                <button className={composerMode === "quick" ? "active" : ""} onClick={() => setComposerMode("quick")}>{t("quickRecord")}</button>
-                <button className={composerMode === "source" ? "active" : ""} onClick={() => setComposerMode("source")}>{t("saveSource")}</button>
-              </div><button className="primary" disabled={busy || !messageText.trim()} onClick={() => void sendMessage()}>
-                  {composerMode === "agent" ? t("askAgent") : t("send")}</button></div></div>
+              <div className="composer-footer"><details className="secondary-actions"><summary>{composerMode === "record" ? (language === "zh-CN" ? "其他方式" : "Other options") : composerMode === "agent" ? t("askAgent") : (language === "zh-CN" ? "仅保存原文" : "Save original only")}</summary>
+                <div><button className={composerMode === "record" ? "active" : ""} onClick={() => setComposerMode("record")}>{language === "zh-CN" ? "记为正式记录" : "Save as record"}</button>
+                  <button className={composerMode === "agent" ? "active" : ""} onClick={() => setComposerMode("agent")}>{t("askAgent")}</button>
+                  <button className={composerMode === "source" ? "active" : ""} onClick={() => setComposerMode("source")}>{language === "zh-CN" ? "仅保存原文" : "Save original only"}</button></div></details>
+                <button className="primary record-submit" disabled={busy || !messageText.trim()} onClick={() => void sendMessage()}>{composerMode === "record" ? (language === "zh-CN" ? "记下来" : "Save") : composerMode === "agent" ? t("askAgent") : (language === "zh-CN" ? "保存原文" : "Save original")}</button></div></div>
           </>}
         </section>
-      </div>}
+      </RecordPage>}
 
-      {view === "events" && <div className="events-layout">
+      {view === "events" && <MemoryPage className="events-layout">
         <aside className="event-list-panel panel">
-          <div className="section-heading"><div><p className="eyebrow">EVENT MEMORY</p><h2>{t("events")}</h2></div>
-            <button onClick={() => void createManualEvent()}>＋</button></div>
-          <div className="filters"><input placeholder={t("searchPlaceholder")} value={queryText} onChange={(event) => setQueryText(event.target.value)} />
-            <select value={queryStatus} onChange={(event) => setQueryStatus(event.target.value)}><option value="">{t("allStatuses")}</option>
-              <option value="candidate">{t("candidate")}</option><option value="confirmed">{t("confirmed")}</option><option value="archived">{t("archived")}</option></select>
+          <div className="section-heading"><h2>{language === "zh-CN" ? "全部记录" : "All records"}</h2>
+            <button aria-label={language === "zh-CN" ? "新建记录" : "New record"} onClick={() => void createManualEvent()}>＋</button></div>
+          <details className="filter-details"><summary>{language === "zh-CN" ? "筛选记录" : "Filter records"}</summary><div className="filters">
+            <input placeholder={t("searchPlaceholder")} value={queryText} onChange={(event) => setQueryText(event.target.value)} />
+            <select aria-label={language === "zh-CN" ? "记录状态" : "Record status"} value={queryStatus} onChange={(event) => setQueryStatus(event.target.value)}><option value="">{t("allStatuses")}</option>
+              <option value="candidate">{language === "zh-CN" ? "待整理" : "Needs review"}</option><option value="confirmed">{language === "zh-CN" ? "已记录" : "Recorded"}</option><option value="archived">{t("archived")}</option></select>
             <select value={queryPerson} onChange={(event) => setQueryPerson(event.target.value)}><option value="">{t("allPeople")}</option>
               {people.map((person) => <option key={person.id} value={person.id}>{person.displayName}</option>)}</select>
             <div className="date-filter"><input type="date" aria-label={t("from")} value={queryFrom} onChange={(event) => setQueryFrom(event.target.value)} />
               <input type="date" aria-label={t("to")} value={queryTo} onChange={(event) => setQueryTo(event.target.value)} /></div>
-            <button className="primary" onClick={() => void searchEvents()}>{t("search")}</button></div>
+            <button className="primary" onClick={() => void searchEvents()}>{t("search")}</button></div></details>
           <div className="event-list">{events.length === 0 ? <div className="empty compact">{t("noEvents")}</div> : events.map((event) =>
             <article key={event.id} className={selectedEventId === event.id ? "selected" : ""} onClick={() => void openEvent(event.id)}>
               <div><strong>{event.title}</strong><span>{new Date(event.updatedAt).toLocaleString(language)}</span></div>
-              <em className={`status ${event.status}`}>{t(event.status)}</em></article>)}</div>
+              <em className={`status ${event.status}`}>{event.status === "candidate" ? (language === "zh-CN" ? "待整理" : "Needs review")
+                : event.status === "confirmed" ? (language === "zh-CN" ? "已记录" : "Recorded") : t("archived")}</em></article>)}</div>
         </aside>
         <section className="event-editor panel">
           {!eventDetail ? <div className="empty">{t("newEvent")}</div> : <>
-            <div className="editor-heading"><div><p className="eyebrow">{t("currentRevision")} {eventDetail.event.currentRevision}</p><h2>{t("eventDetails")}</h2></div>
-              <div><button onClick={() => void changeStatus("confirmed")}>{t("confirm")}</button><button onClick={() => void changeStatus("archived")}>{t("archive")}</button></div></div>
+            <div className="editor-heading"><h2>{language === "zh-CN" ? "记录详情" : "Record details"}</h2><div>
+              {eventDetail.event.status === "candidate" && <button className="primary" onClick={() => void changeStatus("confirmed")}>{language === "zh-CN" ? "加入记忆" : "Add to memory"}</button>}
+              <button onClick={() => void changeStatus("archived")}>{t("archive")}</button></div></div>
             <div className="editor-form">
               <label className="field"><span>{t("title")}</span><input value={eventForm.title} onChange={(event) => setEventForm({ ...eventForm, title: event.target.value })} /></label>
-              <div className="form-row"><label className="field"><span>{t("status")}</span><select value={eventForm.status} onChange={(event) => setEventForm({ ...eventForm, status: event.target.value as Event["status"] })}>
-                <option value="candidate">{t("candidate")}</option><option value="confirmed">{t("confirmed")}</option><option value="archived">{t("archived")}</option></select></label>
-                <label className="field"><span>{t("occurredAt")}</span><select value={eventForm.temporalKind} onChange={(event) => setEventForm({ ...eventForm, temporalKind: event.target.value as TemporalValue["kind"], temporalValue: "", temporalEnd: "" })}>
-                  {(["unknown", "date", "month", "range", "relative", "instant"] as const).map((kind) => <option key={kind} value={kind}>{t(kind)}</option>)}</select></label></div>
+              <label className="field"><span>{t("occurredAt")}</span><select value={eventForm.temporalKind} onChange={(event) => setEventForm({ ...eventForm, temporalKind: event.target.value as TemporalValue["kind"], temporalValue: "", temporalEnd: "" })}>
+                  {(["unknown", "date", "month", "range", "relative", "instant"] as const).map((kind) => <option key={kind} value={kind}>{t(kind)}</option>)}</select></label>
               {eventForm.temporalKind !== "unknown" && <div className="form-row"><input
                 type={eventForm.temporalKind === "month" ? "month" : eventForm.temporalKind === "relative" ? "text" : eventForm.temporalKind === "instant" ? "datetime-local" : "date"}
                 placeholder={eventForm.temporalKind === "relative" ? t("relativeValue") : t("monthValue")}
                 value={eventForm.temporalValue} onChange={(event) => setEventForm({ ...eventForm, temporalValue: event.target.value })} />
                 {eventForm.temporalKind === "range" && <input type="date" aria-label={t("endValue")} value={eventForm.temporalEnd} onChange={(event) => setEventForm({ ...eventForm, temporalEnd: event.target.value })} />}</div>}
-              <label className="field"><span>{t("narrative")}</span><textarea value={eventForm.narrative} onChange={(event) => setEventForm({ ...eventForm, narrative: event.target.value })} /></label>
-              <div className="form-row textareas"><label className="field"><span>{t("facts")}</span><textarea value={eventForm.facts} onChange={(event) => setEventForm({ ...eventForm, facts: event.target.value })} /><small>{t("factsHelp")}</small></label>
-                <label className="field"><span>{t("interpretations")}</span><textarea value={eventForm.interpretations} onChange={(event) => setEventForm({ ...eventForm, interpretations: event.target.value })} /></label></div>
-              <div className="form-row textareas"><label className="field"><span>{t("emotions")}</span><textarea value={eventForm.emotions} onChange={(event) => setEventForm({ ...eventForm, emotions: event.target.value })} /><small>{t("emotionsHelp")}</small></label>
-                <label className="field"><span>{t("interests")}</span><textarea value={eventForm.interests} onChange={(event) => setEventForm({ ...eventForm, interests: event.target.value })} /><small>{t("interestsHelp")}</small></label></div>
+              <label className="field"><span>{language === "zh-CN" ? "发生了什么" : "What happened"}</span><textarea value={eventForm.narrative} onChange={(event) => setEventForm({ ...eventForm, narrative: event.target.value })} /></label>
               <fieldset><legend>{t("people")}</legend><div className="people-picker">{people.map((person) => <label className="check" key={person.id}>
                 <input type="checkbox" checked={eventForm.personIds.includes(person.id)} onChange={(event) => setEventForm((current) => ({ ...current,
                   personIds: event.target.checked ? [...current.personIds, person.id] : current.personIds.filter((id) => id !== person.id) }))} />{person.displayName}</label>)}</div>
@@ -1059,13 +1072,22 @@ export function App() {
               <p className="drop-hint">{t("dropFiles")}</p>
               <div className="mini-list">{eventDetail.assets.map((asset) => <article key={asset.id}><div><strong>{asset.originalFileName}</strong><span>{formatBytes(asset.byteSize)}</span></div>
                 <button onClick={() => void previewAsset(asset.id)}>{t("preview")}</button><button onClick={() => void window.grudgeVault.assets.exportCopy(asset.id)}>{t("exportCopy")}</button></article>)}</div></section>
-            <section className="subsection"><h3>{t("clarifications")}</h3><div className="mini-list">{eventDetail.clarifications.map((item) => <article key={item.id}>
+            <section className="subsection"><h3>{language === "zh-CN" ? "待补充" : "Details to add"}</h3>{eventDetail.clarifications.length === 0 ? <p className="muted">{language === "zh-CN" ? "这条记录目前不需要补充。" : "This record does not need more details."}</p> : <div className="mini-list">{eventDetail.clarifications.map((item) => <article key={item.id}>
               <div><strong>{item.question}</strong><span>{item.reason}</span></div><em className={`status ${item.status}`}>{item.status}</em>
-              {item.status === "open" && <><button onClick={() => void answerClarification(item.id)}>{t("answer")}</button><button onClick={() => void dismissClarification(item.id)}>{t("dismiss")}</button></>}</article>)}</div></section>
-            <section className="subsection"><div className="subsection-heading"><h3>{t("sourceRecord")}</h3></div>
-              <div className="chip-list">{eventDetail.event.sourceRefs.map((sourceRef) =>
-                <button key={sourceRef} onClick={() => void openSource(sourceRef)}>{t("openSource")} · {sourceRef.slice(0, 8)}</button>)}</div></section>
-            <section className="subsection"><div className="subsection-heading"><h3>{t("relatedEvents")}</h3>
+              {item.status === "open" && <><button onClick={() => void answerClarification(item.id)}>{t("answer")}</button><button onClick={() => void dismissClarification(item.id)}>{t("dismiss")}</button></>}</article>)}</div>}</section>
+            <details className="advanced-section"><summary>{language === "zh-CN" ? "更多信息" : "More details"}</summary><div className="advanced-content">
+              <section className="structured-editor"><div className="subsection-heading"><h3>{language === "zh-CN" ? "事实" : "Facts"}</h3><button onClick={() => setEventForm((current) => ({ ...current, facts: [...current.facts, { id: window.crypto.randomUUID(), kind: "fact.confirmed", text: "" }] }))}>{language === "zh-CN" ? "添加" : "Add"}</button></div>
+                {eventForm.facts.map((item) => <div className="structured-row fact-row" key={item.id}><select aria-label={language === "zh-CN" ? "事实类型" : "Fact type"} value={item.kind} onChange={(event) => setEventForm((current) => ({ ...current, facts: current.facts.map((fact) => fact.id === item.id ? { ...fact, kind: event.target.value as FactInput["kind"] } : fact) }))}>
+                  <option value="fact.confirmed">{language === "zh-CN" ? "确定事实" : "Confirmed"}</option><option value="fact.disputed">{language === "zh-CN" ? "存在争议" : "Disputed"}</option><option value="fact.unknown">{language === "zh-CN" ? "待确认" : "Unknown"}</option></select>
+                  <input aria-label={language === "zh-CN" ? "事实内容" : "Fact text"} value={item.text} onChange={(event) => setEventForm((current) => ({ ...current, facts: current.facts.map((fact) => fact.id === item.id ? { ...fact, text: event.target.value } : fact) }))} />
+                  <button aria-label={language === "zh-CN" ? "删除事实" : "Remove fact"} onClick={() => setEventForm((current) => ({ ...current, facts: current.facts.filter(({ id }) => id !== item.id) }))}>×</button></div>)}</section>
+              <section className="structured-editor"><div className="subsection-heading"><h3>{language === "zh-CN" ? "我的判断" : "My interpretation"}</h3><button onClick={() => setEventForm((current) => ({ ...current, interpretations: [...current.interpretations, { id: window.crypto.randomUUID(), text: "" }] }))}>{language === "zh-CN" ? "添加" : "Add"}</button></div>
+                {eventForm.interpretations.map((item) => <div className="structured-row" key={item.id}><input value={item.text} onChange={(event) => setEventForm((current) => ({ ...current, interpretations: current.interpretations.map((entry) => entry.id === item.id ? { ...entry, text: event.target.value } : entry) }))} /><button onClick={() => setEventForm((current) => ({ ...current, interpretations: current.interpretations.filter(({ id }) => id !== item.id) }))}>×</button></div>)}</section>
+              <section className="structured-editor"><div className="subsection-heading"><h3>{language === "zh-CN" ? "当时的感受" : "How I felt"}</h3><button onClick={() => setEventForm((current) => ({ ...current, emotions: [...current.emotions, { id: window.crypto.randomUUID(), label: "", intensity: 3 }] }))}>{language === "zh-CN" ? "添加" : "Add"}</button></div>
+                {eventForm.emotions.map((item) => <div className="structured-row emotion-row" key={item.id}><input placeholder={language === "zh-CN" ? "例如：生气" : "For example: angry"} value={item.label} onChange={(event) => setEventForm((current) => ({ ...current, emotions: current.emotions.map((entry) => entry.id === item.id ? { ...entry, label: event.target.value } : entry) }))} /><select aria-label={language === "zh-CN" ? "感受程度" : "Intensity"} value={item.intensity ?? 3} onChange={(event) => setEventForm((current) => ({ ...current, emotions: current.emotions.map((entry) => entry.id === item.id ? { ...entry, intensity: Number(event.target.value) as NonNullable<EmotionInput["intensity"]> } : entry) }))}>{[1, 2, 3, 4, 5].map((value) => <option key={value} value={value}>{value}</option>)}</select><button onClick={() => setEventForm((current) => ({ ...current, emotions: current.emotions.filter(({ id }) => id !== item.id) }))}>×</button></div>)}</section>
+              <section className="structured-editor"><div className="subsection-heading"><h3>{language === "zh-CN" ? "我关心什么" : "What matters to me"}</h3><button onClick={() => setEventForm((current) => ({ ...current, interests: [...current.interests, { id: window.crypto.randomUUID(), label: "", description: "" }] }))}>{language === "zh-CN" ? "添加" : "Add"}</button></div>
+                {eventForm.interests.map((item) => <div className="structured-row interest-row" key={item.id}><input placeholder={language === "zh-CN" ? "关注点" : "Interest"} value={item.label} onChange={(event) => setEventForm((current) => ({ ...current, interests: current.interests.map((entry) => entry.id === item.id ? { ...entry, label: event.target.value } : entry) }))} /><input placeholder={language === "zh-CN" ? "补充说明（可选）" : "Optional note"} value={item.description} onChange={(event) => setEventForm((current) => ({ ...current, interests: current.interests.map((entry) => entry.id === item.id ? { ...entry, description: event.target.value } : entry) }))} /><button onClick={() => setEventForm((current) => ({ ...current, interests: current.interests.filter(({ id }) => id !== item.id) }))}>×</button></div>)}</section>
+              <section className="subsection"><div className="subsection-heading"><h3>{t("relatedEvents")}</h3>
               <button onClick={() => void refreshRelations()}>{t("refreshSuggestions")}</button></div>
               <div className="inline-create"><select aria-label={t("relationKind")} value={relationKind}
                 onChange={(event) => setRelationKind(event.target.value as EventRelation["kind"])}>
@@ -1079,8 +1101,7 @@ export function App() {
                 const otherId = relation.sourceEventId === eventDetail.event.id ? relation.targetEventId : relation.sourceEventId;
                 const other = events.find(({ id }) => id === otherId);
                 return <article key={relation.id}><div><strong>{other?.title ?? otherId}</strong>
-                  <span>{relation.kind} · {relation.algorithmIdentity ? `${relation.algorithmIdentity} v${relation.algorithmVersion} · ` : ""}
-                    {relation.basis.map(({ label }) => label).join("；")}</span></div>
+                  <span>{t(relation.kind === "same_topic" ? "sameTopic" : relation.kind === "same_case" ? "sameCase" : relation.kind)} · {relation.basis.map(({ label }) => label).join("；")}</span></div>
                   <em className={`status ${relation.status}`}>{relation.status}</em>
                   <button onClick={() => void openEvent(otherId)}>{t("openEvent")}</button>
                   {relation.status === "suggested" && <><button onClick={() => void decideRelation(relation, "confirm")}>{t("confirm")}</button>
@@ -1089,29 +1110,19 @@ export function App() {
                     <button onClick={() => void decideRelation(relation, "reject")}>{t("reject")}</button>}
                   {relation.origin === "user" && <button onClick={() => void decideRelation(relation, "remove")}>{t("delete")}</button>}</article>;
               })}</div></section>
-            <section className="subsection"><h3>{t("revisions")}</h3><div className="revision-list">{revisions.map((revision) => <article key={revision.id}>
-              <strong>{t("revision")} {revision.revision}</strong><span>{revision.reason} · {new Date(revision.createdAt).toLocaleString(language)}</span></article>)}</div></section>
+              <section className="subsection"><h3>{language === "zh-CN" ? "原始内容" : "Original content"}</h3><div className="chip-list">{eventDetail.event.sourceRefs.map((sourceRef, index) =>
+                <button key={sourceRef} onClick={() => void openSource(sourceRef)}>{language === "zh-CN" ? `查看原始内容 ${index + 1}` : `Open original ${index + 1}`}</button>)}</div></section>
+              <section className="subsection"><h3>{language === "zh-CN" ? "修改记录" : "Change history"}</h3><div className="revision-list">{revisions.map((revision) => <article key={revision.id}>
+                <strong>{language === "zh-CN" ? `第 ${revision.revision} 次` : `Change ${revision.revision}`}</strong><span>{new Date(revision.createdAt).toLocaleString(language)}</span></article>)}</div></section>
+            </div></details>
           </>}
         </section>
-      </div>}
+      </MemoryPage>}
 
-      {view === "search" && <div className="phase-three-grid single">
+      {view === "search" && <MemoryPage className="phase-three-grid single">
         <section className="panel phase-three-panel">
-          <div className="section-heading"><div><p className="eyebrow">FTS5 + OPTIONAL EMBEDDINGS</p>
-            <h2>{t("unifiedSearch")}</h2><p className="muted">{t("unifiedSearchHelp")}</p></div></div>
-          <div className="search-toolbar"><input aria-label={t("unifiedSearch")} placeholder={t("searchPlaceholder")}
-            value={unifiedQuery} onChange={(event) => setUnifiedQuery(event.target.value)}
-            onKeyDown={(event) => { if (event.key === "Enter") void runUnifiedSearch(); }} />
-            <label className="check"><input type="checkbox" disabled={!embeddingStatus?.available}
-              checked={semanticSearch && Boolean(embeddingStatus?.available)}
-              onChange={(event) => void toggleSemanticSearch(event.target.checked)} />{t("semanticSearch")}</label>
-            {embeddingStatus?.available && <button onClick={() => void window.grudgeVault.search.rebuildEmbeddings().then(async (result) => {
-              if (!result.ok) setError(result.error.message); else await refreshLists();
-            })}>{t("refresh")}</button>}
-            <button className="primary" onClick={() => void runUnifiedSearch()}>{t("search")}</button></div>
-          <p className="capability-note">{t("embeddingStatus")}: {embeddingStatus?.state ?? t("unavailable")}
-            {embeddingStatus?.adapterIdentity ? ` · ${embeddingStatus.adapterIdentity} v${embeddingStatus.adapterVersion}` : ""}</p>
-          <h3>{t("searchResults")}</h3>
+          <div className="section-heading"><div><h2>{t("searchResults")}</h2><p className="muted">{unifiedQuery.trim()
+            ? (language === "zh-CN" ? `“${unifiedQuery}”的相关结果` : `Results for “${unifiedQuery}”`) : (language === "zh-CN" ? "使用顶部搜索框查找记忆。" : "Use the search box above to find a memory.")}</p></div></div>
           <div className="memory-results">{unifiedHits.length === 0 ? <div className="empty compact">{t("noSearchResults")}</div> : unifiedHits.map((hit) =>
             <article key={`${hit.kind}:${hit.id}`}><div><em className="kind-badge">{hit.kind === "event" ? t("events") : hit.kind === "journal_entry" ? t("journalEntry") : t("transcript")}</em>
               <strong>{hit.title}</strong><p>{hit.excerpt}</p><span>{hit.occurredAt ?? t("unknown")}</span></div>
@@ -1121,9 +1132,9 @@ export function App() {
                 )}>{t("openSource")}</button>}</div>
             </article>)}</div>
         </section>
-      </div>}
+      </MemoryPage>}
 
-      {view === "timeline" && <div className="phase-three-grid single">
+      {view === "timeline" && <MemoryPage className="phase-three-grid single">
         <section className="panel phase-three-panel"><div className="section-heading"><div><p className="eyebrow">CURRENT EVENT PROJECTIONS</p>
           <h2>{t("timeline")}</h2><p className="muted">{t("timelineHelp")}</p></div></div>
           <div className="search-toolbar"><select aria-label={t("people")} value={timelinePerson} onChange={(event) => setTimelinePerson(event.target.value)}>
@@ -1135,26 +1146,26 @@ export function App() {
             {group.events.map((item) => <article key={item.id} onClick={() => void openEvent(item.id)}><span className="timeline-dot" />
               <div><strong>{item.title}</strong><p>{item.narrative}</p><em className={`status ${item.status}`}>{t(item.status)}</em></div></article>)}</section>)}</div>
         </section>
-      </div>}
+      </MemoryPage>}
 
-      {view === "people" && <div className="phase-three-grid people-memory">
+      {view === "people" && <MemoryPage className="phase-three-grid people-memory">
         <aside className="panel people-index"><div className="section-heading"><div><p className="eyebrow">CANONICAL IDENTITIES</p><h2>{t("people")}</h2></div></div>
           <div className="event-list">{personIdentities.map((identity) => <article key={identity.canonicalPerson.id}
             className={selectedPerson?.canonicalPerson.id === identity.canonicalPerson.id ? "selected" : ""}
             onClick={() => void openPerson(identity.canonicalPerson.id)}><div><strong>{identity.canonicalPerson.displayName}</strong>
               <span>{identity.identities.length > 1 ? `${identity.identities.length} ${t("identityMembers")}` : identity.canonicalPerson.notes}</span></div></article>)}</div>
-          <div className="subsection"><div className="subsection-heading"><h3>{t("mergeSuggestions")}</h3>
+          <div className="subsection"><div className="subsection-heading"><h3>{language === "zh-CN" ? "可能是同一个人" : "May be the same person"}</h3>
             <button onClick={() => void loadMergeSuggestions()}>{t("refresh")}</button></div>
             {mergeSuggestions.filter(({ status }) => status === "pending").length === 0 ? <p className="muted">{t("noMergeSuggestions")}</p> :
               mergeSuggestions.filter(({ status }) => status === "pending").map((suggestion) => <article className="suggestion-card" key={suggestion.id}>
                 <strong>{people.find(({ id }) => id === suggestion.personAId)?.displayName} ↔ {people.find(({ id }) => id === suggestion.personBId)?.displayName}</strong>
-                <span>{Math.round(suggestion.score * 100)}% · {suggestion.basis.join("；")}</span><div className="row-actions permanent">
+                <details className="advanced-section"><summary>{language === "zh-CN" ? "为什么会建议" : "Why this was suggested"}</summary><span>{Math.round(suggestion.score * 100)}% · {suggestion.basis.join("；")}</span></details><div className="row-actions permanent">
                   <button className="primary" onClick={() => void mergePeople(suggestion)}>{t("mergePeople")}</button>
                   <button onClick={() => void rejectPersonMerge(suggestion.id)}>{t("reject")}</button></div></article>)}</div>
         </aside>
         <section className="panel phase-three-panel">{!selectedPerson ? <div className="empty">{t("personIdentity")}</div> : <>
-          <div className="section-heading"><div><p className="eyebrow">{t("canonical")}</p><h2>{selectedPerson.canonicalPerson.displayName}</h2></div></div>
-          <section className="subsection"><h3>{t("identityMembers")}</h3><div className="chip-list">{selectedPerson.identities.map((person) =>
+          <div className="section-heading"><h2>{selectedPerson.canonicalPerson.displayName}</h2></div>
+          <section className="subsection"><h3>{language === "zh-CN" ? "关联姓名" : "Linked names"}</h3><div className="chip-list">{selectedPerson.identities.map((person) =>
             <span key={person.id}>{person.displayName}</span>)}</div></section>
           <section className="subsection"><h3>{t("aliases")}</h3><div className="chip-list">{selectedPerson.aliases.map((alias) =>
             <span className={alias.status === "inactive" ? "inactive" : ""} key={alias.id}>{alias.value}
@@ -1169,9 +1180,9 @@ export function App() {
           <section className="subsection"><h3>{t("timeline")}</h3><div className="memory-results">{selectedPerson.events.map((item) =>
             <article key={item.id} onClick={() => void openEvent(item.id)}><div><strong>{item.title}</strong><p>{item.narrative}</p></div></article>)}</div></section>
         </>}</section>
-      </div>}
+      </MemoryPage>}
 
-      {view === "review" && <div className="phase-three-grid review-memory">
+      {view === "review" && <ReviewPage className="phase-three-grid review-memory">
         <aside className="panel review-controls"><div className="section-heading"><div><p className="eyebrow">TRACEABLE ANALYSIS</p><h2>{t("review")}</h2></div></div>
           <div className="backfill-form"><label className="field"><span>{t("from")}</span><input type="date" value={reviewFrom} onChange={(event) => setReviewFrom(event.target.value)} /></label>
             <label className="field"><span>{t("to")}</span><input type="date" value={reviewTo} onChange={(event) => setReviewTo(event.target.value)} /></label>
@@ -1181,25 +1192,16 @@ export function App() {
           <h3>{t("reviewHistory")}</h3>{reviews.length === 0 ? <p className="muted">{t("noReviews")}</p> : <div className="run-list">{reviews.map((review) =>
             <article key={review.id} className={selectedReview?.id === review.id ? "selected" : ""} onClick={() => setSelectedReview(review)}>
               <div><strong>{review.from} — {review.to}</strong><span>{new Date(review.createdAt).toLocaleString(language)}</span></div>
-              {review.stale && <em className="status failed">stale</em>}</article>)}</div>}
-          {reviewAutomation && <section className="subsection"><h3>{language === "zh-CN" ? "持续回顾" : "Continuous review"}</h3>
-            <div className="people-picker"><label className="check"><input type="checkbox" checked={reviewAutomation.monthly}
-              onChange={(event) => void updateAutomation({ monthly: event.target.checked })} />{language === "zh-CN" ? "月度回顾" : "Monthly reviews"}</label>
-              <label className="check"><input type="checkbox" checked={reviewAutomation.quarterly}
-                onChange={(event) => void updateAutomation({ quarterly: event.target.checked })} />{language === "zh-CN" ? "季度回顾" : "Quarterly reviews"}</label>
-              <label className="check"><input type="checkbox" checked={reviewAutomation.clarificationWeekly}
-                onChange={(event) => void updateAutomation({ clarificationWeekly: event.target.checked })} />{language === "zh-CN" ? "每周高价值待补全提醒" : "Weekly high-value clarification digest"}</label>
-              <label className="check"><input type="checkbox" checked={reviewAutomation.systemNotifications}
-                onChange={(event) => void updateAutomation({ systemNotifications: event.target.checked })} />{language === "zh-CN" ? "系统通知（仅通用文案）" : "System notifications (generic text only)"}</label></div></section>}
+              {review.stale && <em className="status failed">{language === "zh-CN" ? "需重新生成" : "Needs refresh"}</em>}</article>)}</div>}
           <section className="subsection"><h3>{language === "zh-CN" ? "应用内提醒" : "In-app reminders"}</h3>
             {reminders.filter(({ status }) => status !== "dismissed").length === 0 ? <p className="muted">{language === "zh-CN" ? "暂无到期提醒。" : "No due reminders."}</p> :
               <div className="mini-list">{reminders.filter(({ status }) => status !== "dismissed").map((reminder) => <article key={reminder.id}>
-                <div><strong>{reminder.kind}</strong><span>{new Date(reminder.dueAt).toLocaleString(language)} · {reminder.status}</span></div>
+                <div><strong>{reminder.kind === "monthly_review" ? (language === "zh-CN" ? "月度回顾" : "Monthly review") : reminder.kind === "quarterly_review" ? (language === "zh-CN" ? "季度回顾" : "Quarterly review") : (language === "zh-CN" ? "待补充事项" : "Details to add")}</strong><span>{new Date(reminder.dueAt).toLocaleString(language)}</span></div>
                 <button onClick={() => void openReminder(reminder)}>{language === "zh-CN" ? "打开" : "Open"}</button>
                 <button onClick={() => void window.grudgeVault.reminders.dismiss(reminder.id).then(async (result) => {
                   if (!result.ok) setError(result.error.message); else await refreshLists();
                 })}>{t("dismiss")}</button></article>)}</div>}</section>
-          <section className="subsection"><h3>{t("globalClarifications")}</h3><div className="mini-list">{globalClarifications.filter(({ status }) => status === "open").map((item) =>
+          <section className="subsection"><h3>{language === "zh-CN" ? "待补充事项" : "Details to add"}</h3><div className="mini-list">{globalClarifications.filter(({ status }) => status === "open").map((item) =>
             <article key={item.id}><div><strong>{item.question}</strong><span>{item.reason}</span></div>
               <select aria-label={t("priority")} value={item.priority} onChange={(event) => void changeClarificationPriority(item.id, event.target.value as typeof item.priority)}>
                 <option value="normal">{t("normal")}</option><option value="important">{t("important")}</option><option value="rights_related">{t("rightsRelated")}</option></select>
@@ -1208,74 +1210,77 @@ export function App() {
               <button onClick={() => void openEvent(item.eventId)}>{t("openEvent")}</button></article>)}</div></section>
         </aside>
         <section className="panel phase-three-panel">{!selectedReview ? <div className="empty">{t("noReviews")}</div> : <>
-          <div className="section-heading"><div><p className="eyebrow">{selectedReview.generatorIdentity} v{selectedReview.generatorVersion}</p>
-            <h2>{selectedReview.from} — {selectedReview.to}</h2></div></div>
+          <div className="section-heading"><h2>{selectedReview.from} — {selectedReview.to}</h2></div>
           {selectedReview.stale && <div className="notice-banner">{t("staleReview")}</div>}
           <h3>{t("patterns")}</h3><div className="pattern-list">{selectedReview.patterns.length === 0 ? <div className="empty compact">{t("noPatterns")}</div> :
-            selectedReview.patterns.map((pattern) => <article key={pattern.id}><em className="kind-badge">{pattern.kind}</em><h3>{pattern.title}</h3><p>{pattern.summary}</p>
+            selectedReview.patterns.map((pattern) => <article key={pattern.id}><em className="kind-badge">{({ person: language === "zh-CN" ? "人物" : "Person", interest: language === "zh-CN" ? "关注点" : "Interest", emotion: language === "zh-CN" ? "感受" : "Emotion", relation: language === "zh-CN" ? "关联" : "Relation" } as Record<string, string>)[pattern.kind] ?? (language === "zh-CN" ? "记录" : "Record")}</em><h3>{pattern.title}</h3><p>{pattern.summary}</p>
               <strong>{t("supportingEvents")}</strong><div className="chip-list">{pattern.eventIds.map((eventId) =>
                 <button key={eventId} onClick={() => void openEvent(eventId)}>{events.find(({ id }) => id === eventId)?.title ?? eventId}</button>)}</div>
               <div className="chip-list">{pattern.sourceRefs.map((sourceRef) => <button key={sourceRef} onClick={() => void openSource(sourceRef)}>{t("openSource")} · {sourceRef.slice(0, 8)}</button>)}</div>
             </article>)}</div>
         </>}</section>
-      </div>}
+      </ReviewPage>}
 
-      {view === "backfill" && <div className="backfill-layout">
+      {view === "backfill" && <SettingsPage className="backfill-layout">
+        <section className="panel data-actions"><div className="section-heading"><div><h2>{language === "zh-CN" ? "数据与备份" : "Data and backups"}</h2>
+          <p className="muted">{language === "zh-CN" ? "数据保存在本机，可随时打开存储位置或创建备份。" : "Your data stays on this device. You can reveal its location or create a backup."}</p></div></div>
+          <div className="landing-actions"><button onClick={() => void window.grudgeVault.workspace.reveal().then((result) => { if (!result.ok) setError(result.error.message); })}>{language === "zh-CN" ? "打开存储位置" : "Show storage location"}</button>
+            <button className="primary" onClick={() => void window.grudgeVault.backups.createSnapshot().then((result) => { if (!result.ok) setError(result.error.message); else if (result.data) setNotice(t("backupCreated")); })}>{t("createBackup")}</button>
+            <button onClick={() => { if (window.confirm(t("restoreWarning"))) void window.grudgeVault.backups.restoreSnapshot().then(async (result) => { if (!result.ok) setError(result.error.message); else if (result.data) await refresh(); }); }}>{t("restoreBackup")}</button></div></section>
         <section className="panel import-panel">
-          <div className="section-heading"><div><p className="eyebrow">DAY ONE SOURCE MEMORY</p><h2>{t("dayOneImports")}</h2></div>
-            <button className="primary" disabled={busy} onClick={() => void chooseDayOneZip()}>{t("chooseDayOneZip")}</button></div>
-          {importFolderStatus && <section className="subsection"><div className="subsection-heading"><div><p className="eyebrow">INCREMENTAL IMPORT FOLDER</p>
-            <h3>{language === "zh-CN" ? "Day One 增量目录" : "Incremental Day One folder"}</h3></div></div>
+          <div className="section-heading"><div><h2>{t("dayOneImports")}</h2><p className="muted">{language === "zh-CN" ? `待整理 ${candidates.length} 条` : `${candidates.length} waiting to be organized`}</p></div>
+            <button className="primary" disabled={busy} onClick={() => void chooseDayOneZip()}>{language === "zh-CN" ? "选择 Day One 导出包" : "Choose Day One export"}</button></div>
+          {importFolderStatus && <details className="advanced-section"><summary>{language === "zh-CN" ? "自动导入设置" : "Automatic import settings"}</summary><section className="subsection">
+            <h3>{language === "zh-CN" ? "Day One 增量目录" : "Incremental Day One folder"}</h3>
             <p className="path-value">{importFolderStatus.displayPath ?? (language === "zh-CN" ? "尚未选择目录" : "No folder selected")}</p>
             <p className="muted">{language === "zh-CN" ? "仅处理顶层常规 ZIP；原始路径只保存在本机配置中。" : "Only top-level regular ZIP files are processed; the original path stays in machine-local settings."}</p>
             <div className="row-actions permanent"><button onClick={() => void chooseImportFolder()}>{language === "zh-CN" ? "选择目录" : "Choose folder"}</button>
               <label className="check"><input type="checkbox" disabled={!importFolderStatus.configured} checked={importFolderStatus.enabled}
                 onChange={(event) => void updateImportFolder(event.target.checked)} />{language === "zh-CN" ? "启用监听" : "Watch folder"}</label>
               <button disabled={!importFolderStatus.configured} onClick={() => void scanImportFolder()}>{language === "zh-CN" ? "立即扫描" : "Scan now"}</button></div>
-            <p className="muted">{importFolderStatus.watching ? (language === "zh-CN" ? "监听中" : "Watching") : (language === "zh-CN" ? "未监听" : "Not watching")}
-              {` · ${importFolderStatus.importedCount} imported · ${importFolderStatus.failedCount} failed`}</p>
-            {importFolderStatus.lastError && <p className="error-banner">{importFolderStatus.lastError}</p>}</section>}
+            <p className="muted">{importFolderStatus.watching ? (language === "zh-CN" ? "正在自动导入" : "Automatic import is on") : (language === "zh-CN" ? "自动导入已关闭" : "Automatic import is off")}
+              {language === "zh-CN" ? ` · 已导入 ${importFolderStatus.importedCount} · 失败 ${importFolderStatus.failedCount}` : ` · ${importFolderStatus.importedCount} imported · ${importFolderStatus.failedCount} failed`}</p>
+            {importFolderStatus.lastError && <p className="error-banner">{language === "zh-CN" ? "自动导入遇到问题，请重新选择目录。" : "Automatic import needs attention. Choose the folder again."}</p>}</section></details>}
           {importRuns.length === 0 ? <div className="empty compact">{t("noImports")}</div> : <div className="run-list">{importRuns.map((run) =>
             <article key={run.id} className={selectedImportId === run.id ? "selected" : ""} onClick={() => setSelectedImportId(run.id)}>
               <div><strong>{run.archiveFileName}</strong><span>{new Date(run.createdAt).toLocaleString(language)}</span></div>
-              <em className={`status ${run.state}`}>{run.state}</em>
+              <em className={`status ${run.state}`}>{run.state === "succeeded" ? (language === "zh-CN" ? "已完成" : "Completed") : run.state === "failed" ? (language === "zh-CN" ? "失败" : "Failed") : (language === "zh-CN" ? "导入中" : "Importing")}</em>
               <progress max={1} value={run.progress} />
               <span>{t("entries")}: {run.counts.totalEntries} · +{run.counts.newEntries} · ↻{run.counts.updatedEntries} · ={run.counts.skippedEntries}</span>
               <span>{t("media")}: {run.counts.mediaImported} · {t("issues")}: {run.counts.errorCount + run.counts.mediaMissing}</span>
             </article>)}</div>}
-          {importDetail && <div className="issue-list"><h3>{t("importReport")}</h3>
+          {importDetail && importDetail.issues.length > 0 && <details className="advanced-section"><summary>{t("importReport")}</summary><div className="issue-list">
             {importDetail.issues.length === 0 ? <p className="muted">{t("noIssues")}</p> : importDetail.issues.map((issue) =>
               <article key={issue.id}><em className={`status ${issue.severity === "error" ? "failed" : "archived"}`}>{issue.code}</em>
-                <div><strong>{issue.message}</strong><span>{issue.entryExternalId ?? issue.archivePath ?? ""}</span></div></article>)}</div>}
+                <div><strong>{issue.message}</strong><span>{issue.entryExternalId ?? issue.archivePath ?? ""}</span></div></article>)}</div></details>}
         </section>
 
-        <section className="panel backfill-controls">
-          <div className="section-heading"><div><p className="eyebrow">RECOVERABLE BACKFILL</p><h2>{t("backfillRuns")}</h2></div></div>
+        <details className="panel backfill-controls advanced-section"><summary>{language === "zh-CN" ? "高级整理选项" : "Advanced organization options"}</summary><div className="advanced-content">
+          <div className="section-heading"><h2>{language === "zh-CN" ? "批量整理" : "Batch organization"}</h2></div>
           <div className="backfill-form"><div className="date-filter"><label className="field"><span>{t("from")}</span><input type="date" value={backfillFrom} onChange={(event) => setBackfillFrom(event.target.value)} /></label>
             <label className="field"><span>{t("to")}</span><input type="date" value={backfillTo} onChange={(event) => setBackfillTo(event.target.value)} /></label></div>
             <label className="field"><span>{t("tagFilter")}</span><input value={backfillTags} placeholder={t("tagFilterHelp")} onChange={(event) => setBackfillTags(event.target.value)} /></label>
             <label className="field"><span>{t("batchSize")}</span><input type="number" min={1} max={100} value={backfillBatchSize} onChange={(event) => setBackfillBatchSize(event.target.value)} /></label>
             <button className="primary" disabled={importRuns.length === 0} onClick={() => void startBackfill()}>{t("startBackfill")}</button></div>
-          <div className="run-list">{backfillRuns.map((run) => <article key={run.id}>
-            <div><strong>{run.detectorIdentity} v{run.detectorVersion}</strong><span>{run.processedItems}/{run.totalItems} · {run.candidateCount} {t("candidates")}</span></div>
-            <em className={`status ${run.state}`}>{run.state}</em><progress max={Math.max(1, run.totalItems)} value={run.processedItems} />
+          <div className="run-list">{backfillRuns.filter(({ state }) => state !== "completed").map((run) => <article key={run.id}>
+            <div><strong>{language === "zh-CN" ? "整理任务" : "Organization task"}</strong><span>{run.processedItems}/{run.totalItems} · {run.candidateCount} {t("candidates")}</span></div>
+            <em className={`status ${run.state}`}>{run.state === "failed" ? (language === "zh-CN" ? "失败" : "Failed") : (language === "zh-CN" ? "处理中" : "Processing")}</em><progress max={Math.max(1, run.totalItems)} value={run.processedItems} />
             <div className="row-actions permanent">{(run.state === "queued" || run.state === "running") && <button onClick={() => void changeBackfill(run, "pause")}>{t("pause")}</button>}
               {(run.state === "paused" || run.state === "failed") && <button onClick={() => void changeBackfill(run, "resume")}>{t("resume")}</button>}
               {!["completed", "cancelled"].includes(run.state) && <button onClick={() => void changeBackfill(run, "cancel")}>{t("cancel")}</button>}</div>
-          </article>)}</div>
-        </section>
+          </article>)}</div></div></details>
 
         <section className="panel candidate-inbox">
-          <div className="section-heading"><div><p className="eyebrow">CANDIDATE INBOX</p><h2>{t("candidateInbox")}</h2></div><span className="count-badge">{candidates.length}</span></div>
+          <div className="section-heading"><h2>{language === "zh-CN" ? "待整理记录" : "Records to organize"}</h2><span className="count-badge">{candidates.length}</span></div>
           {candidates.length === 0 ? <div className="empty compact">{t("noCandidates")}</div> : <div className="candidate-list">{candidates.map((candidate) =>
             <article key={candidate.event.id} className={candidateDetail?.event.id === candidate.event.id ? "selected" : ""} onClick={() => void inspectCandidate(candidate.event.id)}>
               <div><strong>{candidate.event.title}</strong><span>{candidate.journalEntry.journalDate} · {candidate.journalEntry.tags.join(", ")}</span>
-                <p>{candidate.excerpt}</p></div><em className="status candidate">v{candidate.extraction.detectorVersion}</em></article>)}</div>}
+                <p>{candidate.excerpt}</p></div></article>)}</div>}
         </section>
 
         <section className="panel candidate-source">
           {!candidateDetail ? <div className="empty">{t("selectCandidate")}</div> : <>
-            <div className="section-heading"><div><p className="eyebrow">{candidateDetail.extraction.detectorIdentity} v{candidateDetail.extraction.detectorVersion}</p><h2>{candidateDetail.event.title}</h2></div>
+            <div className="section-heading"><h2>{candidateDetail.event.title}</h2>
               <button onClick={() => void openEvent(candidateDetail.event.id)}>{t("openEvent")}</button></div>
             <div className="source-card"><div className="source-meta"><span>{formatJournalTimestamp(
               candidateDetail.journalEntry.creationDate, language, candidateDetail.journalEntry.timeZone
@@ -1284,8 +1289,8 @@ export function App() {
               <h3>{t("sourceExcerpt")}</h3><pre>{candidateDetail.excerpt}</pre>
               <p className="muted">{t("candidateTimeSource")}: {candidateDetail.extraction.temporalBasis === "source-text"
                 ? t("timeFromSource") : candidateDetail.extraction.temporalBasis === "relative" ? t("timeFromRelative") : t("timeFromJournal")}</p>
-              <p className="muted">{t("sourceVersion")} {candidateDetail.sourceVersion.version} · {candidateDetail.sourceVersion.contentHash}</p>
-              <div className="candidate-actions"><button className="primary" onClick={() => void reviewCandidate("confirm")}>{t("confirm")}</button>
+              <details className="advanced-section"><summary>{language === "zh-CN" ? "高级详情" : "Advanced details"}</summary><p className="muted">{t("sourceVersion")} {candidateDetail.sourceVersion.version} · {candidateDetail.sourceVersion.contentHash}</p></details>
+              <div className="candidate-actions"><button className="primary" onClick={() => void reviewCandidate("confirm")}>{language === "zh-CN" ? "加入记忆" : "Add to memory"}</button>
                 <button onClick={() => void reviewCandidate("ignore")}>{t("ignoreCandidate")}</button>
                 <select aria-label={t("mergeTarget")} value={mergeTargetId} onChange={(event) => setMergeTargetId(event.target.value)}>
                   <option value="">{t("mergeTarget")}</option>{events.filter(({ id, status }) => id !== candidateDetail.event.id && status !== "archived").map((event) =>
@@ -1293,47 +1298,82 @@ export function App() {
                 <button disabled={!mergeTargetId} onClick={() => void mergeCandidate()}>{t("mergeCandidate")}</button></div>
             </div></>}
         </section>
-      </div>}
+      </SettingsPage>}
 
-      {view === "evidence" && <EvidencePanel language={language} onError={setError} onNotice={setNotice} />}
+      {view === "evidence" && <MaterialsPage><EvidencePanel language={language} onError={setError} onNotice={setNotice} /></MaterialsPage>}
 
-      {view === "cases" && <CasesPanel language={language} events={events} people={people} evidence={assets}
-        onError={setError} onNotice={setNotice} />}
+      {view === "cases" && <MaterialsPage><CasesPanel language={language} events={events} people={people} evidence={assets}
+        onError={setError} onNotice={setNotice} /></MaterialsPage>}
 
-      {view === "vault" && <div className="vault-grid">
+      {view === "vault" && <MaterialsPage className="vault-grid">
         <section className="panel drop-target" onDragOver={(event) => event.preventDefault()} onDrop={(event) => {
           event.preventDefault(); void importVaultFiles(Array.from(event.dataTransfer.files));
-        }}><div className="section-heading"><div><p className="eyebrow">OBJECT VAULT</p><h2>{t("originals")}</h2></div>
-          <button className="primary" onClick={() => void window.grudgeVault.assets.chooseAndImport().then(refreshLists)}>{t("chooseFiles")}</button></div>
+        }}><div className="section-heading"><div><h2>{language === "zh-CN" ? "全部材料" : "All materials"}</h2><p className="muted">{language === "zh-CN" ? "把文件拖到这里，或从电脑中选择。" : "Drop files here or choose them from your computer."}</p></div>
+          <button className="primary" onClick={() => void window.grudgeVault.assets.chooseAndImport().then(refreshLists)}>{language === "zh-CN" ? "添加材料" : "Add materials"}</button></div>
           <input id="asset-file-input" hidden multiple type="file" onChange={(event) => {
             const files = Array.from(event.target.files ?? []);
             if (files.length > 0) void importVaultFiles(files);
           }} />
-          {assets.length === 0 ? <div className="empty">{t("noAssets")}</div> : <div className="asset-list">{assets.map((asset) => <article className="asset-row" key={asset.id}>
-            <div><strong>{asset.originalFileName}</strong><span>{formatBytes(asset.byteSize)} · {asset.mimeType}</span></div><code>{asset.sha256}</code>
-            <em className={`status ${asset.integrityStatus}`}>{asset.integrityStatus}</em>
+          {assets.length === 0 ? <div className="empty">{language === "zh-CN" ? "还没有材料。" : "No materials yet."}</div> : <div className="asset-list">{assets.map((asset) => <article className="asset-row" key={asset.id}>
+            <div><strong>{asset.originalFileName}</strong><span>{formatBytes(asset.byteSize)} · {language === "zh-CN" ? "可用" : "Available"}</span></div>
             <div className="row-actions"><button onClick={() => void previewAsset(asset.id)}>{t("preview")}</button><button onClick={() => void window.grudgeVault.assets.exportCopy(asset.id)}>{t("exportCopy")}</button>
-              <button onClick={() => void window.grudgeVault.assets.verify(asset.id)}>{t("verify")}</button>
               <button onClick={() => void window.grudgeVault.localIntelligence.processAsset(asset.id).then(async (result) => {
                 if (!result.ok) setError(result.error.message); else await refreshLists();
-              })}>{language === "zh-CN" ? "本地处理" : "Process locally"}</button></div></article>)}</div>}
+              })}>{language === "zh-CN" ? "提取文字" : "Extract text"}</button></div>
+            <details className="asset-advanced"><summary>{language === "zh-CN" ? "高级详情" : "Advanced details"}</summary><code>{asset.sha256}</code>
+              <span>{language === "zh-CN" ? "文件检查" : "File check"}: {asset.integrityStatus}</span><button onClick={() => void window.grudgeVault.assets.verify(asset.id)}>{t("verify")}</button></details></article>)}</div>}
         </section>
-        <aside className="panel"><div className="section-heading"><div><p className="eyebrow">JOBS</p><h2>{t("tasks")}</h2></div></div>
-          {jobs.length === 0 ? <div className="empty compact">{t("noJobs")}</div> : jobs.map((job) => <article className="job-row" key={job.id}>
-            <div><strong>{job.type}</strong><span>{t("attempt")} {job.attempts}/{job.maxAttempts}</span></div><em className={`status ${job.state}`}>{job.state}</em>
-            <progress max={1} value={job.progress ?? 0} />{job.lastError && <p>{job.lastError}</p>}
+        {jobs.some(({ state }) => state === "queued" || state === "running" || state === "failed") && <aside className="panel"><div className="section-heading"><h2>{language === "zh-CN" ? "处理中" : "Processing"}</h2></div>
+          {jobs.filter(({ state }) => state === "queued" || state === "running" || state === "failed").map((job) => <article className="job-row" key={job.id}>
+            <div><strong>{job.type.includes("import") ? (language === "zh-CN" ? "导入材料" : "Import materials") : job.type.includes("scan") || job.type.includes("verify") ? (language === "zh-CN" ? "检查材料" : "Check materials") : (language === "zh-CN" ? "整理材料" : "Process material")}</strong></div><em className={`status ${job.state}`}>{job.state === "failed" ? (language === "zh-CN" ? "处理失败" : "Failed") : (language === "zh-CN" ? "正在处理" : "Processing")}</em>
+            <progress max={1} value={job.progress ?? 0} />{job.lastError && <p>{language === "zh-CN" ? "处理没有完成，可以重试。" : "Processing did not finish. You can retry."}</p>}
             {job.state === "failed" && <button onClick={() => void window.grudgeVault.jobs.retry(job.id)}>{t("retry")}</button>}
             {(job.state === "queued" || job.state === "running") && <button onClick={() => void window.grudgeVault.jobs.cancel(job.id).then(async (result) => {
               if (!result.ok) setError(result.error.message); else await refreshLists();
-            })}>{t("cancel")}</button>}</article>)}</aside>
-      </div>}
+            })}>{t("cancel")}</button>}</article>)}</aside>}
+      </MaterialsPage>}
 
-      {view === "settings" && <div className="settings-grid">
-        <WorkspaceSecurityPanel language={language} onError={setError} onNotice={setNotice}
-          onLocked={clearSensitiveRendererState} />
-        <section className="panel settings-card"><p className="eyebrow">LANGUAGE</p><h2>{t("language")}</h2>
+      {view === "settings" && settingsSection === "general" && <SettingsPage className="settings-grid">
+        <section className="panel settings-card"><h2>{t("language")}</h2>
           <div className="language-pills"><button className={language === "zh-CN" ? "active" : ""} onClick={() => setAppLanguage("zh-CN")}>{t("chinese")}</button>
             <button className={language === "en" ? "active" : ""} onClick={() => setAppLanguage("en")}>{t("english")}</button></div></section>
+        <WorkspaceSecurityPanel mode="general" language={language} onError={setError} onNotice={setNotice} onLocked={clearSensitiveRendererState} />
+        {reviewAutomation && <section className="panel settings-card"><h2>{language === "zh-CN" ? "回顾与提醒" : "Reviews and reminders"}</h2>
+          <div className="settings-checks"><label className="check"><input type="checkbox" checked={reviewAutomation.monthly}
+            onChange={(event) => void updateAutomation({ monthly: event.target.checked })} />{language === "zh-CN" ? "每月提醒我回顾" : "Remind me to review monthly"}</label>
+            <label className="check"><input type="checkbox" checked={reviewAutomation.quarterly}
+              onChange={(event) => void updateAutomation({ quarterly: event.target.checked })} />{language === "zh-CN" ? "每季度提醒我回顾" : "Remind me to review quarterly"}</label>
+            <label className="check"><input type="checkbox" checked={reviewAutomation.clarificationWeekly}
+              onChange={(event) => void updateAutomation({ clarificationWeekly: event.target.checked })} />{language === "zh-CN" ? "每周提醒待补充事项" : "Weekly reminder for missing details"}</label>
+            <label className="check"><input type="checkbox" checked={reviewAutomation.systemNotifications}
+              onChange={(event) => void updateAutomation({ systemNotifications: event.target.checked })} />{language === "zh-CN" ? "允许系统通知" : "Allow system notifications"}</label></div></section>}
+      </SettingsPage>}
+
+      {view === "settings" && settingsSection === "intelligence" && <SettingsPage className="settings-grid">
+        <section className="panel settings-card"><h2>{language === "zh-CN" ? "智能搜索" : "Smart search"}</h2>
+          <p>{language === "zh-CN" ? "在普通关键词搜索之外，尝试找到意思相近的记录。" : "Find records with similar meaning in addition to keyword matches."}</p>
+          <label className="check"><input type="checkbox" disabled={!embeddingStatus?.available} checked={semanticSearch && Boolean(embeddingStatus?.available)}
+            onChange={(event) => void toggleSemanticSearch(event.target.checked)} />{embeddingStatus?.available ? (language === "zh-CN" ? "使用智能搜索" : "Use smart search") : (language === "zh-CN" ? "当前设备暂不支持" : "Not available on this device")}</label>
+        </section>
+        {processorStatus && <section className="panel settings-card"><h2>{language === "zh-CN" ? "附件文字识别与录音转写" : "Attachment text and audio transcription"}</h2>
+          <p>{language === "zh-CN" ? "处理只在本机进行，不会自动下载模型或联网。" : "Processing stays on this device and never downloads models or connects automatically."}</p>
+          <label className="check"><input type="checkbox" checked={processorStatus.settings.autoProcessNew}
+            onChange={(event) => void updateMediaSettings({ autoProcessNew: event.target.checked })} />{language === "zh-CN" ? "自动处理新材料" : "Automatically process new materials"}</label>
+          <button disabled={processorStatus.eligibleHistoricalAssets === 0} onClick={() => void processHistoricalMedia()}>{language === "zh-CN"
+            ? `处理已有材料（${processorStatus.eligibleHistoricalAssets}）` : `Process existing materials (${processorStatus.eligibleHistoricalAssets})`}</button>
+        </section>}
+        <section className="panel settings-card"><h2>{language === "zh-CN" ? "助手模式" : "Assistant mode"}</h2>
+          <p>{language === "zh-CN" ? "离线模式不发送内容；联网增强会在每次发送前让你确认。" : "Offline mode keeps content local. Enhanced mode asks before sending any context."}</p>
+          <div className="language-pills"><button className={agentMode === "private" ? "active" : ""} onClick={() => setAgentMode("private")}>{language === "zh-CN" ? "离线" : "Offline"}</button>
+            <button className={agentMode === "enhanced" ? "active" : ""} onClick={() => setAgentMode("enhanced")}>{language === "zh-CN" ? "联网增强" : "Enhanced"}</button></div>
+          <button className="primary" onClick={() => void saveAgentSettings()}>{language === "zh-CN" ? "保存助手模式" : "Save assistant mode"}</button></section>
+      </SettingsPage>}
+
+      {view === "settings" && settingsSection === "advanced" && <SettingsPage className="settings-grid">
+        <WorkspaceSecurityPanel language={language} onError={setError} onNotice={setNotice}
+          onLocked={clearSensitiveRendererState} mode="advanced" />
+        {diagnosticError && <section className="panel settings-card"><h2>{language === "zh-CN" ? "最近一次诊断" : "Latest diagnostic"}</h2>
+          <details className="advanced-section"><summary>{language === "zh-CN" ? "查看原始错误" : "View raw error"}</summary><pre className="diagnostic-value">{diagnosticError}</pre></details></section>}
         {processorStatus && <section className="panel settings-card"><p className="eyebrow">LOCAL MEDIA INTELLIGENCE</p>
           <h2>{language === "zh-CN" ? "本地媒体引擎" : "Local media engines"}</h2>
           <p>{language === "zh-CN" ? "仅运行用户选择的本地程序和模型；不会下载或联网。" : "Only user-selected local programs and models run; nothing is downloaded or sent online."}</p>
@@ -1384,29 +1424,16 @@ export function App() {
           <div className="landing-actions"><button className="primary" disabled={busy} onClick={() => void saveAgentSettings()}>{t("saveAgentSettings")}</button>
             <button onClick={() => void clearAgentCredential()}>{t("clearCredential")}</button></div>
         </section>
-        <section className="panel settings-card"><p className="eyebrow">ENCRYPTED SNAPSHOT</p><h2>{t("backup")}</h2><p>{t("backupHelp")}</p>
-          <div className="landing-actions"><button className="primary" onClick={() => void window.grudgeVault.backups.createSnapshot().then((result) => {
-            if (!result.ok) setError(result.error.message); else if (result.data) setNotice(`${t("backupCreated")}: ${result.data.path}`);
-          })}>{t("createBackup")}</button><button onClick={() => { if (window.confirm(t("restoreWarning"))) void window.grudgeVault.backups.restoreSnapshot().then(async (result) => {
-            if (!result.ok) setError(result.error.message); else if (result.data) await refresh();
-          }); }}>{t("restoreBackup")}</button></div></section>
-        <section className="panel settings-card"><p className="eyebrow">WORKSPACE</p><h2>{t("activeWorkspace")}</h2><p className="path-value">{workspace.rootPath}</p></section>
-        <section className="panel settings-card"><p className="eyebrow">PEOPLE</p><h2>{t("people")}</h2>
-          <div className="settings-list">{people.map((person) => <article key={person.id}><div><strong>{person.displayName}</strong><span>{person.notes}</span></div>
-            <button onClick={() => void editPerson(person)}>{t("edit")}</button>
-            <button onClick={() => void window.grudgeVault.people.archive(person.id).then(async (result) => {
-              if (!result.ok) setError(result.error.message); else await refreshLists();
-            })}>{t("archivePerson")}</button></article>)}</div></section>
-      </div>}
+      </SettingsPage>}
     </section>
 
     {pendingAgentRun?.disclosure && <div className="modal-backdrop"><section className="preview-modal consent-modal">
-      <div className="section-heading"><div><p className="eyebrow">ENHANCED CONTEXT</p><h2>{t("externalContextConsent")}</h2></div></div>
+      <div className="section-heading"><h2>{t("externalContextConsent")}</h2></div>
       <p>{t("externalContextHelp")}</p>
       <div className="disclosure-list">{pendingAgentRun.disclosure.categories.map((category) => <article key={category}>
-        <strong>{category}</strong><span>{pendingAgentRun.disclosure?.categoryCounts[category] ?? 0}</span>
+        <strong>{({ conversation_text: language === "zh-CN" ? "本次对话" : "This conversation", event_fields: language === "zh-CN" ? "相关记录" : "Related records", source_excerpt: language === "zh-CN" ? "相关原文片段" : "Related source excerpts", asset_metadata: language === "zh-CN" ? "材料基本信息" : "Material details", ocr_excerpt: language === "zh-CN" ? "材料中的文字" : "Text from materials", transcript_excerpt: language === "zh-CN" ? "录音转写片段" : "Audio transcript excerpts" } as Record<string, string>)[category] ?? category}</strong><span>{pendingAgentRun.disclosure?.categoryCounts[category] ?? 0}</span>
       </article>)}</div>
-      <p className="muted">{t("redactionPolicy")} v{pendingAgentRun.disclosure.policyVersion} · {pendingAgentRun.disclosure.contextHash}</p>
+      <details className="advanced-section"><summary>{language === "zh-CN" ? "技术详情" : "Technical details"}</summary><p className="muted">{t("redactionPolicy")} v{pendingAgentRun.disclosure.policyVersion} · {pendingAgentRun.disclosure.contextHash}</p></details>
       <div className="landing-actions"><button className="primary" disabled={busy} onClick={() => void resumeAgentRun()}>{t("allowAndContinue")}</button>
         <button disabled={busy} onClick={() => void cancelAgentRun()}>{t("cancel")}</button></div>
     </section></div>}
@@ -1416,12 +1443,12 @@ export function App() {
         : preview.mimeType.startsWith("audio/") ? <audio controls src={preview.url} /> : preview.mimeType.startsWith("video/") ? <video controls src={preview.url} />
           : <iframe title={preview.fileName} src={preview.url} />}</div></section></div>}
     {sourceDetail && <div className="modal-backdrop" onClick={() => setSourceDetail(undefined)}><section className="preview-modal source-modal" onClick={(event) => event.stopPropagation()}>
-      <div className="section-heading"><div><p className="eyebrow">{sourceDetail.kind}</p><h2>{sourceDetail.title}</h2></div>
+      <div className="section-heading"><h2>{sourceDetail.title}</h2>
         <button onClick={() => setSourceDetail(undefined)}>×</button></div>
-      <div className="source-meta"><span>{new Date(sourceDetail.recordedAt).toLocaleString(language)}</span>
-        {sourceDetail.sourceVersion && <span>{t("sourceVersion")} {sourceDetail.sourceVersion}</span>}
-        {sourceDetail.contentHash && <code>{sourceDetail.contentHash}</code>}</div>
+      <div className="source-meta"><span>{new Date(sourceDetail.recordedAt).toLocaleString(language)}</span></div>
       <pre className="source-body">{sourceDetail.excerpt || t("sourceDeleted")}</pre>
+      <details className="advanced-section source-technical"><summary>{language === "zh-CN" ? "技术详情" : "Technical details"}</summary><div className="source-meta"><span>{sourceDetail.kind}</span>
+        {sourceDetail.sourceVersion && <span>{t("sourceVersion")} {sourceDetail.sourceVersion}</span>}{sourceDetail.contentHash && <code>{sourceDetail.contentHash}</code>}</div></details>
       <div className="chip-list">{sourceDetail.eventIds.map((eventId) =>
         <button key={eventId} onClick={() => { setSourceDetail(undefined); void openEvent(eventId); }}>{t("openEvent")}</button>)}</div>
       {sourceDetail.conversationId && <div className="chip-list"><button onClick={() => {

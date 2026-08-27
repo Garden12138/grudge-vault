@@ -60,7 +60,7 @@ describe("Phase 1 event recording application", () => {
     expect(parseConservativeTemporalValue("没有时间信息")).toEqual({ kind: "unknown" });
   });
 
-  it("keeps the raw message when draft generation fails", async () => {
+  it("keeps the raw message when record generation fails", async () => {
     const failing: EventDraftGeneratorPort = {
       identity: "test.failure", version: 1,
       async generate() { throw new AppError("INTERNAL_ERROR", "generator unavailable", true); }
@@ -69,25 +69,38 @@ describe("Phase 1 event recording application", () => {
     contexts.push(context);
     const conversation = context.application.createConversation("Inbox");
     const result = await context.application.sendMessage({
-      conversationId: conversation.id, content: "A durable raw message", createDraft: true
+      conversationId: conversation.id, content: "A durable raw message", intent: "record"
     });
-    expect(result.draft).toBeUndefined();
-    expect(result.draftError?.code).toBe("INTERNAL_ERROR");
+    expect(result.event).toBeUndefined();
+    expect(result.eventError?.code).toBe("INTERNAL_ERROR");
     expect(context.application.listMessages(conversation.id)[0]?.content).toBe("A durable raw message");
     expect(context.application.searchEvents({})).toEqual([]);
   });
 
-  it("creates a sourced candidate and resolves its clarification with a revision", async () => {
+  it("saves source intent without creating an event", async () => {
     const context = testContext();
     contexts.push(context);
     const conversation = context.application.createConversation("Inbox");
     const result = await context.application.sendMessage({
-      conversationId: conversation.id, content: "Someone removed my name from the report", createDraft: true
+      conversationId: conversation.id, content: "Keep this original text", intent: "source"
     });
-    expect(result.draft?.status).toBe("candidate");
-    expect(result.draft?.occurredAt).toEqual({ kind: "unknown" });
-    expect(result.draft?.sourceRefs).toEqual([result.message.sourceItemId]);
-    const clarification = context.application.listClarifications(result.draft!.id)[0]!;
+    expect(result.event).toBeUndefined();
+    expect(result.eventError).toBeUndefined();
+    expect(context.application.listMessages(conversation.id)[0]?.content).toBe("Keep this original text");
+    expect(context.application.searchEvents({})).toEqual([]);
+  });
+
+  it("creates a sourced confirmed record and resolves its clarification with a revision", async () => {
+    const context = testContext();
+    contexts.push(context);
+    const conversation = context.application.createConversation("Inbox");
+    const result = await context.application.sendMessage({
+      conversationId: conversation.id, content: "Someone removed my name from the report", intent: "record"
+    });
+    expect(result.event?.status).toBe("confirmed");
+    expect(result.event?.occurredAt).toEqual({ kind: "unknown" });
+    expect(result.event?.sourceRefs).toEqual([result.message.sourceItemId]);
+    const clarification = context.application.listClarifications(result.event!.id)[0]!;
     const updated = context.application.answerClarification({
       clarificationId: clarification.id, answer: "Around September", expectedRevision: 1
     });
@@ -103,8 +116,8 @@ describe("Phase 1 event recording application", () => {
     const context = testContext();
     contexts.push(context);
     const conversation = context.application.createConversation("Inbox");
-    const recorded = await context.application.sendMessage({ conversationId: conversation.id, content: "Event text", createDraft: true });
-    const event = recorded.draft!;
+    const recorded = await context.application.sendMessage({ conversationId: conversation.id, content: "Event text", intent: "record" });
+    const event = recorded.event!;
     const fields = {
       title: "Edited once", status: event.status, occurredAt: event.occurredAt,
       facts: event.facts, interpretations: event.interpretations, emotions: event.emotions,
@@ -421,10 +434,10 @@ describe("Phase 3 relations, retrieval, and review application", () => {
   it("sorts and updates the global clarification inbox by explicit priority", async () => {
     const context = testContext();
     const conversation = context.application.createConversation("Clarifications");
-    const first = await context.application.sendMessage({ conversationId: conversation.id, content: "First unknown event", createDraft: true });
-    const second = await context.application.sendMessage({ conversationId: conversation.id, content: "Second unknown event", createDraft: true });
-    const firstClarification = context.application.listClarifications(first.draft!.id)[0]!;
-    const secondClarification = context.application.listClarifications(second.draft!.id)[0]!;
+    const first = await context.application.sendMessage({ conversationId: conversation.id, content: "First unknown event", intent: "record" });
+    const second = await context.application.sendMessage({ conversationId: conversation.id, content: "Second unknown event", intent: "record" });
+    const firstClarification = context.application.listClarifications(first.event!.id)[0]!;
+    const secondClarification = context.application.listClarifications(second.event!.id)[0]!;
     context.application.setClarificationPriority(firstClarification.id, "important");
     context.application.setClarificationPriority(secondClarification.id, "rights_related");
     expect(context.application.listClarifications().slice(0, 2).map(({ id }) => id))

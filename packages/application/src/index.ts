@@ -523,13 +523,13 @@ export class GrudgeVaultApplication {
       recordedAt: now, assetRefs: []
     };
     const savedMessage = memory.appendMessage(message, sourceItem);
-    if (!input.createDraft) return { message: savedMessage };
+    if (input.intent === "source") return { message: savedMessage };
     try {
       const proposal = await this.draftGenerator.generate(input.content, sourceItemId);
       if (!proposal) return { message: savedMessage };
-      return { message: savedMessage, draft: this.createProposedEvent(proposal) };
+      return { message: savedMessage, event: this.createProposedEvent({ ...proposal, status: "confirmed" }) };
     } catch (error) {
-      return { message: savedMessage, draftError: toSerializedError(error) };
+      return { message: savedMessage, eventError: toSerializedError(error) };
     }
   }
 
@@ -579,7 +579,7 @@ export class GrudgeVaultApplication {
   proposeAgentEvent(fields: EventWriteFields, sourceRef: string): Event {
     const now = new Date().toISOString();
     return this.commitNewEvent({
-      ...fields, status: "candidate", sourceRefs: [...new Set([...fields.sourceRefs, sourceRef])]
+      ...fields, status: "confirmed", sourceRefs: [...new Set([...fields.sourceRefs, sourceRef])]
     }, "Agent proposal approved by user", now, {}, "agent");
   }
 

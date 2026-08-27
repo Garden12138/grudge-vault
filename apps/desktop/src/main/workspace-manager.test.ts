@@ -83,9 +83,9 @@ describe("encrypted workspace snapshots", () => {
       const imported = await application.importAsset(resolve("fixtures/assets/phase-zero-demo.txt"));
       const conversation = application.createConversation("Inbox");
       const recorded = await application.sendMessage({
-        conversationId: conversation.id, content: "A restorable project event", createDraft: true
+        conversationId: conversation.id, content: "A restorable project event", intent: "record"
       });
-      expect(recorded.draft).toBeDefined();
+      expect(recorded.event).toBeDefined();
 
       const archive = await application.importAsset(resolve("fixtures/dayone/synthetic-minimal.zip"));
       const now = "2026-08-24T00:00:00.000Z";
@@ -120,7 +120,7 @@ describe("encrypted workspace snapshots", () => {
         sourcePersonId: firstPerson.id, targetPersonId: secondPerson.id, suggestionId: mergeSuggestion.id
       });
       const relation = application.createEventRelation({
-        sourceEventId: recorded.draft!.id, targetEventId: application.listCandidates()[0]!.event.id, kind: "similar"
+        sourceEventId: recorded.event!.id, targetEventId: application.listCandidates()[0]!.event.id, kind: "similar"
       });
       application.setSemanticEnabled(true);
       const agentResult = await new AgentHarness(application).send({
@@ -147,7 +147,7 @@ describe("encrypted workspace snapshots", () => {
       const restoredPath = join(root, "restored");
       const restored = await application.restoreBackup(backupPath, restoredPath);
       expect(restored.rootPath).toBe(restoredPath);
-      expect(application.searchEvents({ text: "restorable" })[0]?.id).toBe(recorded.draft!.id);
+      expect(application.searchEvents({ text: "restorable" })[0]?.id).toBe(recorded.event!.id);
       expect(application.listMessages(conversation.id)[0]?.content).toBe("A restorable project event");
       expect(application.listAssets().map(({ id }) => id)).toEqual(expect.arrayContaining([imported.asset.id, archive.asset.id]));
       const session = manager.current()!;
@@ -159,7 +159,7 @@ describe("encrypted workspace snapshots", () => {
       expect(application.listCandidates()[0]?.excerpt).toContain("Restorable Day One entry");
       expect(application.getPersonIdentity(secondPerson.id).identities).toHaveLength(2);
       expect(application.getPersonIdentity(secondPerson.id).activeMerges[0]?.id).toBe(identityMerge.id);
-      expect(application.listEventRelations(recorded.draft!.id)[0]?.id).toBe(relation.id);
+      expect(application.listEventRelations(recorded.event!.id)[0]?.id).toBe(relation.id);
       expect(application.getEmbeddingStatus()).toMatchObject({ available: false, enabled: true, state: "unavailable" });
       expect((await application.unifiedSearch({ text: "Restorable Day One", semantic: false }))
         .some(({ kind }) => kind === "journal_entry")).toBe(true);
