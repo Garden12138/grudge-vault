@@ -1,18 +1,31 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
-  AgentAction, AgentModelSettings, AgentRun, Asset, BackfillRun, CandidateDetail, CandidateSummary, Conversation, Event, EventDetail,
+  AgentAction, AgentRun, Asset, BackfillRun, BailianRegion, CandidateDetail, CandidateSummary, Conversation, Event, EventDetail,
   EmbeddingIndexStatus, EventRelation, EventRevision, ImportFolderStatus, ImportRun, ImportRunDetail, Job, LocalProcessorStatus,
-  MediaProcessingSettings, Message, Person, PersonIdentityDetail, PersonMergeSuggestion, Reminder, ReviewAutomationSettings,
+  LlmModelOption, LlmProvider, LlmSettings, MediaProcessingSettings, Message, Person, PersonIdentityDetail, PersonMergeSuggestion, Reminder, ReviewAutomationSettings,
   ReviewRun, SourceReferenceDetail, StatementKind,
   TemporalValue, TimelineResult, UnifiedSearchHit, Workspace, WorkspaceLockState
 } from "@grudge-vault/domain";
 import type { EventWriteFields, IpcResult } from "@grudge-vault/shared";
 import { detectLanguage, translator, type Language } from "./i18n";
 import { CasesPanel, EvidencePanel, WorkspaceSecurityPanel } from "./PhaseFive";
-import { MaterialsPage, MemoryPage, RecordPage, ReviewPage, SettingsPage } from "./ProductPages";
+import { AppShell, MaterialsPage, MemoryPage, PageTabs, RecordPage, ReviewPage, SettingsPage } from "./ProductPages";
 
 type View = "chat" | "events" | "search" | "timeline" | "people" | "review" | "backfill" | "vault" | "evidence" | "cases" | "settings";
-type SettingsSection = "general" | "data" | "intelligence" | "advanced";
+type SettingsSection = "general" | "data" | "llm" | "advanced";
+const NVIDIA_DEFAULT_MODEL = "openai/gpt-oss-20b";
+
+interface LlmDraft {
+  region: BailianRegion;
+  model: string;
+  apiKey: string;
+  models: LlmModelOption[];
+  manualModel: boolean;
+}
+
+function defaultLlmModel(provider: LlmProvider): string {
+  return provider === "nvidia" ? NVIDIA_DEFAULT_MODEL : provider === "bailian" ? "qwen3.7-plus" : "";
+}
 
 interface FactInput { id: string; kind: Extract<StatementKind, "fact.confirmed" | "fact.disputed" | "fact.unknown">; text: string }
 interface TextInput { id: string; text: string }
@@ -68,6 +81,56 @@ function formatJournalTimestamp(value: string, language: Language, timeZone?: st
 
 function productError(language: Language, message: string): string {
   const normalized = message.toLowerCase();
+  if (normalized.includes("err_proxy") || normalized.includes("econnrefused")) {
+    return language === "zh-CN" ? "无法连接系统代理，请确认代理软件正在运行后重试。" : "The system proxy could not be reached. Make sure it is running and try again.";
+  }
+  if (normalized.includes("err_name_not_resolved") || normalized.includes("enotfound")) {
+    return language === "zh-CN" ? "无法解析模型服务地址，请检查 DNS 或代理设置。" : "The model service address could not be resolved. Check DNS or proxy settings.";
+  }
+  if (normalized.includes("err_cert") || normalized.includes("certificate")) {
+    return language === "zh-CN" ? "模型服务的 HTTPS 证书校验失败，请检查代理证书设置。" : "The model service certificate could not be verified. Check proxy certificate settings.";
+  }
+  if (normalized.includes("timed out")) {
+    return language === "zh-CN" ? "模型服务响应超时，请稍后重试或更换模型。" : "The model service timed out. Try again or choose another model.";
+  }
+  if (normalized.includes("api key") || normalized.includes("credential")) {
+    return language === "zh-CN" ? "API Key 无法使用，请检查后重新连接。" : "The API key could not be used. Check it and reconnect.";
+  }
+  if (normalized.includes("rate limit")) {
+    return language === "zh-CN" ? "模型服务当前请求较多，请稍后重试。" : "The model service is busy. Try again shortly.";
+  }
+  if (normalized.includes("tool") && (normalized.includes("support") || normalized.includes("compatible"))) {
+    return language === "zh-CN" ? "这个模型不支持应用所需的助手能力，请换一个推荐模型。" : "This model does not support the assistant capabilities required by the app.";
+  }
+  if (normalized.includes("account or region") || normalized.includes("region")) {
+    return language === "zh-CN" ? "当前账号或地域无法使用这个模型，请检查地域或更换模型。" : "This model is unavailable for the current account or region.";
+  }
+  if (normalized.includes("no longer available")) {
+    return language === "zh-CN" ? "这个模型已被服务商下线，请重新加载模型并选择其他模型。" : "This model was retired by the provider. Reload the model list and choose another model.";
+  }
+  if (normalized.includes("model service") && (normalized.includes("reach") || normalized.includes("load"))) {
+    return language === "zh-CN" ? "暂时无法连接模型服务，请检查网络后重试。" : "The model service could not be reached. Check your connection and try again.";
+  }
+  if (normalized.includes("already contains a workspace")) {
+    return language === "zh-CN"
+      ? "这个文件夹已经包含账本，请点击“打开已有工作区”。"
+      : "This folder already contains a journal. Choose “Open existing workspace” instead.";
+  }
+  if (normalized.includes("empty directory")) {
+    return language === "zh-CN"
+      ? "创建新账本需要选择一个空文件夹，请新建空文件夹后重试。"
+      : "A new journal needs an empty folder. Create an empty folder and try again.";
+  }
+  if (normalized.includes("supported grudge vault workspace")) {
+    return language === "zh-CN"
+      ? "所选文件夹不是有效的记仇账本工作区，请选择包含 workspace.json 的文件夹。"
+      : "The selected folder is not a valid Grudge Vault workspace. Choose the folder containing workspace.json.";
+  }
+  if (normalized.includes("workspace key could not be protected")) {
+    return language === "zh-CN"
+      ? "无法使用系统钥匙串保护账本密钥，请确认钥匙串已解锁后重试。"
+      : "The journal key could not be protected. Unlock the operating-system key store and try again.";
+  }
   if (normalized.includes("changed") || normalized.includes("revision") || normalized.includes("stale")) {
     return language === "zh-CN" ? "内容刚刚有更新，请核对后再试。" : "This content was just updated. Review it and try again.";
   }
@@ -168,13 +231,15 @@ export function App() {
   const [lastEvent, setLastEvent] = useState<Event>();
   const [agentRuns, setAgentRuns] = useState<AgentRun[]>([]);
   const [pendingAgentRun, setPendingAgentRun] = useState<AgentRun>();
-  const [agentSettings, setAgentSettings] = useState<AgentModelSettings>();
-  const [agentMode, setAgentMode] = useState<AgentModelSettings["mode"]>("private");
-  const [agentPrivateBaseUrl, setAgentPrivateBaseUrl] = useState("");
-  const [agentPrivateModel, setAgentPrivateModel] = useState("");
-  const [agentEnhancedBaseUrl, setAgentEnhancedBaseUrl] = useState("https://api.openai.com/v1");
-  const [agentEnhancedModel, setAgentEnhancedModel] = useState("");
-  const [agentApiKey, setAgentApiKey] = useState("");
+  const [llmSettings, setLlmSettings] = useState<LlmSettings>({ providers: {} });
+  const [llmProvider, setLlmProvider] = useState<LlmProvider>("nvidia");
+  const [llmRegion, setLlmRegion] = useState<BailianRegion>("cn-beijing");
+  const [llmModel, setLlmModel] = useState(NVIDIA_DEFAULT_MODEL);
+  const [llmApiKey, setLlmApiKey] = useState("");
+  const [llmModels, setLlmModels] = useState<LlmModelOption[]>([]);
+  const [manualLlmModel, setManualLlmModel] = useState(false);
+  const llmDraftsRef = useRef<Partial<Record<LlmProvider, LlmDraft>>>({});
+  const llmFormInitializedRef = useRef(false);
 
   const [events, setEvents] = useState<Event[]>([]);
   const [people, setPeople] = useState<Person[]>([]);
@@ -208,7 +273,7 @@ export function App() {
   const [unifiedQuery, setUnifiedQuery] = useState("");
   const [unifiedHits, setUnifiedHits] = useState<UnifiedSearchHit[]>([]);
   const [semanticSearch, setSemanticSearch] = useState(false);
-  const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingIndexStatus>();
+  const [, setEmbeddingStatus] = useState<EmbeddingIndexStatus>();
   const [timeline, setTimeline] = useState<TimelineResult>();
   const [timelinePerson, setTimelinePerson] = useState("");
   const [timelineFrom, setTimelineFrom] = useState("");
@@ -248,13 +313,13 @@ export function App() {
 
   const refreshLists = useCallback(async () => {
     const [conversationResult, eventResult, peopleResult, assetResult, jobResult, importResult, backfillResult, candidateResult,
-      embeddingResult, reviewResult, clarificationResult, identityResult, agentSettingsResult, processorResult,
+      embeddingResult, reviewResult, clarificationResult, identityResult, llmSettingsResult, processorResult,
       importFolderResult, reminderResult, reviewAutomationResult] = await Promise.all([
       window.grudgeVault.conversations.list(), window.grudgeVault.events.search({}),
       window.grudgeVault.people.list(), window.grudgeVault.assets.list(), window.grudgeVault.jobs.list(),
       window.grudgeVault.imports.list(), window.grudgeVault.backfill.list(), window.grudgeVault.candidates.list(),
       window.grudgeVault.search.getEmbeddingStatus(), window.grudgeVault.reviews.list(), window.grudgeVault.clarifications.list(),
-      window.grudgeVault.people.listIdentities(), window.grudgeVault.agent.getSettings(),
+      window.grudgeVault.people.listIdentities(), window.grudgeVault.llm.getSettings(),
       window.grudgeVault.localIntelligence.status(), window.grudgeVault.importFolder.status(),
       window.grudgeVault.reminders.list(), window.grudgeVault.reminders.getSettings()
     ]);
@@ -289,14 +354,18 @@ export function App() {
     } else setError(reviewResult.error.message);
     if (clarificationResult.ok) setGlobalClarifications(clarificationResult.data); else setError(clarificationResult.error.message);
     if (identityResult.ok) setPersonIdentities(identityResult.data); else setError(identityResult.error.message);
-    if (agentSettingsResult.ok) {
-      const settings = agentSettingsResult.data;
-      setAgentSettings(settings); setAgentMode(settings.mode);
-      setAgentPrivateBaseUrl(settings.privateEndpoint?.baseUrl ?? "");
-      setAgentPrivateModel(settings.privateEndpoint?.model ?? "");
-      setAgentEnhancedBaseUrl(settings.enhancedEndpoint?.baseUrl ?? "https://api.openai.com/v1");
-      setAgentEnhancedModel(settings.enhancedEndpoint?.model ?? "");
-    } else setError(agentSettingsResult.error.message);
+    if (llmSettingsResult.ok) {
+      const settings = llmSettingsResult.data;
+      setLlmSettings(settings);
+      if (!llmFormInitializedRef.current) {
+        const provider = settings.activeProvider ?? "nvidia";
+        const config = settings.providers[provider];
+        setLlmProvider(provider);
+        setLlmRegion(config?.region ?? "cn-beijing");
+        setLlmModel(config?.model ?? defaultLlmModel(provider));
+        llmFormInitializedRef.current = true;
+      }
+    } else setError(llmSettingsResult.error.message);
     if (processorResult.ok) setProcessorStatus(processorResult.data); else setError(processorResult.error.message);
     if (importFolderResult.ok) setImportFolderStatus(importFolderResult.data); else setError(importFolderResult.error.message);
     if (reminderResult.ok) setReminders(reminderResult.data); else setError(reminderResult.error.message);
@@ -360,6 +429,9 @@ export function App() {
     setPersonIdentities([]); setAssets([]); setImportDetail(undefined); setCandidateDetail(undefined); setSelectedReview(undefined);
     setAgentRuns([]); setPendingAgentRun(undefined); setConversations([]); setTimeline(undefined); setUnifiedHits([]);
     setProcessorStatus(undefined); setImportFolderStatus(undefined); setReminders([]); setReviewAutomation(undefined);
+    llmDraftsRef.current = {}; llmFormInitializedRef.current = false;
+    setLlmSettings({ providers: {} }); setLlmProvider("nvidia"); setLlmRegion("cn-beijing");
+    setLlmModel(NVIDIA_DEFAULT_MODEL); setLlmApiKey(""); setLlmModels([]); setManualLlmModel(false);
     setLockState((current) => current.status === "open"
       ? { status: "locked", workspaceId: current.workspace.id, workspaceName: current.workspace.name }
       : current);
@@ -464,31 +536,72 @@ export function App() {
     await refreshAgentConversation(); await refreshLists();
   };
 
-  const saveAgentSettings = async () => {
-    setBusy(true); setError(undefined);
-    const endpoint = agentMode === "private"
-      ? (agentPrivateBaseUrl.trim() && agentPrivateModel.trim() ? {
-          privateEndpoint: {
-            baseUrl: agentPrivateBaseUrl, model: agentPrivateModel,
-            ...(agentApiKey.trim() ? { apiKey: agentApiKey } : {})
-          }
-        } : {})
-      : {
-          enhancedEndpoint: {
-            baseUrl: agentEnhancedBaseUrl, model: agentEnhancedModel,
-            ...(agentApiKey.trim() ? { apiKey: agentApiKey } : {})
-          }
-        };
-    const result = await window.grudgeVault.agent.updateSettings({ mode: agentMode, ...endpoint });
-    setBusy(false);
-    if (!result.ok) return setError(result.error.message);
-    setAgentSettings(result.data); setAgentApiKey(""); setNotice(t("agentSettingsSaved"));
+  const selectLlmProvider = (provider: LlmProvider) => {
+    llmDraftsRef.current[llmProvider] = {
+      region: llmRegion, model: llmModel, apiKey: llmApiKey, models: llmModels, manualModel: manualLlmModel
+    };
+    const draft = llmDraftsRef.current[provider];
+    const config = llmSettings.providers[provider];
+    setLlmProvider(provider);
+    setLlmRegion(draft?.region ?? config?.region ?? "cn-beijing");
+    setLlmModel(draft?.model ?? config?.model ?? defaultLlmModel(provider));
+    setLlmApiKey(draft?.apiKey ?? ""); setLlmModels(draft?.models ?? []);
+    setManualLlmModel(draft?.manualModel ?? false); setError(undefined);
   };
 
-  const clearAgentCredential = async () => {
-    const result = await window.grudgeVault.agent.clearCredential(agentMode);
+  const loadLlmModels = async () => {
+    setBusy(true); setError(undefined);
+    const result = await window.grudgeVault.llm.listModels({
+      provider: llmProvider,
+      ...(llmProvider === "bailian" ? { region: llmRegion } : {}),
+      ...(llmApiKey.trim() ? { apiKey: llmApiKey } : {})
+    });
+    setBusy(false);
     if (!result.ok) return setError(result.error.message);
-    setAgentSettings(result.data); setNotice(t("credentialCleared"));
+    setLlmModels(result.data);
+    if (!llmModel && result.data[0]) setLlmModel(result.data[0].id);
+  };
+
+  const connectLlm = async () => {
+    if (!llmModel.trim()) return setError(language === "zh-CN" ? "请选择或填写模型。" : "Choose or enter a model.");
+    setBusy(true); setError(undefined);
+    const result = await window.grudgeVault.llm.connect({
+      provider: llmProvider, model: llmModel.trim(),
+      ...(llmProvider === "bailian" ? { region: llmRegion } : {}),
+      ...(llmApiKey.trim() ? { apiKey: llmApiKey } : {})
+    });
+    setBusy(false);
+    if (!result.ok) return setError(result.error.message);
+    setLlmSettings(result.data); setLlmApiKey("");
+    setNotice(language === "zh-CN" ? "模型服务已连接并启用。" : "Model service connected and enabled.");
+  };
+
+  const saveLlm = async () => {
+    if (!llmModel.trim()) return setError(language === "zh-CN" ? "请选择或填写模型。" : "Choose or enter a model.");
+    setBusy(true); setError(undefined);
+    const result = await window.grudgeVault.llm.save({
+      provider: llmProvider, model: llmModel.trim(),
+      ...(llmProvider === "bailian" ? { region: llmRegion } : {}),
+      ...(llmApiKey.trim() ? { apiKey: llmApiKey } : {})
+    });
+    setBusy(false);
+    if (!result.ok) return setError(result.error.message);
+    setLlmSettings(result.data); setLlmApiKey("");
+    llmDraftsRef.current[llmProvider] = {
+      region: llmRegion, model: llmModel.trim(), apiKey: "", models: llmModels, manualModel: manualLlmModel
+    };
+    setNotice(language === "zh-CN"
+      ? "配置已安全保存到当前账本；连接并启用前不会发送测试请求。"
+      : "Configuration saved securely in this journal. No test request is sent until you connect and enable it.");
+  };
+
+  const disconnectLlm = async () => {
+    const label = llmProvider === "nvidia" ? "NVIDIA" : llmProvider === "openrouter" ? "OpenRouter" : "百炼";
+    if (!window.confirm(language === "zh-CN" ? `断开 ${label} 并清除本机保存的 API Key？` : `Disconnect ${label} and clear its saved API key?`)) return;
+    const result = await window.grudgeVault.llm.disconnect(llmProvider);
+    if (!result.ok) return setError(result.error.message);
+    setLlmSettings(result.data); setLlmApiKey(""); setLlmModels([]);
+    setNotice(language === "zh-CN" ? "模型服务已断开。" : "Model service disconnected.");
   };
 
   const createManualEvent = async () => {
@@ -640,6 +753,13 @@ export function App() {
 
   const updateAutomation = async (patch: Partial<ReviewAutomationSettings>) => {
     if (!reviewAutomation) return;
+    if (patch.systemNotifications === true && !reviewAutomation.systemNotifications) {
+      const permission = await window.grudgeVault.reminders.requestSystemNotifications(language);
+      if (!permission.ok) return setError(permission.error.message);
+      if (!permission.data) {
+        return setError(language === "zh-CN" ? "当前系统不支持应用通知。" : "App notifications are not supported on this system.");
+      }
+    }
     const result = await window.grudgeVault.reminders.updateSettings({ ...reviewAutomation, ...patch });
     if (!result.ok) return setError(result.error.message);
     setReviewAutomation(result.data);
@@ -713,12 +833,6 @@ export function App() {
       setUnifiedHits(result.data);
       setView("search");
     }
-  };
-
-  const toggleSemanticSearch = async (enabled: boolean) => {
-    const result = await window.grudgeVault.search.setSemanticEnabled(enabled);
-    if (!result.ok) return setError(result.error.message);
-    setSemanticSearch(enabled); setEmbeddingStatus(result.data);
   };
 
   const openSource = async (sourceItemId: string) => {
@@ -856,6 +970,34 @@ export function App() {
     }
   };
 
+  const deleteVaultAsset = async (asset: Asset) => {
+    const impact = await window.grudgeVault.evidence.deleteImpact(asset.id);
+    if (!impact.ok) return setError(impact.error.message);
+    const total = impact.data.eventIds.length + impact.data.sourceItemIds.length
+      + impact.data.importRunIds.length + impact.data.caseIds.length;
+    const referencedCopy = total > 0
+      ? (language === "zh-CN"
+          ? `它仍被 ${impact.data.eventIds.length} 条记录、${impact.data.sourceItemIds.length} 个来源、${impact.data.importRunIds.length} 次导入和 ${impact.data.caseIds.length} 个材料包引用。`
+          : `It is still referenced by ${impact.data.eventIds.length} records, ${impact.data.sourceItemIds.length} sources, ${impact.data.importRunIds.length} imports, and ${impact.data.caseIds.length} material packages.`)
+      : (language === "zh-CN"
+          ? "它没有任何引用，文件名、大小和哈希等元数据也会一并清除。"
+          : "It has no references, so metadata such as its file name, size, and hash will also be removed.");
+    const message = language === "zh-CN"
+      ? `将从磁盘永久删除“${asset.originalFileName}”的加密原件，删除后无法预览或导出。${referencedCopy}${total > 0 ? "为保留引用关系，材料详情中会留下“已删除”记录。" : ""}继续吗？`
+      : `This permanently removes the encrypted original “${asset.originalFileName}” from disk. It can no longer be previewed or exported. ${referencedCopy}${total > 0 ? " A “Deleted” record remains in Material details to preserve references." : ""} Continue?`;
+    if (!window.confirm(message)) return;
+    const result = await window.grudgeVault.evidence.deleteOriginal({
+      assetId: asset.id, confirmReferencedDeletion: total > 0
+    });
+    if (!result.ok) return setError(result.error.message);
+    setNotice(total === 0
+      ? (language === "zh-CN" ? "材料原件及其元数据已永久删除。" : "The original and its metadata were permanently deleted.")
+      : (language === "zh-CN"
+          ? "加密原件已从磁盘永久删除；引用位置仅保留“已删除”记录。"
+          : "The encrypted original was permanently removed from disk; referenced locations retain only a “Deleted” record."));
+    await refreshLists();
+  };
+
   const setAppLanguage = (next: Language) => {
     window.localStorage.setItem("grudge-vault.language", next);
     document.documentElement.lang = next;
@@ -912,8 +1054,7 @@ export function App() {
     </section></main>;
   }
 
-  return <main className="app-shell">
-    <aside className="app-sidebar">
+  return <AppShell sidebar={<>
       <div className="brand"><h1>{t("appName")}</h1></div>
       <nav aria-label={language === "zh-CN" ? "主要功能" : "Main navigation"}>
         <button className={view === "chat" ? "active" : ""} onClick={() => setView("chat")}>{language === "zh-CN" ? "记录" : "Record"}</button>
@@ -923,30 +1064,29 @@ export function App() {
         <button className={["settings", "backfill"].includes(view) ? "active" : ""} onClick={() => { setSettingsSection("general"); setView("settings"); }}>{language === "zh-CN" ? "设置" : "Settings"}</button>
       </nav>
       <div className="workspace-card"><strong>{workspace.name}</strong><em>{language === "zh-CN" ? "数据保存在本机" : "Data stays on this device"}</em></div>
-    </aside>
-    <section className="workspace-view">
+    </>}>
       <header className="workspace-topbar"><form className="global-search" onSubmit={(event) => { event.preventDefault(); void runUnifiedSearch(); }}>
         <input aria-label={language === "zh-CN" ? "搜索记忆" : "Search memory"} placeholder={language === "zh-CN" ? "搜索记录、Day One 和材料文字…" : "Search records, Day One, and material text…"}
           value={unifiedQuery} onChange={(event) => setUnifiedQuery(event.target.value)} />
         <button type="submit" disabled={!unifiedQuery.trim()}>{language === "zh-CN" ? "搜索" : "Search"}</button>
       </form></header>
-      {["events", "search", "timeline", "people"].includes(view) && <nav className="section-tabs" aria-label={language === "zh-CN" ? "记忆页面" : "Memory pages"}>
+      {["events", "search", "timeline", "people"].includes(view) && <PageTabs label={language === "zh-CN" ? "记忆页面" : "Memory pages"}>
         <button className={view === "events" ? "active" : ""} onClick={() => setView("events")}>{language === "zh-CN" ? "全部记录" : "All records"}</button>
         <button className={view === "search" ? "active" : ""} onClick={() => setView("search")}>{language === "zh-CN" ? "搜索结果" : "Search results"}</button>
         <button className={view === "people" ? "active" : ""} onClick={() => { setView("people"); void loadMergeSuggestions(); if (!selectedPerson && personIdentities[0]) void openPerson(personIdentities[0].canonicalPerson.id); }}>{language === "zh-CN" ? "人物" : "People"}</button>
         <button className={view === "timeline" ? "active" : ""} onClick={() => { setView("timeline"); void loadTimeline(); }}>{language === "zh-CN" ? "时间线" : "Timeline"}</button>
-      </nav>}
-      {["vault", "evidence", "cases"].includes(view) && <nav className="section-tabs" aria-label={language === "zh-CN" ? "材料页面" : "Material pages"}>
+      </PageTabs>}
+      {["vault", "evidence", "cases"].includes(view) && <PageTabs label={language === "zh-CN" ? "材料页面" : "Material pages"}>
         <button className={view === "vault" ? "active" : ""} onClick={() => setView("vault")}>{language === "zh-CN" ? "全部材料" : "All materials"}</button>
         <button className={view === "evidence" ? "active" : ""} onClick={() => setView("evidence")}>{language === "zh-CN" ? "材料详情" : "Material details"}</button>
         <button className={view === "cases" ? "active" : ""} onClick={() => setView("cases")}>{language === "zh-CN" ? "材料包" : "Material packages"}</button>
-      </nav>}
-      {["settings", "backfill"].includes(view) && <nav className="section-tabs" aria-label={language === "zh-CN" ? "设置页面" : "Settings pages"}>
-        {(["general", "data", "intelligence", "advanced"] as SettingsSection[]).map((section) => <button key={section}
+      </PageTabs>}
+      {["settings", "backfill"].includes(view) && <PageTabs label={language === "zh-CN" ? "设置页面" : "Settings pages"}>
+        {(["general", "data", "llm", "advanced"] as SettingsSection[]).map((section) => <button key={section}
           className={settingsSection === section ? "active" : ""} onClick={() => { setSettingsSection(section); setView(section === "data" ? "backfill" : "settings"); }}>
-          {language === "zh-CN" ? ({ general: "常规", data: "数据", intelligence: "智能功能", advanced: "高级设置" } as const)[section]
-            : ({ general: "General", data: "Data", intelligence: "Smart features", advanced: "Advanced" } as const)[section]}</button>)}
-      </nav>}
+          {language === "zh-CN" ? ({ general: "常规", data: "数据", llm: "模型服务", advanced: "高级设置" } as const)[section]
+            : ({ general: "General", data: "Data", llm: "Model service", advanced: "Advanced" } as const)[section]}</button>)}
+      </PageTabs>}
       {(error || notice) && <div className={error ? "error-banner sticky" : "notice-banner sticky"} role="alert">
         <span>{error ?? notice}</span><button onClick={() => { setError(undefined); setNotice(undefined); }}>×</button>
       </div>}
@@ -1314,12 +1454,19 @@ export function App() {
             const files = Array.from(event.target.files ?? []);
             if (files.length > 0) void importVaultFiles(files);
           }} />
-          {assets.length === 0 ? <div className="empty">{language === "zh-CN" ? "还没有材料。" : "No materials yet."}</div> : <div className="asset-list">{assets.map((asset) => <article className="asset-row" key={asset.id}>
-            <div><strong>{asset.originalFileName}</strong><span>{formatBytes(asset.byteSize)} · {language === "zh-CN" ? "可用" : "Available"}</span></div>
-            <div className="row-actions"><button onClick={() => void previewAsset(asset.id)}>{t("preview")}</button><button onClick={() => void window.grudgeVault.assets.exportCopy(asset.id)}>{t("exportCopy")}</button>
-              <button onClick={() => void window.grudgeVault.localIntelligence.processAsset(asset.id).then(async (result) => {
+          {assets.every(({ availabilityStatus }) => availabilityStatus === "deleted")
+            ? <div className="empty">{language === "zh-CN" ? "还没有材料。" : "No materials yet."}</div>
+            : <div className="asset-list">{assets.filter(({ availabilityStatus }) => availabilityStatus !== "deleted").map((asset) => <article className="asset-row" key={asset.id}>
+            <div><strong>{asset.originalFileName}</strong><span>{formatBytes(asset.byteSize)} · {asset.availabilityStatus === "missing"
+              ? (language === "zh-CN" ? "文件缺失" : "Missing")
+              : asset.availabilityStatus === "superseded" ? (language === "zh-CN" ? "已被替换" : "Superseded")
+                : (language === "zh-CN" ? "可用" : "Available")}</span></div>
+            <div className="row-actions"><button disabled={asset.availabilityStatus === "missing"} onClick={() => void previewAsset(asset.id)}>{t("preview")}</button>
+              <button disabled={asset.availabilityStatus === "missing"} onClick={() => void window.grudgeVault.assets.exportCopy(asset.id)}>{t("exportCopy")}</button>
+              <button disabled={asset.availabilityStatus === "missing"} onClick={() => void window.grudgeVault.localIntelligence.processAsset(asset.id).then(async (result) => {
                 if (!result.ok) setError(result.error.message); else await refreshLists();
-              })}>{language === "zh-CN" ? "提取文字" : "Extract text"}</button></div>
+              })}>{language === "zh-CN" ? "提取文字" : "Extract text"}</button>
+              <button onClick={() => void deleteVaultAsset(asset)}>{language === "zh-CN" ? "永久删除" : "Delete permanently"}</button></div>
             <details className="asset-advanced"><summary>{language === "zh-CN" ? "高级详情" : "Advanced details"}</summary><code>{asset.sha256}</code>
               <span>{language === "zh-CN" ? "文件检查" : "File check"}: {asset.integrityStatus}</span><button onClick={() => void window.grudgeVault.assets.verify(asset.id)}>{t("verify")}</button></details></article>)}</div>}
         </section>
@@ -1339,34 +1486,62 @@ export function App() {
             <button className={language === "en" ? "active" : ""} onClick={() => setAppLanguage("en")}>{t("english")}</button></div></section>
         <WorkspaceSecurityPanel mode="general" language={language} onError={setError} onNotice={setNotice} onLocked={clearSensitiveRendererState} />
         {reviewAutomation && <section className="panel settings-card"><h2>{language === "zh-CN" ? "回顾与提醒" : "Reviews and reminders"}</h2>
-          <div className="settings-checks"><label className="check"><input type="checkbox" checked={reviewAutomation.monthly}
-            onChange={(event) => void updateAutomation({ monthly: event.target.checked })} />{language === "zh-CN" ? "每月提醒我回顾" : "Remind me to review monthly"}</label>
-            <label className="check"><input type="checkbox" checked={reviewAutomation.quarterly}
-              onChange={(event) => void updateAutomation({ quarterly: event.target.checked })} />{language === "zh-CN" ? "每季度提醒我回顾" : "Remind me to review quarterly"}</label>
-            <label className="check"><input type="checkbox" checked={reviewAutomation.clarificationWeekly}
-              onChange={(event) => void updateAutomation({ clarificationWeekly: event.target.checked })} />{language === "zh-CN" ? "每周提醒待补充事项" : "Weekly reminder for missing details"}</label>
-            <label className="check"><input type="checkbox" checked={reviewAutomation.systemNotifications}
+          <p>{language === "zh-CN" ? "月度、季度回顾和每周待补充提醒会自动准备，无需额外设置。" : "Monthly, quarterly, and weekly follow-ups are prepared automatically."}</p>
+          <div className="settings-checks"><label className="check"><input type="checkbox" checked={reviewAutomation.systemNotifications}
               onChange={(event) => void updateAutomation({ systemNotifications: event.target.checked })} />{language === "zh-CN" ? "允许系统通知" : "Allow system notifications"}</label></div></section>}
       </SettingsPage>}
 
-      {view === "settings" && settingsSection === "intelligence" && <SettingsPage className="settings-grid">
-        <section className="panel settings-card"><h2>{language === "zh-CN" ? "智能搜索" : "Smart search"}</h2>
-          <p>{language === "zh-CN" ? "在普通关键词搜索之外，尝试找到意思相近的记录。" : "Find records with similar meaning in addition to keyword matches."}</p>
-          <label className="check"><input type="checkbox" disabled={!embeddingStatus?.available} checked={semanticSearch && Boolean(embeddingStatus?.available)}
-            onChange={(event) => void toggleSemanticSearch(event.target.checked)} />{embeddingStatus?.available ? (language === "zh-CN" ? "使用智能搜索" : "Use smart search") : (language === "zh-CN" ? "当前设备暂不支持" : "Not available on this device")}</label>
+      {view === "settings" && settingsSection === "llm" && <SettingsPage className="llm-settings-page">
+        <section className="panel settings-card llm-settings-card">
+          <div className="section-heading llm-heading"><div><h2>{language === "zh-CN" ? "模型服务" : "Model service"}</h2>
+            <p>{language === "zh-CN" ? "连接一个 API 模型，让助手完成更深入的整理和分析。发送记录前仍会请你确认。" : "Connect an API model for deeper organization and analysis. You still confirm before records are sent."}</p></div>
+            {llmSettings.activeProvider && <span className="connection-summary">{language === "zh-CN" ? "当前已启用" : "Active"}</span>}</div>
+          <div className="provider-selector" role="tablist" aria-label={language === "zh-CN" ? "模型服务商" : "Model providers"}>
+            {(["nvidia", "openrouter", "bailian"] as const).map((provider) => {
+              const label = provider === "nvidia" ? "NVIDIA" : provider === "openrouter" ? "OpenRouter" : "百炼";
+              const config = llmSettings.providers[provider];
+              return <button key={provider} role="tab" aria-selected={llmProvider === provider}
+                className={llmProvider === provider ? "active" : ""} onClick={() => selectLlmProvider(provider)}>
+                <strong>{label}</strong><span>{config?.status === "needs_attention"
+                  ? (language === "zh-CN" ? "已保存，待验证" : "Saved, verify next") : llmSettings.activeProvider === provider
+                  ? (language === "zh-CN" ? "使用中" : "In use") : config?.credentialConfigured
+                    ? (language === "zh-CN" ? "已连接" : "Connected") : config
+                      ? (language === "zh-CN" ? "配置已保存" : "Configuration saved")
+                      : (language === "zh-CN" ? "未连接" : "Not connected")}</span>
+              </button>;
+            })}
+          </div>
+          <div className="llm-form">
+            {llmProvider === "bailian" && <label className="field"><span>{language === "zh-CN" ? "服务地域" : "Service region"}</span>
+              <select value={llmRegion} onChange={(event) => { setLlmRegion(event.target.value as BailianRegion); setLlmModels([]); }}>
+                <option value="cn-beijing">{language === "zh-CN" ? "中国大陆（北京）" : "China mainland (Beijing)"}</option>
+                <option value="ap-southeast-1">{language === "zh-CN" ? "新加坡" : "Singapore"}</option>
+                <option value="us-east-1">{language === "zh-CN" ? "美国（弗吉尼亚）" : "US (Virginia)"}</option>
+                <option value="cn-hongkong">{language === "zh-CN" ? "中国香港" : "Hong Kong, China"}</option>
+              </select><small>{language === "zh-CN" ? "地域必须与你创建 API Key 时选择的地域一致。" : "This must match the region where the API key was created."}</small></label>}
+            <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={llmApiKey}
+              placeholder={llmSettings.providers[llmProvider]?.credentialConfigured ? (language === "zh-CN" ? "已安全保存在本机；留空则继续使用" : "Saved securely; leave blank to keep using it") : "••••••••"}
+              onChange={(event) => setLlmApiKey(event.target.value)} /></label>
+            {!manualLlmModel ? <label className="field"><span>{language === "zh-CN" ? "模型" : "Model"}</span>
+              <div className="model-picker"><select value={llmModel} onChange={(event) => setLlmModel(event.target.value)}>
+                {!llmModel && <option value="">{language === "zh-CN" ? "请选择模型" : "Choose a model"}</option>}
+                {llmModel && !llmModels.some(({ id }) => id === llmModel) && <option value={llmModel}>{llmModel}</option>}
+                {llmModels.map((model) => <option key={model.id} value={model.id}>{model.recommended ? "★ " : ""}{model.name}</option>)}
+              </select><button disabled={busy} onClick={() => void loadLlmModels()}>{language === "zh-CN" ? "加载推荐" : "Load recommendations"}</button></div>
+              <small><button className="text-button" onClick={() => setManualLlmModel(true)}>{language === "zh-CN" ? "使用其他模型名称" : "Use another model name"}</button></small>
+            </label> : <label className="field"><span>{language === "zh-CN" ? "模型名称" : "Model name"}</span>
+              <input value={llmModel} maxLength={200} onChange={(event) => setLlmModel(event.target.value)} />
+              <small><button className="text-button" onClick={() => setManualLlmModel(false)}>{language === "zh-CN" ? "返回推荐模型" : "Back to recommended models"}</button></small></label>}
+            <div className="connection-note"><strong>{language === "zh-CN" ? "启用前会进行一次连接测试" : "A connection test runs before enabling"}</strong>
+              <span>{llmProvider === "nvidia"
+                ? (language === "zh-CN" ? "先确认模型仍在 NVIDIA 目录中，再完成一次最多 8 token 的真实推理；最长等待 360 秒。" : "It confirms the model is still in NVIDIA's catalog, then runs a real inference of at most 8 tokens with a 360-second timeout.")
+                : (language === "zh-CN" ? "只请求一个极短回复，用来验证 API Key 和模型，可能产生极少量服务商费用。" : "It requests one very short reply to verify the API key and model and may incur a tiny provider charge.")}</span></div>
+            <div className="landing-actions"><button disabled={busy || !llmModel.trim()} onClick={() => void saveLlm()}>{language === "zh-CN" ? "保存配置" : "Save configuration"}</button>
+              <button className="primary" disabled={busy || !llmModel.trim()} onClick={() => void connectLlm()}>{language === "zh-CN" ? "连接并启用" : "Connect and enable"}</button>
+            </div>
+            {llmSettings.providers[llmProvider] && <small><button className="text-button danger-text" disabled={busy} onClick={() => void disconnectLlm()}>{language === "zh-CN" ? "清除已保存配置" : "Clear saved configuration"}</button></small>}
+          </div>
         </section>
-        {processorStatus && <section className="panel settings-card"><h2>{language === "zh-CN" ? "附件文字识别与录音转写" : "Attachment text and audio transcription"}</h2>
-          <p>{language === "zh-CN" ? "处理只在本机进行，不会自动下载模型或联网。" : "Processing stays on this device and never downloads models or connects automatically."}</p>
-          <label className="check"><input type="checkbox" checked={processorStatus.settings.autoProcessNew}
-            onChange={(event) => void updateMediaSettings({ autoProcessNew: event.target.checked })} />{language === "zh-CN" ? "自动处理新材料" : "Automatically process new materials"}</label>
-          <button disabled={processorStatus.eligibleHistoricalAssets === 0} onClick={() => void processHistoricalMedia()}>{language === "zh-CN"
-            ? `处理已有材料（${processorStatus.eligibleHistoricalAssets}）` : `Process existing materials (${processorStatus.eligibleHistoricalAssets})`}</button>
-        </section>}
-        <section className="panel settings-card"><h2>{language === "zh-CN" ? "助手模式" : "Assistant mode"}</h2>
-          <p>{language === "zh-CN" ? "离线模式不发送内容；联网增强会在每次发送前让你确认。" : "Offline mode keeps content local. Enhanced mode asks before sending any context."}</p>
-          <div className="language-pills"><button className={agentMode === "private" ? "active" : ""} onClick={() => setAgentMode("private")}>{language === "zh-CN" ? "离线" : "Offline"}</button>
-            <button className={agentMode === "enhanced" ? "active" : ""} onClick={() => setAgentMode("enhanced")}>{language === "zh-CN" ? "联网增强" : "Enhanced"}</button></div>
-          <button className="primary" onClick={() => void saveAgentSettings()}>{language === "zh-CN" ? "保存助手模式" : "Save assistant mode"}</button></section>
       </SettingsPage>}
 
       {view === "settings" && settingsSection === "advanced" && <SettingsPage className="settings-grid">
@@ -1390,9 +1565,7 @@ export function App() {
           <label className="field"><span>{language === "zh-CN" ? "资源档位" : "Resource profile"}</span><select value={processorStatus.settings.resourceProfile}
             onChange={(event) => void updateMediaSettings({ resourceProfile: event.target.value as MediaProcessingSettings["resourceProfile"] })}>
             <option value="conservative">conservative</option><option value="balanced">balanced</option><option value="performance">performance</option></select></label>
-          <div className="people-picker"><label className="check"><input type="checkbox" checked={processorStatus.settings.autoProcessNew}
-            onChange={(event) => void updateMediaSettings({ autoProcessNew: event.target.checked })} />{language === "zh-CN" ? "自动处理新附件" : "Automatically process new attachments"}</label>
-            <label className="check"><input type="checkbox" checked={processorStatus.settings.whisperGpu === "auto"}
+          <div className="people-picker"><label className="check"><input type="checkbox" checked={processorStatus.settings.whisperGpu === "auto"}
               onChange={(event) => void updateMediaSettings({ whisperGpu: event.target.checked ? "auto" : "cpu" })} />{language === "zh-CN" ? "Whisper 自动使用 GPU" : "Whisper GPU auto"}</label></div>
           {[...processorStatus.ocr.warnings, ...processorStatus.asr.warnings].map((warning) => <p className="warning-copy" key={warning}>{warning}</p>)}
           <div className="landing-actions"><button onClick={() => void probeProcessors()}>{language === "zh-CN" ? "重新探测" : "Probe again"}</button>
@@ -1400,32 +1573,7 @@ export function App() {
               ? `处理历史附件（${processorStatus.eligibleHistoricalAssets}）` : `Process historical (${processorStatus.eligibleHistoricalAssets})`}</button></div>
           <p className="muted">{language === "zh-CN" ? "OCR/转写搜索正文会存储在未加密 SQLite 元数据中。" : "OCR/transcript search text is stored in unencrypted SQLite metadata."}</p>
         </section>}
-        <section className="panel settings-card agent-settings-card"><p className="eyebrow">HARNESS AGENT</p><h2>{t("agentSettings")}</h2>
-          <p>{t("agentSettingsHelp")}</p>
-          <label className="field"><span>{t("agentExecutionMode")}</span><select value={agentMode}
-            onChange={(event) => setAgentMode(event.target.value as AgentModelSettings["mode"])}>
-            <option value="private">Private</option><option value="enhanced">Enhanced</option></select></label>
-          {agentMode === "private" ? <>
-            <label className="field"><span>{t("modelBaseUrl")}</span><input aria-label={t("modelBaseUrl")} value={agentPrivateBaseUrl}
-              placeholder="http://127.0.0.1:11434/v1" onChange={(event) => setAgentPrivateBaseUrl(event.target.value)} /></label>
-            <label className="field"><span>{t("modelName")}</span><input aria-label={t("modelName")} value={agentPrivateModel}
-              placeholder="local-model" onChange={(event) => setAgentPrivateModel(event.target.value)} /></label>
-          </> : <>
-            <label className="field"><span>{t("modelBaseUrl")}</span><input aria-label={t("modelBaseUrl")} value={agentEnhancedBaseUrl}
-              onChange={(event) => setAgentEnhancedBaseUrl(event.target.value)} /></label>
-            <label className="field"><span>{t("modelName")}</span><input aria-label={t("modelName")} value={agentEnhancedModel}
-              onChange={(event) => setAgentEnhancedModel(event.target.value)} /></label>
-          </>}
-          <label className="field"><span>{t("apiKey")}</span><input aria-label={t("apiKey")} type="password" value={agentApiKey}
-            placeholder={agentMode === "private" ? t("optional") : "••••••••"} onChange={(event) => setAgentApiKey(event.target.value)} /></label>
-          <p className="muted">{t("credentialStatus")}: {(agentMode === "private" ? agentSettings?.privateEndpoint : agentSettings?.enhancedEndpoint)?.credentialConfigured
-            ? t("configured") : t("notConfigured")}</p>
-          <p className="muted">{t("consentedCategories")}: {agentSettings?.consentedDataCategories.join(", ") || t("none")}</p>
-          <div className="landing-actions"><button className="primary" disabled={busy} onClick={() => void saveAgentSettings()}>{t("saveAgentSettings")}</button>
-            <button onClick={() => void clearAgentCredential()}>{t("clearCredential")}</button></div>
-        </section>
       </SettingsPage>}
-    </section>
 
     {pendingAgentRun?.disclosure && <div className="modal-backdrop"><section className="preview-modal consent-modal">
       <div className="section-heading"><h2>{t("externalContextConsent")}</h2></div>
@@ -1455,5 +1603,5 @@ export function App() {
         setSelectedConversationId(sourceDetail.conversationId); setSourceDetail(undefined); setView("chat");
       }}>{t("openConversation")}</button></div>}
     </section></div>}
-  </main>;
+  </AppShell>;
 }

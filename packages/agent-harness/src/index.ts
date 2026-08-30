@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
+  llmProviderHeaders,
   parseConservativeTemporalValue,
+  resolveLlmProviderEndpoint,
   type GrudgeVaultApplication
 } from "@grudge-vault/application";
 import type {
@@ -18,6 +20,9 @@ import type {
   Event,
   ExternalContextDisclosure,
   GroundedAgentClaim,
+  LlmModelOption,
+  LlmProvider,
+  LlmSettings,
   Message,
   SourceReferenceDetail,
   StrategyAnalysis,
@@ -31,6 +36,8 @@ import {
   type AgentSettingsUpdateInput,
   type CreateCaseInput,
   type EventWriteFields,
+  type LlmConnectInput,
+  type LlmListModelsInput,
   type UpdateCaseInput,
   type UpdateEventInput
 } from "@grudge-vault/shared";
@@ -225,10 +232,26 @@ export interface AgentModelAdapterRequest {
   baseUrl: string;
   model: string;
   apiKey?: string;
+  extraHeaders?: Record<string, string>;
   system: string;
   user: string;
   tools: RegisteredAgentTool[];
   executeTool(name: string, input: unknown, providerCallId: string): Promise<unknown>;
+}
+
+export interface AgentModelConnectionRequest {
+  baseUrl: string;
+  model: string;
+  apiKey: string;
+  extraHeaders?: Record<string, string>;
+}
+
+export interface AgentModelCatalogItem {
+  id: string;
+  name?: string;
+  supportedParameters?: string[];
+  outputModalities?: string[];
+  pricing?: { prompt?: string; completion?: string };
 }
 
 export interface AgentModelAdapterResult {
@@ -242,6 +265,8 @@ export interface AgentModelAdapterPort {
   readonly identity: string;
   readonly version: number;
   run(input: AgentModelAdapterRequest): Promise<AgentModelAdapterResult>;
+  testConnection?(input: AgentModelConnectionRequest): Promise<void>;
+  listModels?(input: Omit<AgentModelConnectionRequest, "model"> & { query?: globalThis.URLSearchParams }): Promise<AgentModelCatalogItem[]>;
 }
 
 type FetchResponse = Awaited<ReturnType<typeof globalThis.fetch>>;
@@ -273,14 +298,171 @@ async function readBoundedResponse(response: FetchResponse): Promise<string> {
   return new globalThis.TextDecoder().decode(bytes);
 }
 
+function modelHttpError(status: number): AppError {
+  if (status === 401 || status === 403) {
+    return new AppError("LLM_AUTHENTICATION_FAILED", "The API key was rejected by the model service.");
+  }
+  if (status === 404) return new AppError("LLM_MODEL_NOT_FOUND", "The selected model is not available in this account or region.");
+  if (status === 410) return new AppError("LLM_MODEL_NOT_FOUND", "The selected model is no longer available from this provider.");
+  if (status === 429) return new AppError("LLM_RATE_LIMITED", "The model service is temporarily rate limited.", true);
+  return new AppError("AGENT_MODEL_UNAVAILABLE", `The model service returned HTTP ${status}.`, status >= 500);
+}
+
+function isAbortError(cause: unknown): boolean {
+  return cause instanceof Error && cause.name === "AbortError";
+}
+
+function safeTransportCode(cause: unknown): string | undefined {
+  let current = cause;
+  for (let depth = 0; depth < 4 && current; depth += 1) {
+    if (current instanceof Error) {
+      const chromiumCode = current.message.match(/(?:net::)?(ERR_[A-Z0-9_]+)/)?.[1];
+      if (chromiumCode) return chromiumCode;
+      current = current.cause;
+      continue;
+    }
+    if (typeof current === "object") {
+      const code = (current as { code?: unknown }).code;
+      if (typeof code === "string" && /^[A-Z][A-Z0-9_]{1,80}$/.test(code)) return code;
+      current = (current as { cause?: unknown }).cause;
+      continue;
+    }
+    break;
+  }
+  return undefined;
+}
+
+function unreachableMessage(cause: unknown, fallback: string): string {
+  const code = safeTransportCode(cause);
+  return code ? `${fallback} (${code})` : fallback;
+}
+
+async function resolvePendingChatCompletion(
+  fetcher: typeof globalThis.fetch,
+  response: FetchResponse,
+  baseUrl: string,
+  headers: Record<string, string>,
+  signal: AbortSignal
+): Promise<FetchResponse> {
+  if (response.status !== 202) return response;
+  const pendingBody = await readBoundedResponse(response);
+  let bodyRequestId: string | undefined;
+  try {
+    const parsed = JSON.parse(pendingBody) as { requestId?: unknown; request_id?: unknown };
+    const candidate = parsed.requestId ?? parsed.request_id;
+    if (typeof candidate === "string") bodyRequestId = candidate;
+  } catch {
+    // Some NVIDIA deployments return the request id only in the response header.
+  }
+  const requestId = response.headers.get("nvcf-reqid") ?? bodyRequestId;
+  if (!requestId || !/^[A-Za-z0-9_-]{1,200}$/.test(requestId)) {
+    throw new AppError("AGENT_MODEL_UNAVAILABLE", "The model service returned a pending response without a request id.", true);
+  }
+  let current = response;
+  while (current.status === 202) {
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    if (signal.aborted) throw signal.reason;
+    current = await fetcher(`${baseUrl.replace(/\/$/, "")}/status/${encodeURIComponent(requestId)}`, {
+      method: "GET", redirect: "error", signal, headers
+    });
+    if (current.status === 202) await readBoundedResponse(current);
+  }
+  return current;
+}
+
+function modelRequestTuning(model: string): Record<string, unknown> {
+  // Keep DeepSeek V4 in its non-thinking mode so the app's bounded tool loop
+  // remains responsive and predictable.
+  return model.startsWith("deepseek-ai/deepseek-v4-") ? { reasoning_effort: "none" } : {};
+}
+
 export class OpenAiCompatibleChatAdapter implements AgentModelAdapterPort {
   readonly identity = "openai-compatible.chat-completions";
   readonly version = 1;
 
   constructor(
     private readonly fetcher: typeof globalThis.fetch = globalThis.fetch,
-    private readonly requestTimeoutMs = 60_000
+    private readonly requestTimeoutMs = 360_000
   ) {}
+
+  async testConnection(input: AgentModelConnectionRequest): Promise<void> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    let response: FetchResponse;
+    try {
+      const headers = {
+        "content-type": "application/json", authorization: `Bearer ${input.apiKey}`,
+        ...input.extraHeaders
+      };
+      response = await this.fetcher(`${input.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+        method: "POST", redirect: "error", signal: controller.signal,
+        headers,
+        body: JSON.stringify({
+          model: input.model,
+          messages: [{ role: "user", content: "Reply with OK." }],
+          stream: false, max_tokens: 8,
+          ...modelRequestTuning(input.model)
+        })
+      });
+      response = await resolvePendingChatCompletion(this.fetcher, response, input.baseUrl, headers, controller.signal);
+    } catch (cause) {
+      if (cause instanceof AppError) throw cause;
+      throw new AppError("AGENT_MODEL_UNAVAILABLE", isAbortError(cause)
+        ? "The model service connection test timed out."
+        : unreachableMessage(cause, "The model service could not be reached."), true, { cause });
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (!response.ok) throw modelHttpError(response.status);
+    try { chatCompletionSchema.parse(JSON.parse(await readBoundedResponse(response))); }
+    catch (cause) {
+      if (cause instanceof AppError) throw cause;
+      throw new AppError("AGENT_MODEL_UNAVAILABLE", "The selected model did not return a compatible Chat Completions response.", false, { cause });
+    }
+  }
+
+  async listModels(
+    input: Omit<AgentModelConnectionRequest, "model"> & { query?: globalThis.URLSearchParams }
+  ): Promise<AgentModelCatalogItem[]> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), Math.min(this.requestTimeoutMs, 20_000));
+    let response: FetchResponse;
+    const suffix = input.query?.toString();
+    try {
+      response = await this.fetcher(`${input.baseUrl.replace(/\/$/, "")}/models${suffix ? `?${suffix}` : ""}`, {
+        method: "GET", redirect: "error", signal: controller.signal,
+        headers: { authorization: `Bearer ${input.apiKey}`, ...input.extraHeaders }
+      });
+    } catch (cause) {
+      throw new AppError("AGENT_MODEL_UNAVAILABLE", unreachableMessage(cause, "The model list could not be loaded."), true, { cause });
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (!response.ok) throw modelHttpError(response.status);
+    const schema = z.object({ data: z.array(z.object({
+      id: z.string().min(1).max(500), name: z.string().max(500).optional(),
+      supported_parameters: z.array(z.string()).optional(),
+      architecture: z.object({ output_modalities: z.array(z.string()).optional() }).optional(),
+      pricing: z.object({ prompt: z.string().optional(), completion: z.string().optional() }).optional()
+    })).max(2_000) });
+    try {
+      return schema.parse(JSON.parse(await readBoundedResponse(response))).data.map((item) => {
+        const pricing = item.pricing ? {
+          ...(item.pricing.prompt !== undefined ? { prompt: item.pricing.prompt } : {}),
+          ...(item.pricing.completion !== undefined ? { completion: item.pricing.completion } : {})
+        } : undefined;
+        return {
+          id: item.id, ...(item.name ? { name: item.name } : {}),
+          ...(item.supported_parameters ? { supportedParameters: item.supported_parameters } : {}),
+          ...(item.architecture?.output_modalities ? { outputModalities: item.architecture.output_modalities } : {}),
+          ...(pricing && Object.keys(pricing).length ? { pricing } : {})
+        };
+      });
+    } catch (cause) {
+      if (cause instanceof AppError) throw cause;
+      throw new AppError("AGENT_MODEL_UNAVAILABLE", "The model service returned an invalid model list.", false, { cause });
+    }
+  }
 
   async run(input: AgentModelAdapterRequest): Promise<AgentModelAdapterResult> {
     const messages: Array<Record<string, unknown>> = [
@@ -295,25 +477,33 @@ export class OpenAiCompatibleChatAdapter implements AgentModelAdapterPort {
       const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
       let response: FetchResponse;
       try {
+        const headers = {
+          "content-type": "application/json",
+          ...(input.apiKey ? { authorization: `Bearer ${input.apiKey}` } : {}),
+          ...input.extraHeaders
+        };
         response = await this.fetcher(`${input.baseUrl.replace(/\/$/, "")}/chat/completions`, {
           method: "POST", redirect: "error", signal: controller.signal,
-          headers: {
-            "content-type": "application/json",
-            ...(input.apiKey ? { authorization: `Bearer ${input.apiKey}` } : {})
-          },
+          headers,
           body: JSON.stringify({
             model: input.model, messages, stream: false, tool_choice: "auto",
+            max_tokens: 2_048,
+            ...modelRequestTuning(input.model),
             tools: input.tools.map((tool) => ({
               type: "function", function: { name: tool.name, description: tool.description, parameters: tool.jsonSchema }
             }))
           })
         });
+        response = await resolvePendingChatCompletion(this.fetcher, response, input.baseUrl, headers, controller.signal);
       } catch (cause) {
-        throw new AppError("AGENT_MODEL_UNAVAILABLE", "The configured model endpoint could not be reached.", true, { cause });
+        if (cause instanceof AppError) throw cause;
+        throw new AppError("AGENT_MODEL_UNAVAILABLE", isAbortError(cause)
+          ? "The configured model request timed out."
+          : unreachableMessage(cause, "The configured model endpoint could not be reached."), true, { cause });
       } finally {
         clearTimeout(timeout);
       }
-      if (!response.ok) throw new AppError("AGENT_MODEL_UNAVAILABLE", `The model endpoint returned HTTP ${response.status}.`, response.status >= 500 || response.status === 429);
+      if (!response.ok) throw modelHttpError(response.status);
       let value: z.infer<typeof chatCompletionSchema>;
       try {
         value = chatCompletionSchema.parse(JSON.parse(await readBoundedResponse(response)));
@@ -482,12 +672,135 @@ export interface AgentHarnessOptions {
   modelAdapter?: AgentModelAdapterPort;
 }
 
+const NVIDIA_RECOMMENDED: LlmModelOption[] = [{
+  id: "openai/gpt-oss-20b", name: "GPT-OSS 20B",
+  recommended: true, toolCapable: true
+}];
+
+const BAILIAN_RECOMMENDED: LlmModelOption[] = [
+  { id: "qwen3.7-plus", name: "Qwen 3.7 Plus", recommended: true, toolCapable: true },
+  { id: "qwen3.8-flash", name: "Qwen 3.8 Flash", recommended: true, toolCapable: true },
+  { id: "qwen3.8-max", name: "Qwen 3.8 Max", recommended: true, toolCapable: true }
+];
+
+function pricingHint(item: AgentModelCatalogItem): string | undefined {
+  const prompt = Number(item.pricing?.prompt);
+  const completion = Number(item.pricing?.completion);
+  if (!Number.isFinite(prompt) || !Number.isFinite(completion)) return undefined;
+  return `$${(prompt * 1_000_000).toFixed(2)} / $${(completion * 1_000_000).toFixed(2)} per 1M tokens`;
+}
+
 export class AgentHarness {
   private readonly registry = createDefaultAgentToolRegistry();
   private readonly modelAdapter: AgentModelAdapterPort;
 
   constructor(private readonly application: GrudgeVaultApplication, options: AgentHarnessOptions = {}) {
     this.modelAdapter = options.modelAdapter ?? new OpenAiCompatibleChatAdapter();
+  }
+
+  getLlmSettings(): LlmSettings { return this.application.getLlmSettings(); }
+
+  saveLlm(input: LlmConnectInput): LlmSettings { return this.application.saveLlmProvider(input); }
+
+  async listLlmModels(input: LlmListModelsInput): Promise<LlmModelOption[]> {
+    if (input.provider === "bailian") return BAILIAN_RECOMMENDED;
+    const apiKey = input.apiKey?.trim() || this.application.getLlmCredential(input.provider);
+    if (!apiKey || !this.modelAdapter.listModels) {
+      return input.provider === "nvidia" ? NVIDIA_RECOMMENDED : [];
+    }
+    const query = input.provider === "openrouter"
+      ? new globalThis.URLSearchParams({ supported_parameters: "tools", output_modalities: "text", sort: "most-popular", limit: "8" })
+      : undefined;
+    const catalog = await this.modelAdapter.listModels({
+      baseUrl: resolveLlmProviderEndpoint(input.provider, input.region), apiKey,
+      extraHeaders: llmProviderHeaders(input.provider), ...(query ? { query } : {})
+    });
+    const dynamic = catalog.filter((item) => input.provider !== "openrouter" ||
+      (item.supportedParameters?.includes("tools") && (!item.outputModalities || item.outputModalities.includes("text"))))
+      .slice(0, input.provider === "openrouter" ? 8 : 24)
+      .map((item): LlmModelOption => {
+        const hint = pricingHint(item);
+        return {
+          id: item.id, name: item.name ?? item.id, recommended: false,
+          toolCapable: input.provider === "openrouter" ? Boolean(item.supportedParameters?.includes("tools")) : true,
+          ...(hint ? { pricingHint: hint } : {})
+        };
+      });
+    const combined = input.provider === "nvidia" ? [...NVIDIA_RECOMMENDED, ...dynamic] : dynamic;
+    return [...new Map(combined.map((item) => [item.id, item])).values()];
+  }
+
+  async connectLlm(input: LlmConnectInput): Promise<LlmSettings> {
+    const apiKey = input.apiKey?.trim() || this.application.getLlmCredential(input.provider);
+    if (!apiKey) throw new AppError("LLM_AUTHENTICATION_FAILED", "Enter an API key before connecting.");
+    if (input.provider === "nvidia") {
+      if (!this.modelAdapter.listModels) {
+        throw new AppError("AGENT_MODEL_UNAVAILABLE", "This app build cannot load the NVIDIA model catalog.");
+      }
+      const catalog = await this.modelAdapter.listModels({
+        baseUrl: resolveLlmProviderEndpoint(input.provider, input.region), apiKey,
+        extraHeaders: llmProviderHeaders(input.provider)
+      });
+      if (!catalog.some(({ id }) => id === input.model.trim())) {
+        throw new AppError("LLM_MODEL_NOT_FOUND", "The selected model is not available in this account or region.");
+      }
+    }
+    if (!this.modelAdapter.testConnection) {
+      throw new AppError("LLM_TOOL_UNSUPPORTED", "This app build cannot verify model tool support.");
+    }
+    try {
+      await this.modelAdapter.testConnection({
+        baseUrl: resolveLlmProviderEndpoint(input.provider, input.region), model: input.model.trim(), apiKey,
+        extraHeaders: llmProviderHeaders(input.provider)
+      });
+    } catch (error) {
+      if (input.provider === "bailian" && error instanceof AppError && error.code === "LLM_AUTHENTICATION_FAILED") {
+        throw new AppError("LLM_REGION_MISMATCH", "The API key or selected Alibaba Cloud region does not match.");
+      }
+      throw error;
+    }
+    return this.application.saveLlmConnection(input, new Date().toISOString());
+  }
+
+  async activateLlm(provider: LlmProvider): Promise<LlmSettings> {
+    const config = this.application.getLlmSettings().providers[provider];
+    const apiKey = this.application.getLlmCredential(provider);
+    if (!config || !apiKey) throw new AppError("LLM_AUTHENTICATION_FAILED", "Connect this model service first.");
+    if (!this.modelAdapter.testConnection) throw new AppError("LLM_TOOL_UNSUPPORTED", "This app build cannot verify model tool support.");
+    try {
+      await this.modelAdapter.testConnection({
+        baseUrl: resolveLlmProviderEndpoint(provider, config.region), model: config.model, apiKey,
+        extraHeaders: llmProviderHeaders(provider)
+      });
+    } catch (error) {
+      if (provider === "bailian" && error instanceof AppError && error.code === "LLM_AUTHENTICATION_FAILED") {
+        throw new AppError("LLM_REGION_MISMATCH", "The API key or selected Alibaba Cloud region does not match.");
+      }
+      throw error;
+    }
+    return this.application.activateLlmProvider(provider, new Date().toISOString());
+  }
+
+  disconnectLlm(provider: LlmProvider): LlmSettings { return this.application.disconnectLlmProvider(provider); }
+
+  private runtimeSettings(): { settings: AgentModelSettings; provider?: LlmProvider } {
+    const consent = this.application.getAgentSettings();
+    const llm = this.application.getLlmSettings();
+    const provider = llm.activeProvider;
+    const config = provider ? llm.providers[provider] : undefined;
+    if (!provider || !config || config.status !== "ready" || !config.credentialConfigured) {
+      return { settings: {
+        mode: "private", consentPolicyVersion: consent.consentPolicyVersion,
+        consentedDataCategories: consent.consentedDataCategories
+      } };
+    }
+    return { provider, settings: {
+      mode: "enhanced", consentPolicyVersion: consent.consentPolicyVersion,
+      consentedDataCategories: consent.consentedDataCategories,
+      enhancedEndpoint: {
+        baseUrl: resolveLlmProviderEndpoint(provider, config.region), model: config.model, credentialConfigured: true
+      }
+    } };
   }
 
   async send(input: AgentSendInput): Promise<AgentSendResult> {
@@ -497,7 +810,8 @@ export class AgentHarness {
     const recentMessages = this.application.listMessages(input.conversationId);
     if (intent === "retrieve" && previousRun?.assistantMessageId === recentMessages.at(-2)?.id &&
       previousRun?.analysis?.suggestedQuestions.length === 1) intent = "clarify";
-    const settings = this.application.getAgentSettings();
+    const runtime = this.runtimeSettings();
+    const settings = runtime.settings;
     const snapshot = await this.buildSnapshot(input.conversationId, input.content, intent);
     const endpoint = settings.mode === "private" ? settings.privateEndpoint : settings.enhancedEndpoint;
     const missing = settings.mode === "enhanced" && endpoint
@@ -518,7 +832,7 @@ export class AgentHarness {
     if (disclosure) run = { ...run, disclosure: { ...disclosure, runId: run.id } };
     run = this.application.saveAgentRun(run);
     if (run.status === "awaiting_consent") return { run, userMessage };
-    return this.execute(run, userMessage, snapshot, settings);
+    return this.execute(run, userMessage, snapshot, settings, runtime.provider);
   }
 
   async resume(runId: string, disclosureId: string): Promise<AgentSendResult> {
@@ -530,15 +844,12 @@ export class AgentHarness {
     run = this.application.saveAgentRun({
       ...run, status: "running", disclosure: { ...run.disclosure, acceptedAt }
     });
-    const settings = this.application.getAgentSettings();
-    this.application.updateAgentSettings({
-      mode: settings.mode,
-      consentedDataCategories: [...new Set([...settings.consentedDataCategories, ...run.disclosure!.categories])]
-    });
+    this.application.grantAgentDataCategories(run.disclosure!.categories);
     const userMessage = this.application.listMessages(run.conversationId).find(({ id }) => id === run.userMessageId);
     if (!userMessage?.content) throw new AppError("ENTITY_NOT_FOUND", "The Agent user message no longer exists.");
     const snapshot = await this.buildSnapshot(run.conversationId, userMessage.content, run.intent);
-    const refreshedSettings = this.application.getAgentSettings();
+    const runtime = this.runtimeSettings();
+    const refreshedSettings = runtime.settings;
     const newlyRequired = snapshot.categories.filter(
       (category) => !refreshedSettings.consentedDataCategories.includes(category)
     );
@@ -551,7 +862,7 @@ export class AgentHarness {
       run = this.application.saveAgentRun({ ...run, status: "awaiting_consent", disclosure });
       return { run, userMessage };
     }
-    return this.execute(run, userMessage, snapshot, refreshedSettings);
+    return this.execute(run, userMessage, snapshot, refreshedSettings, runtime.provider);
   }
 
   cancel(runId: string): AgentRun {
@@ -641,7 +952,8 @@ export class AgentHarness {
     initialRun: AgentRun,
     userMessage: Message,
     snapshot: AgentSnapshot,
-    settings: AgentModelSettings
+    settings: AgentModelSettings,
+    provider?: LlmProvider
   ): Promise<AgentSendResult> {
     let run = initialRun;
     const now = new Date().toISOString();
@@ -671,9 +983,12 @@ export class AgentHarness {
       };
       this.application.saveAgentModelCallAudit(audit);
       try {
-        const credential = this.application.getAgentCredential(settings.mode);
+        const credential = provider
+          ? this.application.getLlmCredential(provider)
+          : this.application.getAgentCredential(settings.mode);
         const result = await this.modelAdapter.run({
           baseUrl: endpoint.baseUrl, model: endpoint.model, ...(credential ? { apiKey: credential } : {}),
+          ...(provider ? { extraHeaders: llmProviderHeaders(provider) } : {}),
           system: "Use only the registered tools. Keep unknowns unknown. Never present an uncited claim as a confirmed fact. Offer options; do not decide for the user.",
           user: snapshot.context, tools: this.registry.definitions(run.intent),
           executeTool: async (name, value, providerCallId) => {
@@ -691,6 +1006,9 @@ export class AgentHarness {
         });
       } catch (error) {
         degradedError = error instanceof AppError ? error.code : "INTERNAL_ERROR";
+        if (provider && error instanceof AppError && [
+          "LLM_AUTHENTICATION_FAILED", "LLM_MODEL_NOT_FOUND", "LLM_TOOL_UNSUPPORTED", "LLM_REGION_MISMATCH"
+        ].includes(error.code)) this.application.markLlmProviderNeedsAttention(provider);
         this.application.saveAgentModelCallAudit({
           ...audit, status: "failed", errorCode: degradedError, finishedAt: new Date().toISOString()
         });

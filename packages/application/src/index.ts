@@ -12,7 +12,7 @@ import type {
   CandidateExtraction, CandidateSummary, Clarification, Conversation, EmbeddingGeneration,
   EmbeddingIndexStatus, Event, EventRelation, EventRevision,
   DerivedArtifactDetail, EventSearchQuery, EvidenceDetail, EvidenceReferenceImpact, ImportIssue, ImportRun, ImportRunDetail, IntegrityScan, Job,
-  LegalVerificationResult, Message, Person, PersonAlias,
+  LegalVerificationResult, LlmProvider, LlmSettings, BailianRegion, Message, Person, PersonAlias,
   PersonIdentityDetail, PersonMergeRecord, PersonMergeSuggestion, ReviewRun, Source,
   SourceItem, SourceReferenceDetail, SourceVersion, TimelineQuery, TimelineResult,
   RecoveryPackageSummary, UnifiedSearchHit, UnifiedSearchQuery, Workspace, WorkspaceCryptoStatus,
@@ -23,6 +23,7 @@ import {
   AppError, toSerializedError, type AssetImportResult, type AssetPreview,
   type BackupSummary, type ClarificationAnswerInput, type CreateEventInput,
   type AgentSettingsUpdateInput, type CandidateMergeInput, type CandidateMergeResult, type CreateRelationInput, type EventWriteFields,
+  type LlmConnectInput,
   type CaseWriteFields, type CreateCaseInput, type UpdateCaseInput,
   type PersonAliasInput, type PersonMergeInput, type ReviewGenerateInput, type SendMessageInput,
   type SendMessageResult, type StartBackfillInput, type UpdateEventInput
@@ -144,6 +145,46 @@ export interface KeyProtectorPort {
 
 const AGENT_CONSENT_POLICY_VERSION = 1;
 
+export const LLM_PROVIDER_BASE_URLS = {
+  nvidia: "https://integrate.api.nvidia.com/v1",
+  openrouter: "https://openrouter.ai/api/v1",
+  bailian: {
+    "cn-beijing": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "ap-southeast-1": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    "us-east-1": "https://dashscope-us.aliyuncs.com/compatible-mode/v1",
+    "cn-hongkong": "https://cn-hongkong.dashscope.aliyuncs.com/compatible-mode/v1"
+  }
+} as const;
+
+export function resolveLlmProviderEndpoint(provider: LlmProvider, region?: BailianRegion): string {
+  if (provider === "bailian") return LLM_PROVIDER_BASE_URLS.bailian[region ?? "cn-beijing"];
+  return LLM_PROVIDER_BASE_URLS[provider];
+}
+
+export function llmProviderHeaders(provider: LlmProvider): Record<string, string> {
+  return provider === "openrouter" ? { "x-openrouter-title": "Grudge Vault" } : {};
+}
+
+function recognizeLegacyLlmEndpoint(baseUrl: string): { provider: LlmProvider; region?: BailianRegion } | undefined {
+  let hostname: string;
+  try { hostname = new URL(baseUrl).hostname.toLowerCase(); } catch { return undefined; }
+  if (hostname === "integrate.api.nvidia.com") return { provider: "nvidia" };
+  if (hostname === "openrouter.ai") return { provider: "openrouter" };
+  if (hostname === "dashscope.aliyuncs.com" || hostname.endsWith(".cn-beijing.maas.aliyuncs.com")) {
+    return { provider: "bailian", region: "cn-beijing" };
+  }
+  if (hostname === "dashscope-intl.aliyuncs.com" || hostname.endsWith(".ap-southeast-1.maas.aliyuncs.com")) {
+    return { provider: "bailian", region: "ap-southeast-1" };
+  }
+  if (hostname === "dashscope-us.aliyuncs.com" || hostname.endsWith(".us-east-1.maas.aliyuncs.com")) {
+    return { provider: "bailian", region: "us-east-1" };
+  }
+  if (hostname === "cn-hongkong.dashscope.aliyuncs.com" || hostname.endsWith(".cn-hongkong.maas.aliyuncs.com")) {
+    return { provider: "bailian", region: "cn-hongkong" };
+  }
+  return undefined;
+}
+
 function normalizeCaseWriteFields(value: CaseWriteFields): CaseWriteFields {
   return {
     title: value.title, status: value.status, ...(value.summary !== undefined ? { summary: value.summary } : {}),
@@ -196,6 +237,35 @@ function decryptAgentCredential(
   try {
     const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(envelope.iv, "base64"));
     decipher.setAAD(Buffer.from(`grudge-vault:agent:${workspaceId}:${mode}:v1`, "utf8"));
+    decipher.setAuthTag(Buffer.from(envelope.authTag, "base64"));
+    return Buffer.concat([
+      decipher.update(Buffer.from(envelope.ciphertext, "base64")), decipher.final()
+    ]).toString("utf8");
+  } catch (cause) {
+    throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "The stored model credential could not be decrypted.", false, { cause });
+  }
+}
+
+function encryptLlmCredential(value: string, key: Buffer, workspaceId: string, provider: LlmProvider) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  cipher.setAAD(Buffer.from(`grudge-vault:llm:${workspaceId}:${provider}:v1`, "utf8"));
+  const ciphertext = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
+  return {
+    algorithm: "aes-256-gcm" as const, version: 1 as const, iv: iv.toString("base64"),
+    authTag: cipher.getAuthTag().toString("base64"), ciphertext: ciphertext.toString("base64")
+  };
+}
+
+function decryptLlmCredential(
+  envelope: import("./memory").AgentCredentialEnvelope,
+  key: Buffer,
+  workspaceId: string,
+  provider: LlmProvider
+): string {
+  try {
+    const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(envelope.iv, "base64"));
+    decipher.setAAD(Buffer.from(`grudge-vault:llm:${workspaceId}:${provider}:v1`, "utf8"));
     decipher.setAuthTag(Buffer.from(envelope.authTag, "base64"));
     return Buffer.concat([
       decipher.update(Buffer.from(envelope.ciphertext, "base64")), decipher.final()
@@ -507,6 +577,168 @@ export class GrudgeVaultApplication {
       try { return decryptAgentCredential(envelope, key, session.workspace.id, mode); } catch { /* try the next retained key */ }
     }
     throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "The stored model credential could not be decrypted with the current key ring.");
+  }
+
+  getLlmSettings(): LlmSettings {
+    const session = this.requireSession();
+    const repository = session.agents;
+    const stored = repository.getLlmSettings();
+    if (stored) return stored;
+
+    const now = new Date().toISOString();
+    const empty: LlmSettings = { providers: {} };
+    repository.saveLlmSettings(empty, now);
+    const legacy = this.getAgentSettings().enhancedEndpoint;
+    const recognized = legacy ? recognizeLegacyLlmEndpoint(legacy.baseUrl) : undefined;
+    if (!legacy || !recognized) return repository.getLlmSettings() ?? empty;
+
+    let credentialConfigured = false;
+    const legacyCredential = this.getAgentCredential("enhanced");
+    if (legacyCredential) {
+      const encryptionKey = session.keyRing?.keys.get(session.keyRing.activeKeyId) ?? session.key;
+      repository.saveLlmCredential(recognized.provider, encryptLlmCredential(
+        legacyCredential, encryptionKey, session.workspace.id, recognized.provider
+      ), now);
+      credentialConfigured = true;
+    }
+    repository.saveLlmProviderConfig({
+      provider: recognized.provider, model: legacy.model,
+      credentialConfigured, status: credentialConfigured ? "ready" : "not_configured",
+      ...(recognized.region ? { region: recognized.region } : {})
+    }, now);
+    repository.saveLlmSettings({
+      providers: {}, ...(credentialConfigured ? { activeProvider: recognized.provider } : {})
+    }, now);
+    return repository.getLlmSettings() ?? empty;
+  }
+
+  saveLlmConnection(input: LlmConnectInput, testedAt: string): LlmSettings {
+    const session = this.requireSession();
+    const model = input.model.trim();
+    if (!model || model.length > 200) throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "A model name is required.");
+    if (input.provider === "bailian" && input.region === undefined) {
+      throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "Choose an Alibaba Cloud region.");
+    }
+    if (input.provider !== "bailian" && input.region !== undefined) {
+      throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "This provider does not use a region setting.");
+    }
+    const now = new Date().toISOString();
+    if (input.apiKey !== undefined) {
+      const apiKey = input.apiKey.trim();
+      if (!apiKey || apiKey.length > 10_000) {
+        throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "The model credential is invalid.");
+      }
+      const encryptionKey = session.keyRing?.keys.get(session.keyRing.activeKeyId) ?? session.key;
+      session.agents.saveLlmCredential(input.provider, encryptLlmCredential(
+        apiKey, encryptionKey, session.workspace.id, input.provider
+      ), now);
+    }
+    if (!session.agents.getLlmCredential(input.provider)) {
+      throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "Enter an API key before connecting.");
+    }
+    session.agents.saveLlmProviderConfig({
+      provider: input.provider, model, credentialConfigured: true, status: "ready", lastTestedAt: testedAt,
+      ...(input.region ? { region: input.region } : {})
+    }, now);
+    const current = this.getLlmSettings();
+    session.agents.saveLlmSettings({ ...current, activeProvider: input.provider }, now);
+    return session.agents.getLlmSettings()!;
+  }
+
+  saveLlmProvider(input: LlmConnectInput): LlmSettings {
+    const session = this.requireSession();
+    const model = input.model.trim();
+    if (!model || model.length > 200) throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "A model name is required.");
+    if (input.provider === "bailian" && input.region === undefined) {
+      throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "Choose an Alibaba Cloud region.");
+    }
+    if (input.provider !== "bailian" && input.region !== undefined) {
+      throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "This provider does not use a region setting.");
+    }
+    const now = new Date().toISOString();
+    if (input.apiKey !== undefined) {
+      const apiKey = input.apiKey.trim();
+      if (!apiKey || apiKey.length > 10_000) {
+        throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "The model credential is invalid.");
+      }
+      const encryptionKey = session.keyRing?.keys.get(session.keyRing.activeKeyId) ?? session.key;
+      session.agents.saveLlmCredential(input.provider, encryptLlmCredential(
+        apiKey, encryptionKey, session.workspace.id, input.provider
+      ), now);
+    }
+    const credentialConfigured = Boolean(session.agents.getLlmCredential(input.provider));
+    const existing = session.agents.getLlmProviderConfig(input.provider);
+    const unchanged = Boolean(existing && existing.model === model && existing.region === input.region && input.apiKey === undefined);
+    session.agents.saveLlmProviderConfig({
+      provider: input.provider, model, credentialConfigured,
+      status: unchanged ? existing!.status : credentialConfigured ? "needs_attention" : "not_configured",
+      ...(unchanged && existing?.lastTestedAt ? { lastTestedAt: existing.lastTestedAt } : {}),
+      ...(input.region ? { region: input.region } : {})
+    }, now);
+    const current = this.getLlmSettings();
+    const keepActiveProvider = current.activeProvider && (current.activeProvider !== input.provider || unchanged)
+      ? current.activeProvider : undefined;
+    session.agents.saveLlmSettings({
+      providers: current.providers, ...(keepActiveProvider ? { activeProvider: keepActiveProvider } : {})
+    }, now);
+    return session.agents.getLlmSettings()!;
+  }
+
+  activateLlmProvider(provider: LlmProvider, testedAt: string): LlmSettings {
+    const session = this.requireSession();
+    const config = session.agents.getLlmProviderConfig(provider);
+    if (!config || !session.agents.getLlmCredential(provider)) {
+      throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "Connect this model service before enabling it.");
+    }
+    const now = new Date().toISOString();
+    session.agents.saveLlmProviderConfig({
+      ...config, credentialConfigured: true, status: "ready", lastTestedAt: testedAt
+    }, now);
+    const current = this.getLlmSettings();
+    session.agents.saveLlmSettings({ ...current, activeProvider: provider }, now);
+    return session.agents.getLlmSettings()!;
+  }
+
+  disconnectLlmProvider(provider: LlmProvider): LlmSettings {
+    const session = this.requireSession();
+    const now = new Date().toISOString();
+    session.agents.saveLlmCredential(provider, undefined, now);
+    session.agents.deleteLlmProviderConfig(provider);
+    const current = this.getLlmSettings();
+    session.agents.saveLlmSettings({
+      providers: current.providers,
+      ...(current.activeProvider && current.activeProvider !== provider ? { activeProvider: current.activeProvider } : {})
+    }, now);
+    return session.agents.getLlmSettings()!;
+  }
+
+  markLlmProviderNeedsAttention(provider: LlmProvider): LlmSettings {
+    const session = this.requireSession();
+    const config = session.agents.getLlmProviderConfig(provider);
+    if (!config) return this.getLlmSettings();
+    session.agents.saveLlmProviderConfig({ ...config, status: "needs_attention" }, new Date().toISOString());
+    return session.agents.getLlmSettings()!;
+  }
+
+  getLlmCredential(provider: LlmProvider): string | undefined {
+    const session = this.requireSession();
+    const envelope = session.agents.getLlmCredential(provider);
+    if (!envelope) return undefined;
+    const candidates = session.keyRing ? [...session.keyRing.keys.values()] : [session.key];
+    for (const key of candidates) {
+      try { return decryptLlmCredential(envelope, key, session.workspace.id, provider); } catch { /* try retained keys */ }
+    }
+    throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "The stored model credential could not be decrypted with the current key ring.");
+  }
+
+  grantAgentDataCategories(categories: import("@grudge-vault/domain").AgentDataCategory[]): AgentModelSettings {
+    const session = this.requireSession();
+    const current = this.getAgentSettings();
+    session.agents.saveSettings({
+      ...current, consentPolicyVersion: AGENT_CONSENT_POLICY_VERSION,
+      consentedDataCategories: [...new Set([...current.consentedDataCategories, ...categories])]
+    }, new Date().toISOString());
+    return this.getAgentSettings();
   }
 
   async sendMessage(input: SendMessageInput): Promise<SendMessageResult> {
@@ -848,7 +1080,7 @@ export class GrudgeVaultApplication {
     const memory = this.requireSession().memory;
     const limit = Math.min(100, Math.max(1, query.limit ?? 50));
     const keyword = memory.searchUnifiedKeyword({ ...query, limit: Math.max(limit, 100) });
-    const enabled = memory.getSetting<boolean>("search.semantic_enabled") ?? false;
+    const enabled = Boolean(this.embeddingAdapter);
     const active = memory.listEmbeddingGenerations().find(({ state }) => state === "active");
     if (!query.semantic || !enabled || !this.embeddingAdapter || !active || !query.text.trim()
       || active.adapterIdentity !== this.embeddingAdapter.identity || active.adapterVersion !== this.embeddingAdapter.version) {
@@ -870,7 +1102,10 @@ export class GrudgeVaultApplication {
 
   getEmbeddingStatus(): EmbeddingIndexStatus {
     const memory = this.requireSession().memory;
-    const enabled = memory.getSetting<boolean>("search.semantic_enabled") ?? false;
+    const enabled = Boolean(this.embeddingAdapter);
+    if (enabled && memory.getSetting<boolean>("search.semantic_enabled") !== true) {
+      memory.setSetting("search.semantic_enabled", true, new Date().toISOString());
+    }
     const generations = memory.listEmbeddingGenerations();
     const active = generations.find(({ state }) => state === "active");
     const building = generations.find(({ state }) => state === "building");
@@ -886,8 +1121,17 @@ export class GrudgeVaultApplication {
   }
 
   setSemanticEnabled(enabled: boolean): EmbeddingIndexStatus {
-    this.requireSession().memory.setSetting("search.semantic_enabled", enabled, new Date().toISOString());
+    void enabled;
+    if (this.embeddingAdapter) this.requireSession().memory.setSetting("search.semantic_enabled", true, new Date().toISOString());
     return this.getEmbeddingStatus();
+  }
+
+  ensureAutomaticFeatures(): Job[] {
+    const jobs: Job[] = [];
+    const status = this.getEmbeddingStatus();
+    if (status.available && status.state === "empty") jobs.push(this.rebuildEmbeddings());
+    this.getReviewAutomationSettings();
+    return jobs;
   }
 
   rebuildEmbeddings(): Job {
@@ -1364,7 +1608,7 @@ export class GrudgeVaultApplication {
 
   async updateMediaProcessingSettings(settings: MediaProcessingSettings): Promise<LocalProcessorStatus> {
     if (!this.mediaPipeline) throw new AppError("LOCAL_PROCESSOR_UNAVAILABLE", "No local media pipeline is installed.");
-    await this.mediaPipeline.updateSettings(settings);
+    await this.mediaPipeline.updateSettings({ ...settings, autoProcessNew: true });
     return this.getLocalProcessorStatus();
   }
 
@@ -1482,13 +1726,25 @@ export class GrudgeVaultApplication {
   }
 
   getReviewAutomationSettings(): ReviewAutomationSettings {
-    return this.requireSession().memory.getSetting<ReviewAutomationSettings>("review.automation")
-      ?? DEFAULT_REVIEW_AUTOMATION_SETTINGS;
+    const memory = this.requireSession().memory;
+    const stored = memory.getSetting<ReviewAutomationSettings>("review.automation");
+    const settings = {
+      monthly: true, quarterly: true, clarificationWeekly: true,
+      systemNotifications: stored?.systemNotifications ?? DEFAULT_REVIEW_AUTOMATION_SETTINGS.systemNotifications
+    };
+    if (!stored || !stored.monthly || !stored.quarterly || !stored.clarificationWeekly) {
+      memory.setSetting("review.automation", settings, new Date().toISOString());
+    }
+    return settings;
   }
 
   updateReviewAutomationSettings(settings: ReviewAutomationSettings): ReviewAutomationSettings {
-    this.requireSession().memory.setSetting("review.automation", settings, new Date().toISOString());
-    return settings;
+    const normalized = {
+      monthly: true, quarterly: true, clarificationWeekly: true,
+      systemNotifications: settings.systemNotifications
+    };
+    this.requireSession().memory.setSetting("review.automation", normalized, new Date().toISOString());
+    return normalized;
   }
 
   listReminders(): Reminder[] { return this.requirePhaseSix().listReminders(); }
@@ -1607,6 +1863,14 @@ export class GrudgeVaultApplication {
       const plaintext = this.getAgentCredential(mode);
       if (plaintext !== undefined) {
         session.agents.saveCredential(mode, encryptAgentCredential(plaintext, target, session.workspace.id, mode), new Date().toISOString());
+      }
+    }
+    for (const provider of ["nvidia", "openrouter", "bailian"] as const) {
+      const plaintext = this.getLlmCredential(provider);
+      if (plaintext !== undefined) {
+        session.agents.saveLlmCredential(provider, encryptLlmCredential(
+          plaintext, target, session.workspace.id, provider
+        ), new Date().toISOString());
       }
     }
   }

@@ -167,6 +167,29 @@ export class SqlitePhaseFiveRepository implements PhaseFiveRepositoryPort {
     if (result.changes !== 1) throw new AppError("ASSET_NOT_FOUND", "The original no longer exists.");
   }
 
+  purgeUnreferencedAsset(assetId: string): boolean {
+    return this.database.transaction(() => {
+      const references: ReadonlyArray<readonly [string, string]> = [
+        ["event_assets", "asset_id"],
+        ["source_item_assets", "asset_id"],
+        ["source_version_assets", "asset_id"],
+        ["import_runs", "archive_asset_id"],
+        ["import_folder_entries", "asset_id"],
+        ["case_asset_refs", "asset_id"],
+        ["case_evidence_links", "asset_id"],
+        ["derived_artifacts", "source_asset_id"],
+        ["current_derived_artifacts", "source_asset_id"],
+        ["source_search_documents", "source_asset_id"],
+        ["assets", "superseded_by_asset_id"]
+      ];
+      for (const [table, column] of references) {
+        if (this.database.prepare(`SELECT 1 FROM ${table} WHERE ${column} = ? LIMIT 1`).get(assetId)) return false;
+      }
+      this.database.prepare("DELETE FROM integrity_scan_results WHERE asset_id = ?").run(assetId);
+      return this.database.prepare("DELETE FROM assets WHERE id = ?").run(assetId).changes === 1;
+    })();
+  }
+
   listDerivedArtifacts(assetId?: string): DerivedArtifact[] {
     const rows = assetId
       ? this.database.prepare(`SELECT da.*, EXISTS(

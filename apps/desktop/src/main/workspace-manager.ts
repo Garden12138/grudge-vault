@@ -12,6 +12,7 @@ import {
 import { AppError, type BackupSummary } from "@grudge-vault/shared";
 
 const WORKSPACE_FORMAT_VERSION = 2;
+const IGNORABLE_DIRECTORY_METADATA = new Set([".DS_Store"]);
 const legacyConfigSchema = z.object({
   formatVersion: z.literal(1),
   id: z.string().uuid(),
@@ -77,6 +78,10 @@ async function exists(path: string): Promise<boolean> {
   return access(path).then(() => true, () => false);
 }
 
+function meaningfulDirectoryEntries(entries: string[]): string[] {
+  return entries.filter((entry) => !IGNORABLE_DIRECTORY_METADATA.has(entry));
+}
+
 async function atomicWriteJson(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const temporary = `${path}.${randomUUID()}.tmp`;
@@ -136,7 +141,7 @@ export class LocalWorkspaceManager implements WorkspaceManagerPort {
     if (!normalizedName) throw new AppError("VALIDATION_FAILED", "Workspace name is required.");
     await this.keyProtector.assertAvailable();
     await mkdir(rootPath, { recursive: true, mode: 0o700 });
-    const entries = await readdir(rootPath);
+    const entries = meaningfulDirectoryEntries(await readdir(rootPath));
     if (entries.length > 0) {
       if (entries.includes("workspace.json")) {
         throw new AppError("WORKSPACE_EXISTS", "This directory already contains a workspace.");
@@ -443,7 +448,8 @@ export class LocalWorkspaceManager implements WorkspaceManagerPort {
     const destinationExists = await exists(destinationPath);
     if (destinationExists) {
       const destinationMetadata = await lstat(destinationPath);
-      if (!destinationMetadata.isDirectory() || destinationMetadata.isSymbolicLink() || (await readdir(destinationPath)).length > 0) {
+      if (!destinationMetadata.isDirectory() || destinationMetadata.isSymbolicLink()
+        || meaningfulDirectoryEntries(await readdir(destinationPath)).length > 0) {
         throw new AppError("WORKSPACE_INVALID", "Choose an empty, regular directory for the restored workspace.");
       }
     }

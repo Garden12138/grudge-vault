@@ -41,6 +41,12 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<void> {
   );
   const intelligenceState = new LocalIntelligenceStateStore(join(app.getPath("userData"), "local-intelligence.json"));
   await intelligenceState.load();
+  if (!intelligenceState.getMedia().settings.autoProcessNew) {
+    const current = intelligenceState.getMedia();
+    await intelligenceState.setMedia({
+      ...current, settings: { ...current.settings, autoProcessNew: true }
+    });
+  }
   const localMediaPipeline = options.mediaPipeline ? undefined : new LocalMediaPipeline(
     intelligenceState.getMedia(), (value) => intelligenceState.setMedia(value)
   );
@@ -155,6 +161,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<void> {
       }
     }, { onChanged: notifyJobsChanged });
     application.ensureWorkspaceCryptoMigration();
+    application.ensureAutomaticFeatures();
     runner.start();
     void importFolder.start();
     if (options.continuousScheduler !== false) scheduler.start();
@@ -207,12 +214,12 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<void> {
     importFolder
   });
 
+  window.once("ready-to-show", () => window.show());
   if (process.env.ELECTRON_RENDERER_URL) {
     await window.loadURL(process.env.ELECTRON_RENDERER_URL);
   } else {
     await window.loadFile(join(__dirname, "../renderer/index.html"));
   }
-  window.once("ready-to-show", () => window.show());
 
   let quitting = false;
   app.on("before-quit", (event) => {

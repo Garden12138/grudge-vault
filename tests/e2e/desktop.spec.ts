@@ -41,6 +41,12 @@ test("completes the simplified record, memory, review, materials, data, security
     await page.evaluate(() => window.localStorage.setItem("grudge-vault.language", "en"));
     await page.reload();
     await expect(page.getByText("Automated Vault", { exact: true })).toBeVisible();
+    for (const viewport of [{ width: 1024, height: 768 }, { width: 1280, height: 800 }, { width: 1440, height: 900 }]) {
+      await page.setViewportSize(viewport);
+      await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1)).toBe(true);
+    }
+    await page.setViewportSize({ width: 1280, height: 800 });
+    expect(await page.evaluate(() => globalThis.getComputedStyle(document.body).fontFamily)).toContain("-apple-system");
 
     await page.getByRole("button", { name: "Materials", exact: true }).click();
     await page.locator("#asset-file-input").setInputFiles(fixture);
@@ -268,12 +274,30 @@ test("completes the simplified record, memory, review, materials, data, security
     await expect(page.locator(".agent-action.approved").last()).toBeVisible();
 
     await page.getByRole("button", { name: "Settings", exact: true }).click();
-    await page.getByRole("button", { name: "Advanced", exact: true }).click();
-    await page.getByLabel("Execution mode").selectOption("enhanced");
-    await page.getByLabel("Model base URL").fill("https://model.example/v1");
-    await page.getByLabel("Model name").fill("e2e-fake");
-    await page.getByLabel("API key").fill("e2e-secret");
-    await page.getByRole("button", { name: "Save assistant settings", exact: true }).click();
+    await page.getByRole("button", { name: "Model service", exact: true }).click();
+    await page.getByLabel("API Key", { exact: true }).fill("e2e-secret");
+    await page.getByRole("tab", { name: /OpenRouter/ }).click();
+    await page.getByRole("tab", { name: /NVIDIA/ }).click();
+    await expect(page.getByLabel("API Key", { exact: true })).toHaveValue("e2e-secret");
+    await page.getByRole("button", { name: "Save configuration", exact: true }).click();
+    await expect(page.getByText("Configuration saved securely in this journal. No test request is sent until you connect and enable it.", { exact: true })).toBeVisible();
+    await expect(page.getByLabel("API Key", { exact: true })).toHaveValue("");
+    await page.getByRole("button", { name: "Connect and enable", exact: true }).click();
+    await expect(page.getByText("Model service connected and enabled.", { exact: true })).toBeVisible();
+    await page.getByRole("tab", { name: /OpenRouter/ }).click();
+    await page.getByLabel("API Key", { exact: true }).fill("e2e-openrouter-secret");
+    await page.getByRole("button", { name: "Load recommendations", exact: true }).click();
+    await page.getByRole("button", { name: "Connect and enable", exact: true }).click();
+    await page.getByRole("tab", { name: /百炼/ }).click();
+    await page.getByLabel("API Key", { exact: true }).fill("e2e-bailian-secret");
+    await page.getByRole("button", { name: "Connect and enable", exact: true }).click();
+    await page.getByRole("tab", { name: /NVIDIA/ }).click();
+    await page.getByRole("button", { name: "Connect and enable", exact: true }).click();
+    await page.getByRole("tab", { name: /OpenRouter/ }).click();
+    page.once("dialog", (dialog) => void dialog.accept());
+    await page.getByRole("button", { name: "Clear saved configuration", exact: true }).click();
+    await expect(page.getByText("Model service disconnected.", { exact: true })).toBeVisible();
+    await page.getByRole("tab", { name: /NVIDIA/ }).click();
     await page.getByRole("button", { name: "Record", exact: true }).click();
     await page.getByLabel("Write down what happened…").fill("attribution");
     await page.locator(".record-submit").click();

@@ -1,16 +1,17 @@
-import { dialog, ipcMain, shell, type BrowserWindow, type IpcMainInvokeEvent } from "electron";
+import { dialog, ipcMain, Notification, shell, type BrowserWindow, type IpcMainInvokeEvent } from "electron";
 import { z, ZodError, type ZodType } from "zod";
 import type { GrudgeVaultApplication, JobRunner, WorkspaceManagerPort } from "@grudge-vault/application";
 import type { AgentHarness } from "@grudge-vault/agent-harness";
 import type { EventSearchQuery, Person, TimelineQuery, UnifiedSearchQuery } from "@grudge-vault/domain";
 import type {
-  AgentSendInput, AgentSettingsUpdateInput, CandidateMergeInput, ClarificationAnswerInput, CreateEventInput,
+  AgentSendInput, CandidateMergeInput, ClarificationAnswerInput, CreateEventInput,
   CreateCaseInput, CreateRelationInput, PersonAliasInput, PersonMergeInput, ReviewGenerateInput,
-  SendMessageInput, StartBackfillInput, UpdateCaseInput, UpdateEventInput
+  SendMessageInput, StartBackfillInput, UpdateCaseInput, UpdateEventInput, LlmConnectInput, LlmListModelsInput
 } from "@grudge-vault/shared";
 import { AppError, toSerializedError, type IpcResult, type LocalProcessorPathKind } from "@grudge-vault/shared";
 import type { LocalMediaPipeline } from "@grudge-vault/media-pipeline";
 import type { ImportFolderMonitor } from "./import-folder-monitor";
+import { llmConnectSchema, llmListModelsSchema, llmProviderSchema } from "./llm-ipc-validation";
 
 const emptySchema = z.undefined();
 const titleSchema = z.string().trim().min(1).max(120);
@@ -96,17 +97,6 @@ const unifiedSearchSchema = z.object({
 }).refine((value) => !value.from || !value.to || value.from <= value.to, { message: "Invalid date range." });
 const reviewSchema = z.object({ from: z.iso.date(), to: z.iso.date() })
   .refine((value) => value.from <= value.to, { message: "Invalid date range." });
-const agentEndpointSchema = z.object({
-  baseUrl: z.string().trim().url().max(2_000), model: z.string().trim().min(1).max(200),
-  apiKey: z.string().trim().min(1).max(10_000).optional(), clearCredential: z.boolean().optional()
-});
-const agentCategoriesSchema = z.array(z.enum([
-  "conversation_text", "event_fields", "source_excerpt", "asset_metadata", "ocr_excerpt", "transcript_excerpt"
-])).max(6);
-const agentSettingsSchema = z.object({
-  mode: z.enum(["private", "enhanced"]), privateEndpoint: agentEndpointSchema.optional(),
-  enhancedEndpoint: agentEndpointSchema.optional(), consentedDataCategories: agentCategoriesSchema.optional()
-});
 const securitySettingsSchema = z.object({
   autoLockMinutes: z.union([z.literal(0), z.literal(5), z.literal(15), z.literal(30), z.literal(60)]),
   integrityScanIntervalDays: z.number().int().min(1).max(365)
@@ -292,10 +282,13 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   add("agent:get-run", idSchema, (id) => dependencies.agent.getRun(id));
   add("agent:approve-action", idSchema, (id) => dependencies.agent.approveAction(id));
   add("agent:reject-action", idSchema, (id) => dependencies.agent.rejectAction(id));
-  add("agent:get-settings", emptySchema, () => dependencies.agent.getSettings());
-  add("agent:update-settings", agentSettingsSchema, (input) =>
-    dependencies.agent.updateSettings(input as AgentSettingsUpdateInput));
-  add("agent:clear-credential", z.enum(["private", "enhanced"]), (mode) => dependencies.agent.clearCredential(mode));
+  add("llm:get-settings", emptySchema, () => dependencies.agent.getLlmSettings());
+  add("llm:list-models", llmListModelsSchema, (input) =>
+    dependencies.agent.listLlmModels(input as LlmListModelsInput));
+  add("llm:save", llmConnectSchema, (input) => dependencies.agent.saveLlm(input as LlmConnectInput));
+  add("llm:connect", llmConnectSchema, (input) => dependencies.agent.connectLlm(input as LlmConnectInput));
+  add("llm:activate", llmProviderSchema, (provider) => dependencies.agent.activateLlm(provider));
+  add("llm:disconnect", llmProviderSchema, (provider) => dependencies.agent.disconnectLlm(provider));
 
   add("events:search", searchSchema, (query) => dependencies.application.searchEvents(query as EventSearchQuery));
   add("events:get", idSchema, (id) => dependencies.application.getEvent(id));
@@ -481,6 +474,14 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   add("reminders:settings", emptySchema, () => dependencies.application.getReviewAutomationSettings());
   add("reminders:update-settings", reviewAutomationSchema, (settings) =>
     dependencies.application.updateReviewAutomationSettings(settings));
+  add("reminders:request-system-notifications", z.enum(["zh-CN", "en"]), (locale) => {
+    if (!Notification.isSupported()) return false;
+    new Notification({
+      title: "Grudge Vault",
+      body: locale === "zh-CN" ? "系统通知已开启。" : "System notifications are ready."
+    }).show();
+    return true;
+  });
   add("reminders:read", idSchema, (id) => dependencies.application.markReminderRead(id));
   add("reminders:dismiss", idSchema, (id) => dependencies.application.dismissReminder(id));
 

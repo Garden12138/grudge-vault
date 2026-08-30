@@ -20,6 +20,14 @@ class E2eAgentModelAdapter implements AgentModelAdapterPort {
   readonly identity = "e2e.injected-chat-completions";
   readonly version = 1;
 
+  async testConnection(input: Parameters<NonNullable<AgentModelAdapterPort["testConnection"]>>[0]) {
+    if (!input.apiKey) throw new Error("E2E API key missing");
+  }
+
+  async listModels() {
+    return [{ id: "openai/gpt-oss-20b", name: "GPT-OSS 20B", supportedParameters: ["tools"], outputModalities: ["text"] }];
+  }
+
   async run(input: Parameters<AgentModelAdapterPort["run"]>[0]) {
     if (input.user.includes("attribution")) {
       await input.executeTool("search_events", { query: "attribution" }, "e2e-tool-call-1");

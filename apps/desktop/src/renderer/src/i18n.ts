@@ -62,15 +62,11 @@ const zh = {
   rightsRelated: "权益相关", embeddingStatus: "智能搜索状态", sourceRecord: "原始来源",
   inactive: "已停用", canonical: "当前主身份",
   askAgent: "询问助手",
-  confirmedFacts: "已确认事实", unknownFacts: "争议或未知", historicalPatterns: "历史模式", risks: "风险与未知", agentInterpretation: "Agent 解释",
+  confirmedFacts: "已确认事实", unknownFacts: "争议或未知", historicalPatterns: "历史模式", risks: "风险与未知", agentInterpretation: "助手整理",
   actionOptions: "行动选项", actionPlan: "行动计划", benefits: "收益", citations: "相关记录", invalidCitation: "引用已失效", approveAction: "同意保存",
-  agentFallback: "助手已使用备用方式", agentSettings: "助手连接", agentSettingsHelp: "配置离线或联网增强助手的连接信息。",
-  agentExecutionMode: "执行模式", modelBaseUrl: "模型 Base URL", modelName: "模型名称", apiKey: "API Key",
-  optional: "可选", credentialStatus: "凭证状态", configured: "已配置", notConfigured: "未配置",
-  consentedCategories: "已同意的数据类别", none: "无", saveAgentSettings: "保存助手设置",
-  clearCredential: "清除凭证", agentSettingsSaved: "Agent 设置已保存", credentialCleared: "模型凭证已清除",
-  externalContextConsent: "确认外发最小上下文", externalContextHelp: "以下类别将经过脱敏后发送到配置的 Enhanced 端点；不会发送附件二进制。",
-  redactionPolicy: "脱敏策略", allowAndContinue: "允许并继续"
+  agentFallback: "助手已使用备用方式",
+  externalContextConsent: "确认发送必要内容", externalContextHelp: "以下内容会在隐私处理后发送到当前模型服务；不会发送附件文件。",
+  redactionPolicy: "隐私处理规则", allowAndContinue: "允许并继续"
 } as const;
 
 export type TranslationKey = keyof typeof zh;
@@ -139,13 +135,9 @@ const en: Record<TranslationKey, string> = {
   askAgent: "Ask assistant",
   confirmedFacts: "Confirmed facts", unknownFacts: "Disputed or unknown", historicalPatterns: "Historical patterns", risks: "Risks and unknowns", agentInterpretation: "Agent interpretation",
   actionOptions: "Action options", actionPlan: "Action plan", benefits: "Benefits", citations: "Related records", invalidCitation: "citation unavailable", approveAction: "Approve save",
-  agentFallback: "Assistant fallback", agentSettings: "Assistant connection", agentSettingsHelp: "Configure the connection for offline or enhanced assistant mode.",
-  agentExecutionMode: "Execution mode", modelBaseUrl: "Model base URL", modelName: "Model name", apiKey: "API key",
-  optional: "Optional", credentialStatus: "Credential status", configured: "Configured", notConfigured: "Not configured",
-  consentedCategories: "Consented data categories", none: "None", saveAgentSettings: "Save assistant settings",
-  clearCredential: "Clear credential", agentSettingsSaved: "Agent settings saved", credentialCleared: "Model credential cleared",
-  externalContextConsent: "Confirm minimal external context", externalContextHelp: "These redacted categories will be sent to the configured Enhanced endpoint. Attachment bytes are never sent.",
-  redactionPolicy: "Redaction policy", allowAndContinue: "Allow and continue"
+  agentFallback: "Assistant fallback",
+  externalContextConsent: "Confirm necessary data sharing", externalContextHelp: "These items will be privacy-filtered before being sent to the active model service. Attachment files are never sent.",
+  redactionPolicy: "Privacy handling rules", allowAndContinue: "Allow and continue"
 };
 
 export function detectLanguage(): Language {

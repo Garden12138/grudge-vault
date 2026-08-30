@@ -3,6 +3,9 @@ import type {
   AgentModelCallAudit,
   AgentModelSettings,
   AgentRun,
+  LlmProvider,
+  LlmProviderConfig,
+  LlmSettings,
   Clarification,
   Conversation,
   Event,
@@ -107,6 +110,13 @@ export interface AgentRepositoryPort {
   saveSettings(settings: AgentModelSettings, now: string): AgentModelSettings;
   getCredential(mode: AgentExecutionMode): AgentCredentialEnvelope | undefined;
   saveCredential(mode: AgentExecutionMode, envelope: AgentCredentialEnvelope | undefined, now: string): void;
+  getLlmSettings(): LlmSettings | undefined;
+  saveLlmSettings(settings: LlmSettings, now: string): LlmSettings;
+  getLlmProviderConfig(provider: LlmProvider): LlmProviderConfig | undefined;
+  saveLlmProviderConfig(config: LlmProviderConfig, now: string): void;
+  deleteLlmProviderConfig(provider: LlmProvider): void;
+  getLlmCredential(provider: LlmProvider): AgentCredentialEnvelope | undefined;
+  saveLlmCredential(provider: LlmProvider, envelope: AgentCredentialEnvelope | undefined, now: string): void;
 }
 
 export interface EventDraftProposal extends EventWriteFields {

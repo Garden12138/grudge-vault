@@ -29,6 +29,17 @@ import {
   type AgentModelAdapterPort
 } from "./index";
 
+const ALL_AGENT_CATEGORIES = [
+  "conversation_text", "event_fields", "source_excerpt", "asset_metadata", "ocr_excerpt", "transcript_excerpt"
+] as const;
+
+function configureTestLlm(application: GrudgeVaultApplication, grantConsent = true): void {
+  application.saveLlmConnection({
+    provider: "nvidia", model: "fake", apiKey: "test-api-key"
+  }, "2026-08-30T00:00:00.000Z");
+  if (grantConsent) application.grantAgentDataCategories([...ALL_AGENT_CATEGORIES]);
+}
+
 function createContext() {
   const database = new Database(":memory:");
   database.pragma("foreign_keys = ON");
@@ -140,6 +151,179 @@ describe("Phase 4 Agent Harness", () => {
     expect(JSON.parse(String(requests[0]?.init?.body))).toMatchObject({ stream: false, tool_choice: "auto" });
   });
 
+  it("verifies a connection with a minimal completion and preserves provider headers", async () => {
+    const requests: Array<{ url: string; init?: globalThis.RequestInit }> = [];
+    const adapter = new OpenAiCompatibleChatAdapter((async (input, init) => {
+      requests.push({ url: String(input), ...(init ? { init } : {}) });
+      return jsonResponse({ choices: [{ message: { role: "assistant", content: "OK" } }] });
+    }) as typeof globalThis.fetch);
+    await adapter.testConnection({
+      baseUrl: "https://openrouter.ai/api/v1", model: "tool-model", apiKey: "secret",
+      extraHeaders: { "x-openrouter-title": "Grudge Vault" }
+    });
+    expect(requests[0]?.url).toBe("https://openrouter.ai/api/v1/chat/completions");
+    expect(requests[0]?.init?.headers).toMatchObject({
+      authorization: "Bearer secret", "x-openrouter-title": "Grudge Vault"
+    });
+    expect(JSON.parse(String(requests[0]?.init?.body))).toMatchObject({
+      model: "tool-model", stream: false, max_tokens: 8,
+      messages: [{ role: "user", content: "Reply with OK." }]
+    });
+    expect(JSON.parse(String(requests[0]?.init?.body))).not.toHaveProperty("tools");
+
+    await adapter.testConnection({
+      baseUrl: "https://integrate.api.nvidia.com/v1",
+      model: "deepseek-ai/deepseek-v4-pro-0813",
+      apiKey: "secret"
+    });
+    expect(JSON.parse(String(requests[1]?.init?.body))).toMatchObject({
+      model: "deepseek-ai/deepseek-v4-pro-0813", reasoning_effort: "none"
+    });
+
+    const pendingRequests: string[] = [];
+    const pending = new OpenAiCompatibleChatAdapter((async (input) => {
+      pendingRequests.push(String(input));
+      return pendingRequests.length === 1
+        ? jsonResponse({ requestId: "request-123" }, {
+            status: 202, headers: { "content-type": "application/json", "nvcf-reqid": "request-123" }
+          })
+        : jsonResponse({ choices: [{ message: { role: "assistant", content: "OK" } }] });
+    }) as typeof globalThis.fetch);
+    await pending.testConnection({
+      baseUrl: "https://integrate.api.nvidia.com/v1", model: "async-model", apiKey: "secret"
+    });
+    expect(pendingRequests).toEqual([
+      "https://integrate.api.nvidia.com/v1/chat/completions",
+      "https://integrate.api.nvidia.com/v1/status/request-123"
+    ]);
+
+    const incompatible = new OpenAiCompatibleChatAdapter((async () => jsonResponse({ choices: [] })) as typeof globalThis.fetch);
+    await expect(incompatible.testConnection({
+      baseUrl: "https://integrate.api.nvidia.com/v1", model: "plain", apiKey: "secret"
+    })).rejects.toMatchObject({ code: "AGENT_MODEL_UNAVAILABLE" });
+  });
+
+  it("connects, switches, lists, and disconnects provider services without exposing credentials", async () => {
+    const context = createContext();
+    databases.push(context.database);
+    const tested: Array<{ baseUrl: string; model: string; extraHeaders?: Record<string, string> }> = [];
+    const cataloged: string[] = [];
+    const adapter: AgentModelAdapterPort = {
+      identity: "fake.providers", version: 1,
+      async run(input) { return { text: "ok", model: input.model }; },
+      async testConnection(input) { tested.push(input); },
+      async listModels(input) {
+        cataloged.push(input.baseUrl);
+        if (input.baseUrl.includes("nvidia.com")) {
+          return [{ id: "deepseek-ai/deepseek-v4-pro-0813", name: "DeepSeek V4 Pro" }];
+        }
+        return [
+          { id: "tools-model", name: "Tools model", supportedParameters: ["tools"], outputModalities: ["text"] },
+          { id: "plain-model", name: "Plain model", supportedParameters: ["temperature"], outputModalities: ["text"] }
+        ];
+      }
+    };
+    const harness = new AgentHarness(context.application, { modelAdapter: adapter });
+    const models = await harness.listLlmModels({ provider: "openrouter", apiKey: "temporary-key" });
+    expect(models.map(({ id }) => id)).toEqual(["tools-model"]);
+
+    const saved = harness.saveLlm({
+      provider: "nvidia", model: "deepseek-ai/deepseek-v4-pro-0813", apiKey: "nvidia-key"
+    });
+    expect(saved.activeProvider).toBeUndefined();
+    expect(saved.providers.nvidia).toMatchObject({
+      model: "deepseek-ai/deepseek-v4-pro-0813", credentialConfigured: true, status: "needs_attention"
+    });
+    expect(JSON.stringify(saved)).not.toContain("nvidia-key");
+    expect(String(context.database.prepare(
+      "SELECT envelope_json FROM llm_provider_credentials WHERE provider = 'nvidia'"
+    ).pluck().get())).not.toContain("nvidia-key");
+
+    const nvidia = await harness.connectLlm({ provider: "nvidia", model: "deepseek-ai/deepseek-v4-pro-0813" });
+    expect(nvidia.activeProvider).toBe("nvidia");
+    expect(nvidia.providers.nvidia).toMatchObject({ credentialConfigured: true, status: "ready" });
+    const openrouter = await harness.connectLlm({ provider: "openrouter", model: "tools-model", apiKey: "router-key" });
+    expect(openrouter.activeProvider).toBe("openrouter");
+    expect(openrouter.providers.nvidia?.credentialConfigured).toBe(true);
+    expect(tested).toEqual(expect.arrayContaining([
+      expect.objectContaining({ baseUrl: "https://integrate.api.nvidia.com/v1" }),
+      expect.objectContaining({
+        baseUrl: "https://openrouter.ai/api/v1", extraHeaders: { "x-openrouter-title": "Grudge Vault" }
+      })
+    ]));
+    expect(cataloged).toContain("https://integrate.api.nvidia.com/v1");
+    expect(JSON.stringify(openrouter)).not.toContain("router-key");
+    expect(String(context.database.prepare(
+      "SELECT envelope_json FROM llm_provider_credentials WHERE provider = 'openrouter'"
+    ).pluck().get())).not.toContain("router-key");
+    expect((await harness.activateLlm("nvidia")).activeProvider).toBe("nvidia");
+    expect(harness.disconnectLlm("nvidia").activeProvider).toBeUndefined();
+  });
+
+  it("does not save a failed provider connection and productizes Bailian region failures", async () => {
+    const context = createContext();
+    databases.push(context.database);
+    const adapter: AgentModelAdapterPort = {
+      identity: "fake.failure", version: 1,
+      async run(input) { return { model: input.model }; },
+      async testConnection() { throw new AppError("LLM_AUTHENTICATION_FAILED", "rejected"); }
+    };
+    const harness = new AgentHarness(context.application, { modelAdapter: adapter });
+    await expect(harness.connectLlm({
+      provider: "bailian", region: "cn-beijing", model: "qwen3.7-plus", apiKey: "wrong-key"
+    })).rejects.toMatchObject({ code: "LLM_REGION_MISMATCH" });
+    expect(harness.getLlmSettings()).toEqual({ providers: {} });
+    expect(context.database.prepare("SELECT count(*) FROM llm_provider_credentials").pluck().get()).toBe(0);
+  });
+
+  it("does not enable NVIDIA until a real inference succeeds", async () => {
+    const context = createContext();
+    databases.push(context.database);
+    const adapter: AgentModelAdapterPort = {
+      identity: "fake.nvidia-timeout", version: 1,
+      async run(input) { return { model: input.model }; },
+      async listModels() { return [{ id: "deepseek-ai/deepseek-v4-pro-0813" }]; },
+      async testConnection() {
+        throw new AppError("AGENT_MODEL_UNAVAILABLE", "The model service connection test timed out.", true);
+      }
+    };
+    const harness = new AgentHarness(context.application, { modelAdapter: adapter });
+    await expect(harness.connectLlm({
+      provider: "nvidia", model: "deepseek-ai/deepseek-v4-pro-0813", apiKey: "nvidia-key"
+    })).rejects.toMatchObject({ code: "AGENT_MODEL_UNAVAILABLE" });
+    expect(harness.getLlmSettings()).toEqual({ providers: {} });
+    expect(context.database.prepare("SELECT count(*) FROM llm_provider_credentials").pluck().get()).toBe(0);
+  });
+
+  it("migrates a recognized legacy enhanced endpoint without deleting legacy data", () => {
+    const context = createContext();
+    databases.push(context.database);
+    context.application.updateAgentSettings({
+      mode: "enhanced",
+      enhancedEndpoint: { baseUrl: "https://openrouter.ai/api/v1", model: "legacy-model", apiKey: "legacy-key" }
+    });
+    const migrated = context.application.getLlmSettings();
+    expect(migrated).toMatchObject({
+      activeProvider: "openrouter",
+      providers: { openrouter: { model: "legacy-model", credentialConfigured: true, status: "ready" } }
+    });
+    expect(context.application.getLlmCredential("openrouter")).toBe("legacy-key");
+    expect(context.database.prepare("SELECT count(*) FROM agent_credentials").pluck().get()).toBe(1);
+    expect(context.database.prepare("SELECT count(*) FROM llm_provider_credentials").pluck().get()).toBe(1);
+  });
+
+  it("keeps unknown legacy endpoints stored but never enables them", () => {
+    const context = createContext();
+    databases.push(context.database);
+    context.application.updateAgentSettings({
+      mode: "enhanced",
+      enhancedEndpoint: { baseUrl: "https://model.example/v1", model: "legacy-custom", apiKey: "legacy-key" }
+    });
+    expect(context.application.getLlmSettings()).toEqual({ providers: {} });
+    expect(context.database.prepare("SELECT count(*) FROM agent_credentials").pluck().get()).toBe(1);
+    expect(context.database.prepare("SELECT count(*) FROM llm_provider_credentials").pluck().get()).toBe(0);
+  });
+
   it("rejects invalid JSON, oversized responses, and model round overflow", async () => {
     const invalid = new OpenAiCompatibleChatAdapter((async () =>
       new globalThis.Response("not-json")) as typeof globalThis.fetch);
@@ -156,7 +340,13 @@ describe("Phase 4 Agent Harness", () => {
     const rateLimited = new OpenAiCompatibleChatAdapter((async () =>
       new globalThis.Response("limited", { status: 429 })) as typeof globalThis.fetch);
     await expect(rateLimited.run(request)).rejects.toMatchObject({
-      code: "AGENT_MODEL_UNAVAILABLE", retryable: true
+      code: "LLM_RATE_LIMITED", retryable: true
+    });
+
+    const retired = new OpenAiCompatibleChatAdapter((async () =>
+      new globalThis.Response("gone", { status: 410 })) as typeof globalThis.fetch);
+    await expect(retired.run(request)).rejects.toMatchObject({
+      code: "LLM_MODEL_NOT_FOUND", message: "The selected model is no longer available from this provider."
     });
 
     const timedOut = new OpenAiCompatibleChatAdapter((async (_input, init) => new Promise((_resolve, reject) => {
@@ -216,9 +406,7 @@ describe("Phase 4 Agent Harness", () => {
         return { text: "Prepared an update", model: input.model };
       }
     };
-    context.application.updateAgentSettings({
-      mode: "private", privateEndpoint: { baseUrl: "http://127.0.0.1:9999/v1", model: "fake" }
-    });
+    configureTestLlm(context.application);
     const harness = new AgentHarness(context.application, { modelAdapter: adapter });
     const proposed = await harness.send({
       conversationId: conversation.id, content: "请澄清并更新这条报告事件"
@@ -251,9 +439,7 @@ describe("Phase 4 Agent Harness", () => {
     expect(offline.run.status).toBe("succeeded");
     expect(offline.run.modelIdentity).toBeUndefined();
 
-    context.application.updateAgentSettings({
-      mode: "private", privateEndpoint: { baseUrl: "http://127.0.0.1:1234/v1", model: "fake" }
-    });
+    configureTestLlm(context.application);
     const failed = await harness.send({ conversationId: conversation.id, content: "继续查找" });
     expect(failed.run.status).toBe("succeeded");
     expect(failed.run.errorCode).toBe("INTERNAL_ERROR");
@@ -276,10 +462,9 @@ describe("Phase 4 Agent Harness", () => {
       async run(input) { modelContext = input.user; return { text: "Model answer", model: input.model, promptTokens: 4 }; }
     };
     const harness = new AgentHarness(context.application, { modelAdapter: adapter });
-    context.application.updateAgentSettings({
-      mode: "enhanced",
-      enhancedEndpoint: { baseUrl: "https://model.example/v1", model: "fake", apiKey: "top-secret-key" }
-    });
+    context.application.saveLlmConnection({
+      provider: "openrouter", model: "fake", apiKey: "top-secret-key"
+    }, "2026-08-30T00:00:00.000Z");
     const pending = await harness.send({ conversationId: conversation.id, content: "回顾 Alex 的报告问题" });
     expect(pending.run.status).toBe("awaiting_consent");
     expect(pending.run.disclosure?.categories).toEqual(expect.arrayContaining([
@@ -297,13 +482,13 @@ describe("Phase 4 Agent Harness", () => {
     expect(Buffer.byteLength(modelContext, "utf8")).toBeLessThanOrEqual(64 * 1024);
     expect((JSON.parse(modelContext) as { recentConversation: unknown[] }).recentConversation.length).toBeLessThanOrEqual(12);
     expect(context.application.listAgentModelCallAudits(completed.run.id)[0]).toMatchObject({
-      endpointOrigin: "https://model.example", model: "fake", status: "succeeded", promptTokens: 4
+      endpointOrigin: "https://openrouter.ai", model: "fake", status: "succeeded", promptTokens: 4
     });
     const storedCredential = String(context.database.prepare(
-      "SELECT envelope_json FROM agent_credentials WHERE mode = 'enhanced'"
+      "SELECT envelope_json FROM llm_provider_credentials WHERE provider = 'openrouter'"
     ).pluck().get());
     expect(storedCredential).not.toContain("top-secret-key");
-    expect(JSON.stringify(context.application.getAgentSettings())).not.toContain("top-secret-key");
+    expect(JSON.stringify(context.application.getLlmSettings())).not.toContain("top-secret-key");
 
     const current = context.application.getEvent(recorded.event!.id).event;
     context.session.assets.upsert({
@@ -322,7 +507,7 @@ describe("Phase 4 Agent Harness", () => {
     const categoryChange = await harness.send({ conversationId: conversation.id, content: "再次回顾报告问题" });
     expect(categoryChange.run.status).toBe("awaiting_consent");
     expect(categoryChange.run.disclosure?.categories).toContain("asset_metadata");
-    expect(harness.clearCredential("enhanced").enhancedEndpoint?.credentialConfigured).toBe(false);
+    expect(harness.disconnectLlm("openrouter").providers.openrouter).toBeUndefined();
   });
 
   it("accepts a plain direct reply only for the single clarification just displayed", async () => {
@@ -353,9 +538,7 @@ describe("Phase 4 Agent Harness", () => {
         return { text: "Invented fact", model: input.model };
       }
     };
-    context.application.updateAgentSettings({
-      mode: "private", privateEndpoint: { baseUrl: "http://localhost:8080/v1", model: "fake" }
-    });
+    configureTestLlm(context.application);
     const result = await new AgentHarness(context.application, { modelAdapter: adapter })
       .send({ conversationId: conversation.id, content: "Find the event" });
     expect(result.run.status).toBe("succeeded");

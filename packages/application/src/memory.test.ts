@@ -496,8 +496,10 @@ describe("Phase 3 relations, retrieval, and review application", () => {
       narrative: "A semantic document", facts: [], interpretations: [], emotions: [], interests: [],
       participants: [], sourceRefs: [], assetRefs: [], reason: "test"
     });
-    context.application.setSemanticEnabled(true);
-    const firstJob = context.application.rebuildEmbeddings();
+    expect(context.application.getEmbeddingStatus()).toMatchObject({ available: true, enabled: true, state: "empty" });
+    const [firstJob] = context.application.ensureAutomaticFeatures();
+    expect(firstJob).toBeDefined();
+    if (!firstJob) throw new Error("Automatic embedding rebuild was not scheduled");
     const firstGenerationId = (firstJob.payload as { generationId: string }).generationId;
     await context.application.runEmbeddingRebuild(firstGenerationId, {
       signal: new AbortController().signal, reportProgress() {}

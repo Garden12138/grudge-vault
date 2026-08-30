@@ -10,7 +10,7 @@ import type {
   AgentAction, AgentExecutionMode, AgentModelCallAudit, AgentModelSettings, AgentRun, AgentToolCall, Asset, BackfillRun,
   CandidateDetail, CandidateExtraction, CandidateSummary, Clarification,
   Conversation, EmbeddingGeneration, Event, EventDetail, EventRelation, EventRevision, EventSearchQuery,
-  ImportIssue, ImportRun, ImportRunDetail, Job, JobState, JournalEntry, Message, Person, PersonAlias,
+  ImportIssue, ImportRun, ImportRunDetail, Job, JobState, JournalEntry, LlmProvider, LlmProviderConfig, LlmSettings, Message, Person, PersonAlias,
   PersonMergeRecord, PersonMergeSuggestion, ReviewRun, SearchDocument, Source, SourceItem,
   SourceReferenceDetail, SourceVersion, UnifiedSearchHit, UnifiedSearchQuery, Workspace
 } from "@grudge-vault/domain";
@@ -913,6 +913,32 @@ export const DEFAULT_MIGRATIONS: readonly Migration[] = [
         updated_at TEXT NOT NULL
       ) STRICT;
       CREATE INDEX reminders_status_idx ON reminders(status, due_at);
+    `
+  },
+  {
+    version: 8,
+    name: "llm-provider-services",
+    sql: `
+      CREATE TABLE llm_settings (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        active_provider TEXT CHECK(active_provider IS NULL OR active_provider IN ('nvidia', 'openrouter', 'bailian')),
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE llm_provider_settings (
+        provider TEXT PRIMARY KEY CHECK(provider IN ('nvidia', 'openrouter', 'bailian')),
+        model TEXT NOT NULL,
+        region TEXT CHECK(region IS NULL OR region IN ('cn-beijing', 'ap-southeast-1', 'us-east-1', 'cn-hongkong')),
+        status TEXT NOT NULL CHECK(status IN ('not_configured', 'ready', 'needs_attention')),
+        last_tested_at TEXT,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE llm_provider_credentials (
+        provider TEXT PRIMARY KEY CHECK(provider IN ('nvidia', 'openrouter', 'bailian')),
+        envelope_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
     `
   }
 ];
@@ -2735,6 +2761,75 @@ export class SqliteAgentRepository implements AgentRepositoryPort {
       INSERT INTO agent_credentials(mode, envelope_json, updated_at) VALUES (?, ?, ?)
       ON CONFLICT(mode) DO UPDATE SET envelope_json = excluded.envelope_json, updated_at = excluded.updated_at
     `).run(mode, JSON.stringify(envelope), now);
+  }
+
+  getLlmSettings(): LlmSettings | undefined {
+    const row = this.database.prepare("SELECT active_provider FROM llm_settings WHERE singleton = 1")
+      .get() as { active_provider: string | null } | undefined;
+    if (!row) return undefined;
+    const configs = this.database.prepare("SELECT * FROM llm_provider_settings ORDER BY provider")
+      .all() as Record<string, unknown>[];
+    const providers: LlmSettings["providers"] = {};
+    for (const config of configs) {
+      const provider = String(config.provider) as LlmProvider;
+      providers[provider] = {
+        provider, model: String(config.model), status: config.status as LlmProviderConfig["status"],
+        credentialConfigured: Boolean(this.getLlmCredential(provider)),
+        ...(config.region ? { region: String(config.region) as NonNullable<LlmProviderConfig["region"]> } : {}),
+        ...(config.last_tested_at ? { lastTestedAt: String(config.last_tested_at) } : {})
+      };
+    }
+    return { ...(row.active_provider ? { activeProvider: row.active_provider as LlmProvider } : {}), providers };
+  }
+
+  saveLlmSettings(settings: LlmSettings, now: string): LlmSettings {
+    this.database.prepare(`
+      INSERT INTO llm_settings(singleton, active_provider, updated_at) VALUES (1, ?, ?)
+      ON CONFLICT(singleton) DO UPDATE SET active_provider = excluded.active_provider, updated_at = excluded.updated_at
+    `).run(settings.activeProvider ?? null, now);
+    return this.getLlmSettings()!;
+  }
+
+  getLlmProviderConfig(provider: LlmProvider): LlmProviderConfig | undefined {
+    const row = this.database.prepare("SELECT * FROM llm_provider_settings WHERE provider = ?")
+      .get(provider) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    return {
+      provider, model: String(row.model), status: row.status as LlmProviderConfig["status"],
+      credentialConfigured: Boolean(this.getLlmCredential(provider)),
+      ...(row.region ? { region: String(row.region) as NonNullable<LlmProviderConfig["region"]> } : {}),
+      ...(row.last_tested_at ? { lastTestedAt: String(row.last_tested_at) } : {})
+    };
+  }
+
+  saveLlmProviderConfig(config: LlmProviderConfig, now: string): void {
+    this.database.prepare(`
+      INSERT INTO llm_provider_settings(provider, model, region, status, last_tested_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(provider) DO UPDATE SET model = excluded.model, region = excluded.region,
+        status = excluded.status, last_tested_at = excluded.last_tested_at, updated_at = excluded.updated_at
+    `).run(config.provider, config.model, config.region ?? null, config.status, config.lastTestedAt ?? null, now);
+  }
+
+  deleteLlmProviderConfig(provider: LlmProvider): void {
+    this.database.prepare("DELETE FROM llm_provider_settings WHERE provider = ?").run(provider);
+  }
+
+  getLlmCredential(provider: LlmProvider): AgentCredentialEnvelope | undefined {
+    const row = this.database.prepare("SELECT envelope_json FROM llm_provider_credentials WHERE provider = ?")
+      .get(provider) as { envelope_json: string } | undefined;
+    return row ? JSON.parse(row.envelope_json) as AgentCredentialEnvelope : undefined;
+  }
+
+  saveLlmCredential(provider: LlmProvider, envelope: AgentCredentialEnvelope | undefined, now: string): void {
+    if (!envelope) {
+      this.database.prepare("DELETE FROM llm_provider_credentials WHERE provider = ?").run(provider);
+      return;
+    }
+    this.database.prepare(`
+      INSERT INTO llm_provider_credentials(provider, envelope_json, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(provider) DO UPDATE SET envelope_json = excluded.envelope_json, updated_at = excluded.updated_at
+    `).run(provider, JSON.stringify(envelope), now);
   }
 }
 

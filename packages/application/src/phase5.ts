@@ -27,6 +27,7 @@ export interface PhaseFiveRepositoryPort {
     now: string,
     supersededByAssetId?: string
   ): void;
+  purgeUnreferencedAsset(assetId: string): boolean;
   listDerivedArtifacts(assetId?: string): DerivedArtifact[];
   saveDerivedArtifact(artifact: DerivedArtifact): DerivedArtifact;
   createIntegrityScan(scan: IntegrityScan): IntegrityScan;
@@ -397,8 +398,18 @@ export class PhaseFiveService {
     }
     const asset = context.assets.findById(assetId);
     if (!asset) throw new AppError("ASSET_NOT_FOUND", "The original no longer exists.");
+    const evidence = this.getEvidence(assetId);
+    const now = new Date().toISOString();
     await context.vault.remove(asset.sha256);
-    context.phase5.setAssetAvailability(assetId, "deleted", new Date().toISOString());
+    if (context.phase5.purgeUnreferencedAsset(assetId)) {
+      return {
+        ...evidence,
+        asset: { ...asset, availabilityStatus: "deleted", deletedAt: now },
+        availabilityStatus: "deleted",
+        deletedAt: now
+      };
+    }
+    context.phase5.setAssetAvailability(assetId, "deleted", now);
     return this.getEvidence(assetId);
   }
 

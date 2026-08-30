@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -32,6 +32,24 @@ class ScopedTestKeyProtector implements KeyProtectorPort {
 }
 
 describe("encrypted workspace snapshots", () => {
+  it("allows Finder metadata in an otherwise empty workspace directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "grudge-vault-finder-metadata-"));
+    const workspacePath = join(root, "workspace");
+    const manager = new LocalWorkspaceManager(new TestKeyProtector(), join(root, "state.json"));
+    try {
+      await mkdir(workspacePath);
+      await writeFile(join(workspacePath, ".DS_Store"), "finder metadata");
+
+      const session = await manager.create(workspacePath, "Finder Metadata Test");
+
+      expect(session.workspace.rootPath).toBe(workspacePath);
+      expect(await readdir(workspacePath)).toEqual(expect.arrayContaining([".DS_Store", "workspace.json", "db", "logs", "vault"]));
+    } finally {
+      await manager.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("atomically upgrades a v1 workspace config to a stable v2 key ring", async () => {
     const root = await mkdtemp(join(tmpdir(), "grudge-vault-config-upgrade-"));
     const workspacePath = join(root, "workspace");
@@ -160,7 +178,7 @@ describe("encrypted workspace snapshots", () => {
       expect(application.getPersonIdentity(secondPerson.id).identities).toHaveLength(2);
       expect(application.getPersonIdentity(secondPerson.id).activeMerges[0]?.id).toBe(identityMerge.id);
       expect(application.listEventRelations(recorded.event!.id)[0]?.id).toBe(relation.id);
-      expect(application.getEmbeddingStatus()).toMatchObject({ available: false, enabled: true, state: "unavailable" });
+      expect(application.getEmbeddingStatus()).toMatchObject({ available: false, enabled: false, state: "unavailable" });
       expect((await application.unifiedSearch({ text: "Restorable Day One", semantic: false }))
         .some(({ kind }) => kind === "journal_entry")).toBe(true);
       expect(application.listAgentRuns(conversation.id)[0]).toMatchObject({

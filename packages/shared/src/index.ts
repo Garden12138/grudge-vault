@@ -3,7 +3,6 @@ import type {
   AgentAction,
   AgentDataCategory,
   AgentExecutionMode,
-  AgentModelSettings,
   AgentRun,
   BackfillRun,
   Case,
@@ -32,6 +31,10 @@ import type {
   Job,
   ImportRun,
   ImportRunDetail,
+  LlmModelOption,
+  LlmProvider,
+  LlmSettings,
+  BailianRegion,
   ImportFolderStatus,
   IntegrityScan,
   Message,
@@ -101,6 +104,11 @@ export const APP_ERROR_CODES = [
   "AGENT_ACTION_CONFLICT",
   "AGENT_MODEL_CONFIGURATION_INVALID",
   "AGENT_MODEL_UNAVAILABLE",
+  "LLM_AUTHENTICATION_FAILED",
+  "LLM_MODEL_NOT_FOUND",
+  "LLM_TOOL_UNSUPPORTED",
+  "LLM_RATE_LIMITED",
+  "LLM_REGION_MISMATCH",
   "AGENT_TOOL_FAILED",
   "JOB_NOT_RETRYABLE",
   "JOB_STATE_CONFLICT",
@@ -262,6 +270,19 @@ export interface AgentSettingsUpdateInput {
   consentedDataCategories?: AgentDataCategory[];
 }
 
+export interface LlmConnectInput {
+  provider: LlmProvider;
+  model: string;
+  region?: BailianRegion;
+  apiKey?: string;
+}
+
+export interface LlmListModelsInput {
+  provider: LlmProvider;
+  region?: BailianRegion;
+  apiKey?: string;
+}
+
 export type CaseWriteFields = Omit<Case, "id" | "currentRevision" | "createdAt" | "updatedAt">;
 
 export interface CreateCaseInput extends CaseWriteFields {
@@ -327,9 +348,14 @@ export interface GrudgeVaultApi {
     getRun(runId: string): Promise<IpcResult<AgentRun>>;
     approveAction(actionId: string): Promise<IpcResult<AgentAction>>;
     rejectAction(actionId: string): Promise<IpcResult<AgentAction>>;
-    getSettings(): Promise<IpcResult<AgentModelSettings>>;
-    updateSettings(input: AgentSettingsUpdateInput): Promise<IpcResult<AgentModelSettings>>;
-    clearCredential(mode: AgentExecutionMode): Promise<IpcResult<AgentModelSettings>>;
+  };
+  llm: {
+    getSettings(): Promise<IpcResult<LlmSettings>>;
+    listModels(input: LlmListModelsInput): Promise<IpcResult<LlmModelOption[]>>;
+    save(input: LlmConnectInput): Promise<IpcResult<LlmSettings>>;
+    connect(input: LlmConnectInput): Promise<IpcResult<LlmSettings>>;
+    activate(provider: LlmProvider): Promise<IpcResult<LlmSettings>>;
+    disconnect(provider: LlmProvider): Promise<IpcResult<LlmSettings>>;
   };
   events: {
     search(query: EventSearchQuery): Promise<IpcResult<Event[]>>;
@@ -439,6 +465,7 @@ export interface GrudgeVaultApi {
     list(): Promise<IpcResult<Reminder[]>>;
     getSettings(): Promise<IpcResult<ReviewAutomationSettings>>;
     updateSettings(settings: ReviewAutomationSettings): Promise<IpcResult<ReviewAutomationSettings>>;
+    requestSystemNotifications(locale: "zh-CN" | "en"): Promise<IpcResult<boolean>>;
     markRead(id: string): Promise<IpcResult<Reminder>>;
     dismiss(id: string): Promise<IpcResult<Reminder>>;
     onDue(callback: (reminderId: string, shouldOpen: boolean) => void): () => void;

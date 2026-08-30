@@ -545,6 +545,31 @@ export interface Job {
 
 export type AgentIntent = "record" | "retrieve" | "review" | "clarify" | "strategy" | "evidence";
 export type AgentExecutionMode = "private" | "enhanced";
+export type LlmProvider = "nvidia" | "openrouter" | "bailian";
+export type BailianRegion = "cn-beijing" | "ap-southeast-1" | "us-east-1" | "cn-hongkong";
+export type LlmConnectionStatus = "not_configured" | "ready" | "needs_attention";
+
+export interface LlmProviderConfig {
+  provider: LlmProvider;
+  model: string;
+  region?: BailianRegion;
+  credentialConfigured: boolean;
+  status: LlmConnectionStatus;
+  lastTestedAt?: IsoDateTime;
+}
+
+export interface LlmSettings {
+  activeProvider?: LlmProvider;
+  providers: Partial<Record<LlmProvider, LlmProviderConfig>>;
+}
+
+export interface LlmModelOption {
+  id: string;
+  name: string;
+  recommended: boolean;
+  toolCapable: boolean;
+  pricingHint?: string;
+}
 export type AgentDataCategory =
   | "conversation_text"
   | "event_fields"

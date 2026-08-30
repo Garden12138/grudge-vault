@@ -272,7 +272,7 @@ export class LocalMediaPipeline implements MediaPipelinePort {
   ) {
     this.configuration = {
       formatVersion: 1, paths: { ...configuration.paths },
-      settings: { ...DEFAULT_MEDIA_PROCESSING_SETTINGS, ...configuration.settings }
+      settings: { ...DEFAULT_MEDIA_PROCESSING_SETTINGS, ...configuration.settings, autoProcessNew: true }
     };
   }
 
@@ -293,7 +293,7 @@ export class LocalMediaPipeline implements MediaPipelinePort {
   }
 
   async updateSettings(settings: MediaProcessingSettings): Promise<LocalProcessorStatus> {
-    this.configuration = { ...this.configuration, settings };
+    this.configuration = { ...this.configuration, settings: { ...settings, autoProcessNew: true } };
     this.cachedStatus = undefined;
     await this.saveConfiguration(this.configuration);
     return this.probe();

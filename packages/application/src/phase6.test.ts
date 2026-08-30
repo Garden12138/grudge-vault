@@ -139,4 +139,22 @@ describe("Phase 6 media and continuous memory", () => {
     expect(test.application.runReviewAutomation(new Date(2026, 7, 25, 10))).toEqual([]);
     expect(test.application.listReminders().filter(({ kind }) => kind === "monthly_review")).toHaveLength(1);
   });
+
+  it("keeps core processing and in-app review automation enabled while preserving notification choice", async () => {
+    const test = await makeContext(); cleanup.push(test);
+    test.session.memory.setSetting("review.automation", {
+      monthly: false, quarterly: false, clarificationWeekly: false, systemNotifications: true
+    }, "2026-08-29T00:00:00.000Z");
+    expect(test.application.getReviewAutomationSettings()).toEqual({
+      monthly: true, quarterly: true, clarificationWeekly: true, systemNotifications: true
+    });
+    expect(test.application.updateReviewAutomationSettings({
+      monthly: false, quarterly: false, clarificationWeekly: false, systemNotifications: false
+    })).toEqual({ monthly: true, quarterly: true, clarificationWeekly: true, systemNotifications: false });
+
+    const status = await test.application.updateMediaProcessingSettings({
+      autoProcessNew: false, ocrLanguages: ["eng"], resourceProfile: "balanced", whisperGpu: "auto"
+    });
+    expect(status.settings.autoProcessNew).toBe(true);
+  });
 });

@@ -10,7 +10,7 @@
     "node": ">=24.0.0 <25"
   },
   "scripts": {
-    "dev": "electron-vite dev --config apps/desktop/electron.vite.config.ts",
+    "dev": "electron-vite dev --config apps/desktop/electron.vite.config.ts --entry apps/desktop/out/main/index.js",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
     "test": "vitest run",

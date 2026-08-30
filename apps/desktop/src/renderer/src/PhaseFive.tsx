@@ -52,13 +52,20 @@ export function EvidencePanel({ language, onError, onNotice }: CommonProps) {
     const impact = await window.grudgeVault.evidence.deleteImpact(selected.asset.id);
     if (!impact.ok) return onError(impact.error.message);
     const total = impact.data.eventIds.length + impact.data.sourceItemIds.length + impact.data.importRunIds.length + impact.data.caseIds.length;
-    const message = copy(language,
-      `将永久移除原件，但保留引用记录。它被 ${impact.data.eventIds.length} 条记录、${impact.data.sourceItemIds.length} 个来源、${impact.data.importRunIds.length} 次导入和 ${impact.data.caseIds.length} 个材料包引用。继续吗？`,
-      `This permanently removes the original while retaining its references. It is used by ${impact.data.eventIds.length} records, ${impact.data.sourceItemIds.length} sources, ${impact.data.importRunIds.length} imports, and ${impact.data.caseIds.length} material packages. Continue?`);
+    const clearingTombstone = selected.availabilityStatus === "deleted";
+    const message = clearingTombstone
+      ? copy(language,
+          "此材料没有任何引用。将清除残留的文件名、大小和哈希记录。继续吗？",
+          "This material has no references. Its remaining file name, size, and hash record will be removed. Continue?")
+      : copy(language,
+          `将永久移除原件。它被 ${impact.data.eventIds.length} 条记录、${impact.data.sourceItemIds.length} 个来源、${impact.data.importRunIds.length} 次导入和 ${impact.data.caseIds.length} 个材料包引用；无引用时也会清除元数据。继续吗？`,
+          `This permanently removes the original. It is used by ${impact.data.eventIds.length} records, ${impact.data.sourceItemIds.length} sources, ${impact.data.importRunIds.length} imports, and ${impact.data.caseIds.length} material packages; unreferenced metadata is also removed. Continue?`);
     if (!window.confirm(message)) return;
     const result = await window.grudgeVault.evidence.deleteOriginal({ assetId: selected.asset.id, confirmReferencedDeletion: total > 0 });
     if (!result.ok) return onError(result.error.message);
-    onNotice(copy(language, "原件已删除，引用与墓碑仍保留。", "Original deleted; references and tombstone retained."));
+    onNotice(total === 0 && selected.derivedArtifacts.length === 0
+      ? copy(language, "材料原件及其元数据已永久删除。", "The original and its metadata were permanently deleted.")
+      : copy(language, "加密原件已从磁盘永久删除；引用位置仅保留“已删除”记录。", "The encrypted original was permanently removed from disk; referenced locations retain only a “Deleted” record."));
     await refresh();
   };
 
@@ -99,9 +106,13 @@ export function EvidencePanel({ language, onError, onNotice }: CommonProps) {
     </aside>
     <section className="panel phase-five-detail">{!selected ? <div className="empty">{copy(language, "还没有材料。", "No materials yet.")}</div> : <>
       <div className="section-heading"><div><h2>{selected.asset.originalFileName}</h2><p className="muted">{materialStatus(language, selected.availabilityStatus)} · {selected.events.length} {copy(language, "条关联记录", "linked records")}</p></div>
-        <div className="row-actions permanent"><button onClick={() => void processMedia()}>{copy(language, "提取可搜索文字", "Extract searchable text")}</button>
+        <div className="row-actions permanent">{selected.availabilityStatus !== "deleted" && <>
+          <button onClick={() => void processMedia()}>{copy(language, "提取可搜索文字", "Extract searchable text")}</button>
           <button onClick={() => void window.grudgeVault.assets.exportCopy(selected.asset.id)}>{copy(language, "导出副本", "Export copy")}</button>
-          {selected.availabilityStatus !== "deleted" && <button onClick={() => void deleteOriginal()}>{copy(language, "删除原件", "Delete original")}</button>}</div></div>
+          <button onClick={() => void deleteOriginal()}>{copy(language, "永久删除原件", "Delete original permanently")}</button></>}
+          {selected.availabilityStatus === "deleted" && selected.impact.eventIds.length === 0 && selected.impact.sourceItemIds.length === 0
+            && selected.impact.importRunIds.length === 0 && selected.impact.caseIds.length === 0 && selected.derivedArtifacts.length === 0
+            && <button onClick={() => void deleteOriginal()}>{copy(language, "清除删除记录", "Remove deleted record")}</button>}</div></div>
       <section className="subsection"><h3>{copy(language, "关联记录", "Linked records")}</h3><div className="chip-list">{selected.events.length === 0
         ? <span>{copy(language, "暂未关联记录", "No linked record")}</span> : selected.events.map((event) => <span key={event.id}>{event.title}</span>)}</div></section>
       <details className="advanced-section"><summary>{copy(language, "高级详情", "Advanced details")}</summary><div className="advanced-content">

@@ -39,7 +39,7 @@ describe("SQLite foundation", () => {
       runMigrations(database);
       expect(database.pragma("journal_mode", { simple: true })).toBe("wal");
       expect(database.pragma("foreign_keys", { simple: true })).toBe(1);
-      expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 7 });
+      expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 8 });
       expect(database.prepare("SELECT count(*) AS count FROM pragma_module_list WHERE name = 'fts5'").get()).toEqual({ count: 1 });
       database.close();
     } finally {
@@ -60,7 +60,7 @@ describe("SQLite foundation", () => {
     runMigrations(database, [DEFAULT_MIGRATIONS[0]!]);
     expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 1 });
     runMigrations(database);
-    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 7 });
+    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 8 });
     expect(database.prepare("SELECT name FROM sqlite_master WHERE name = 'events'").get()).toEqual({ name: "events" });
     database.close();
   });
@@ -109,14 +109,16 @@ describe("SQLite foundation", () => {
     const tables = database.prepare(`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (
         'agent_runs', 'agent_tool_calls', 'agent_actions', 'external_context_disclosures',
-        'agent_model_settings', 'agent_credentials', 'agent_model_calls'
+        'agent_model_settings', 'agent_credentials', 'agent_model_calls',
+        'llm_settings', 'llm_provider_settings', 'llm_provider_credentials'
       ) ORDER BY name
     `).all() as Array<{ name: string }>;
     expect(tables.map(({ name }) => name)).toEqual([
       "agent_actions", "agent_credentials", "agent_model_calls", "agent_model_settings",
-      "agent_runs", "agent_tool_calls", "external_context_disclosures"
+      "agent_runs", "agent_tool_calls", "external_context_disclosures", "llm_provider_credentials",
+      "llm_provider_settings", "llm_settings"
     ]);
-    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 7 });
+    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 8 });
     database.close();
   });
 

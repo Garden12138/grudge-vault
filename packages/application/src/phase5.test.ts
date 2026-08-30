@@ -141,5 +141,24 @@ describe("Phase 5 Evidence and Case application", () => {
     expect(deleted.availabilityStatus).toBe("deleted");
     expect(deleted.impact).toMatchObject({ eventIds: [event.id], caseIds: [caseItem.id] });
     expect(test.objects.has(firstHash)).toBe(false);
+
+    const standalone = Buffer.from("standalone"); const standaloneHash = sha256(standalone); test.objects.set(standaloneHash, standalone);
+    const standaloneId = randomUUID();
+    test.session.assets.upsert({ id: standaloneId, sha256: standaloneHash, byteSize: standalone.length, mimeType: "text/plain",
+      originalFileName: "standalone.txt", vaultFormat: 2, integrityStatus: "verified", availabilityStatus: "available", createdAt: now });
+    const purged = await test.application.deleteOriginal(standaloneId, false);
+    expect(purged.availabilityStatus).toBe("deleted");
+    expect(test.objects.has(standaloneHash)).toBe(false);
+    expect(test.session.assets.findById(standaloneId)).toBeUndefined();
+    expect(test.application.listEvidence().some(({ asset }) => asset.id === standaloneId)).toBe(false);
+
+    const oldTombstone = Buffer.from("old tombstone"); const oldTombstoneHash = sha256(oldTombstone);
+    const oldTombstoneId = randomUUID();
+    test.session.assets.upsert({ id: oldTombstoneId, sha256: oldTombstoneHash, byteSize: oldTombstone.length, mimeType: "text/plain",
+      originalFileName: "old-tombstone.txt", vaultFormat: 2, integrityStatus: "verified", availabilityStatus: "deleted",
+      deletedAt: now, createdAt: now });
+    const cleared = await test.application.deleteOriginal(oldTombstoneId, false);
+    expect(cleared.availabilityStatus).toBe("deleted");
+    expect(test.session.assets.findById(oldTombstoneId)).toBeUndefined();
   });
 });

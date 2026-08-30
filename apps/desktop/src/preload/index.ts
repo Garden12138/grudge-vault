@@ -40,10 +40,15 @@ const api: GrudgeVaultApi = {
     listRuns: (conversationId) => invoke("agent:list-runs", conversationId),
     getRun: (runId) => invoke("agent:get-run", runId),
     approveAction: (actionId) => invoke("agent:approve-action", actionId),
-    rejectAction: (actionId) => invoke("agent:reject-action", actionId),
-    getSettings: () => invoke("agent:get-settings"),
-    updateSettings: (input) => invoke("agent:update-settings", input),
-    clearCredential: (mode) => invoke("agent:clear-credential", mode)
+    rejectAction: (actionId) => invoke("agent:reject-action", actionId)
+  },
+  llm: {
+    getSettings: () => invoke("llm:get-settings"),
+    listModels: (input) => invoke("llm:list-models", input),
+    save: (input) => invoke("llm:save", input),
+    connect: (input) => invoke("llm:connect", input),
+    activate: (provider) => invoke("llm:activate", provider),
+    disconnect: (provider) => invoke("llm:disconnect", provider)
   },
   events: {
     search: (query) => invoke("events:search", query),
@@ -174,6 +179,7 @@ const api: GrudgeVaultApi = {
     list: () => invoke("reminders:list"),
     getSettings: () => invoke("reminders:settings"),
     updateSettings: (settings) => invoke("reminders:update-settings", settings),
+    requestSystemNotifications: (locale) => invoke("reminders:request-system-notifications", locale),
     markRead: (id) => invoke("reminders:read", id),
     dismiss: (id) => invoke("reminders:dismiss", id),
     onDue: (callback) => {
