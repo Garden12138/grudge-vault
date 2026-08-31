@@ -274,12 +274,14 @@ export interface LlmConnectInput {
   provider: LlmProvider;
   model: string;
   region?: BailianRegion;
+  workspaceId?: string;
   apiKey?: string;
 }
 
 export interface LlmListModelsInput {
   provider: LlmProvider;
   region?: BailianRegion;
+  workspaceId?: string;
   apiKey?: string;
 }
 

@@ -4,7 +4,11 @@ export const llmProviderSchema = z.enum(["nvidia", "openrouter", "bailian"]);
 export const bailianRegionSchema = z.enum(["cn-beijing", "ap-southeast-1", "us-east-1", "cn-hongkong"]);
 
 function validateRegion(
-  value: { provider: z.infer<typeof llmProviderSchema>; region?: z.infer<typeof bailianRegionSchema> | undefined },
+  value: {
+    provider: z.infer<typeof llmProviderSchema>;
+    region?: z.infer<typeof bailianRegionSchema> | undefined;
+    workspaceId?: string | undefined;
+  },
   context: z.RefinementCtx
 ): void {
   if (value.provider === "bailian" && !value.region) {
@@ -13,17 +17,24 @@ function validateRegion(
   if (value.provider !== "bailian" && value.region) {
     context.addIssue({ code: "custom", message: "This provider does not use a region." });
   }
+  if (value.provider !== "bailian" && value.workspaceId) {
+    context.addIssue({ code: "custom", message: "This provider does not use a Workspace ID." });
+  }
 }
+
+const workspaceIdSchema = z.string().trim().regex(/^[A-Za-z0-9-]{1,63}$/).optional();
 
 export const llmConnectSchema = z.object({
   provider: llmProviderSchema,
   model: z.string().trim().min(1).max(200),
   region: bailianRegionSchema.optional(),
+  workspaceId: workspaceIdSchema,
   apiKey: z.string().trim().min(1).max(10_000).optional()
 }).strict().superRefine(validateRegion);
 
 export const llmListModelsSchema = z.object({
   provider: llmProviderSchema,
   region: bailianRegionSchema.optional(),
+  workspaceId: workspaceIdSchema,
   apiKey: z.string().trim().min(1).max(10_000).optional()
 }).strict().superRefine(validateRegion);

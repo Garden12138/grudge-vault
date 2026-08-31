@@ -553,6 +553,7 @@ export interface LlmProviderConfig {
   provider: LlmProvider;
   model: string;
   region?: BailianRegion;
+  workspaceId?: string;
   credentialConfigured: boolean;
   status: LlmConnectionStatus;
   lastTestedAt?: IsoDateTime;
@@ -563,11 +564,25 @@ export interface LlmSettings {
   providers: Partial<Record<LlmProvider, LlmProviderConfig>>;
 }
 
+export type LlmModelModality = "text" | "image" | "audio" | "video" | "embedding" | "other" | "unknown";
+export type LlmModelModalitySource = "provider" | "conservative" | "unknown";
+export type LlmModelCompatibility = "compatible" | "incompatible" | "unknown";
+export type LlmModelCompatibilityReason =
+  | "no_text_input"
+  | "no_text_output"
+  | "no_tool_calling"
+  | "non_chat_model";
+
 export interface LlmModelOption {
   id: string;
   name: string;
   recommended: boolean;
   toolCapable: boolean;
+  inputModalities: LlmModelModality[];
+  outputModalities: LlmModelModality[];
+  modalitySource: LlmModelModalitySource;
+  compatibility: LlmModelCompatibility;
+  compatibilityReason?: LlmModelCompatibilityReason;
   pricingHint?: string;
 }
 export type AgentDataCategory =

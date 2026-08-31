@@ -39,7 +39,7 @@ describe("SQLite foundation", () => {
       runMigrations(database);
       expect(database.pragma("journal_mode", { simple: true })).toBe("wal");
       expect(database.pragma("foreign_keys", { simple: true })).toBe(1);
-      expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 8 });
+      expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 9 });
       expect(database.prepare("SELECT count(*) AS count FROM pragma_module_list WHERE name = 'fts5'").get()).toEqual({ count: 1 });
       database.close();
     } finally {
@@ -60,7 +60,7 @@ describe("SQLite foundation", () => {
     runMigrations(database, [DEFAULT_MIGRATIONS[0]!]);
     expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 1 });
     runMigrations(database);
-    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 8 });
+    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 9 });
     expect(database.prepare("SELECT name FROM sqlite_master WHERE name = 'events'").get()).toEqual({ name: "events" });
     database.close();
   });
@@ -118,7 +118,30 @@ describe("SQLite foundation", () => {
       "agent_runs", "agent_tool_calls", "external_context_disclosures", "llm_provider_credentials",
       "llm_provider_settings", "llm_settings"
     ]);
-    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 8 });
+    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 9 });
+    database.close();
+  });
+
+  it("adds the optional Bailian Workspace ID without changing existing model settings", () => {
+    const database = new Database(":memory:");
+    runMigrations(database, DEFAULT_MIGRATIONS.slice(0, 8));
+    database.prepare(`
+      INSERT INTO llm_provider_settings(provider, model, region, status, last_tested_at, updated_at)
+      VALUES ('bailian', 'qwen-existing', 'cn-beijing', 'needs_attention', NULL, '2026-08-30T00:00:00.000Z')
+    `).run();
+    runMigrations(database);
+    const columns = database.prepare("PRAGMA table_info(llm_provider_settings)").all() as Array<{ name: string }>;
+    expect(columns.map(({ name }) => name)).toContain("workspace_id");
+    const repository = new SqliteAgentRepository(database);
+    expect(repository.getLlmProviderConfig("bailian")).toMatchObject({
+      model: "qwen-existing", region: "cn-beijing", status: "needs_attention"
+    });
+    expect(repository.getLlmProviderConfig("bailian")).not.toHaveProperty("workspaceId");
+    repository.saveLlmProviderConfig({
+      provider: "bailian", model: "qwen-updated", region: "cn-beijing", workspaceId: "ws-123",
+      credentialConfigured: false, status: "not_configured"
+    }, "2026-08-30T01:00:00.000Z");
+    expect(repository.getLlmProviderConfig("bailian")?.workspaceId).toBe("ws-123");
     database.close();
   });
 

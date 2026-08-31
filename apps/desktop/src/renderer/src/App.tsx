@@ -8,6 +8,8 @@ import type {
 } from "@grudge-vault/domain";
 import type { EventWriteFields, IpcResult } from "@grudge-vault/shared";
 import { detectLanguage, translator, type Language } from "./i18n";
+import { ModelCombobox } from "./ModelCombobox";
+import type { ModelTypeFilter } from "./model-catalog";
 import { CasesPanel, EvidencePanel, WorkspaceSecurityPanel } from "./PhaseFive";
 import { AppShell, MaterialsPage, MemoryPage, PageTabs, RecordPage, ReviewPage, SettingsPage } from "./ProductPages";
 
@@ -17,10 +19,13 @@ const NVIDIA_DEFAULT_MODEL = "openai/gpt-oss-20b";
 
 interface LlmDraft {
   region: BailianRegion;
+  workspaceId: string;
   model: string;
   apiKey: string;
   models: LlmModelOption[];
   manualModel: boolean;
+  modelSearch: string;
+  typeFilter: ModelTypeFilter;
 }
 
 function defaultLlmModel(provider: LlmProvider): string {
@@ -234,10 +239,13 @@ export function App() {
   const [llmSettings, setLlmSettings] = useState<LlmSettings>({ providers: {} });
   const [llmProvider, setLlmProvider] = useState<LlmProvider>("nvidia");
   const [llmRegion, setLlmRegion] = useState<BailianRegion>("cn-beijing");
+  const [llmWorkspaceId, setLlmWorkspaceId] = useState("");
   const [llmModel, setLlmModel] = useState(NVIDIA_DEFAULT_MODEL);
   const [llmApiKey, setLlmApiKey] = useState("");
   const [llmModels, setLlmModels] = useState<LlmModelOption[]>([]);
   const [manualLlmModel, setManualLlmModel] = useState(false);
+  const [llmModelSearch, setLlmModelSearch] = useState("");
+  const [llmTypeFilter, setLlmTypeFilter] = useState<ModelTypeFilter>("all");
   const llmDraftsRef = useRef<Partial<Record<LlmProvider, LlmDraft>>>({});
   const llmFormInitializedRef = useRef(false);
 
@@ -362,6 +370,7 @@ export function App() {
         const config = settings.providers[provider];
         setLlmProvider(provider);
         setLlmRegion(config?.region ?? "cn-beijing");
+        setLlmWorkspaceId(config?.workspaceId ?? "");
         setLlmModel(config?.model ?? defaultLlmModel(provider));
         llmFormInitializedRef.current = true;
       }
@@ -430,8 +439,9 @@ export function App() {
     setAgentRuns([]); setPendingAgentRun(undefined); setConversations([]); setTimeline(undefined); setUnifiedHits([]);
     setProcessorStatus(undefined); setImportFolderStatus(undefined); setReminders([]); setReviewAutomation(undefined);
     llmDraftsRef.current = {}; llmFormInitializedRef.current = false;
-    setLlmSettings({ providers: {} }); setLlmProvider("nvidia"); setLlmRegion("cn-beijing");
+    setLlmSettings({ providers: {} }); setLlmProvider("nvidia"); setLlmRegion("cn-beijing"); setLlmWorkspaceId("");
     setLlmModel(NVIDIA_DEFAULT_MODEL); setLlmApiKey(""); setLlmModels([]); setManualLlmModel(false);
+    setLlmModelSearch(""); setLlmTypeFilter("all");
     setLockState((current) => current.status === "open"
       ? { status: "locked", workspaceId: current.workspace.id, workspaceName: current.workspace.name }
       : current);
@@ -538,15 +548,18 @@ export function App() {
 
   const selectLlmProvider = (provider: LlmProvider) => {
     llmDraftsRef.current[llmProvider] = {
-      region: llmRegion, model: llmModel, apiKey: llmApiKey, models: llmModels, manualModel: manualLlmModel
+      region: llmRegion, workspaceId: llmWorkspaceId, model: llmModel, apiKey: llmApiKey,
+      models: llmModels, manualModel: manualLlmModel, modelSearch: llmModelSearch, typeFilter: llmTypeFilter
     };
     const draft = llmDraftsRef.current[provider];
     const config = llmSettings.providers[provider];
     setLlmProvider(provider);
     setLlmRegion(draft?.region ?? config?.region ?? "cn-beijing");
+    setLlmWorkspaceId(draft?.workspaceId ?? config?.workspaceId ?? "");
     setLlmModel(draft?.model ?? config?.model ?? defaultLlmModel(provider));
     setLlmApiKey(draft?.apiKey ?? ""); setLlmModels(draft?.models ?? []);
-    setManualLlmModel(draft?.manualModel ?? false); setError(undefined);
+    setManualLlmModel(draft?.manualModel ?? false); setLlmModelSearch(draft?.modelSearch ?? "");
+    setLlmTypeFilter(draft?.typeFilter ?? "all"); setError(undefined);
   };
 
   const loadLlmModels = async () => {
@@ -554,12 +567,21 @@ export function App() {
     const result = await window.grudgeVault.llm.listModels({
       provider: llmProvider,
       ...(llmProvider === "bailian" ? { region: llmRegion } : {}),
+      ...(llmProvider === "bailian" && llmWorkspaceId.trim() ? { workspaceId: llmWorkspaceId.trim() } : {}),
       ...(llmApiKey.trim() ? { apiKey: llmApiKey } : {})
     });
     setBusy(false);
     if (!result.ok) return setError(result.error.message);
     setLlmModels(result.data);
-    if (!llmModel && result.data[0]) setLlmModel(result.data[0].id);
+    if (!llmModel) {
+      const firstSelectable = result.data.find(({ compatibility }) => compatibility !== "incompatible");
+      if (firstSelectable) setLlmModel(firstSelectable.id);
+    }
+    if (llmProvider === "bailian" && (llmRegion === "cn-beijing" || llmRegion === "us-east-1") && !llmWorkspaceId.trim()) {
+      setNotice(language === "zh-CN"
+        ? "北京和美国地域的完整目录需要 Workspace ID；当前显示内置推荐模型，连接功能仍可使用。"
+        : "The complete Beijing and US catalogs require a Workspace ID. Built-in recommendations are shown; connecting still works.");
+    }
   };
 
   const connectLlm = async () => {
@@ -568,6 +590,7 @@ export function App() {
     const result = await window.grudgeVault.llm.connect({
       provider: llmProvider, model: llmModel.trim(),
       ...(llmProvider === "bailian" ? { region: llmRegion } : {}),
+      ...(llmProvider === "bailian" && llmWorkspaceId.trim() ? { workspaceId: llmWorkspaceId.trim() } : {}),
       ...(llmApiKey.trim() ? { apiKey: llmApiKey } : {})
     });
     setBusy(false);
@@ -582,13 +605,15 @@ export function App() {
     const result = await window.grudgeVault.llm.save({
       provider: llmProvider, model: llmModel.trim(),
       ...(llmProvider === "bailian" ? { region: llmRegion } : {}),
+      ...(llmProvider === "bailian" && llmWorkspaceId.trim() ? { workspaceId: llmWorkspaceId.trim() } : {}),
       ...(llmApiKey.trim() ? { apiKey: llmApiKey } : {})
     });
     setBusy(false);
     if (!result.ok) return setError(result.error.message);
     setLlmSettings(result.data); setLlmApiKey("");
     llmDraftsRef.current[llmProvider] = {
-      region: llmRegion, model: llmModel.trim(), apiKey: "", models: llmModels, manualModel: manualLlmModel
+      region: llmRegion, workspaceId: llmWorkspaceId.trim(), model: llmModel.trim(), apiKey: "",
+      models: llmModels, manualModel: manualLlmModel, modelSearch: llmModelSearch, typeFilter: llmTypeFilter
     };
     setNotice(language === "zh-CN"
       ? "配置已安全保存到当前账本；连接并启用前不会发送测试请求。"
@@ -600,7 +625,8 @@ export function App() {
     if (!window.confirm(language === "zh-CN" ? `断开 ${label} 并清除本机保存的 API Key？` : `Disconnect ${label} and clear its saved API key?`)) return;
     const result = await window.grudgeVault.llm.disconnect(llmProvider);
     if (!result.ok) return setError(result.error.message);
-    setLlmSettings(result.data); setLlmApiKey(""); setLlmModels([]);
+    setLlmSettings(result.data); setLlmApiKey(""); setLlmModels([]); setLlmWorkspaceId("");
+    setLlmModelSearch(""); setLlmTypeFilter("all");
     setNotice(language === "zh-CN" ? "模型服务已断开。" : "Model service disconnected.");
   };
 
@@ -1513,31 +1539,42 @@ export function App() {
           </div>
           <div className="llm-form">
             {llmProvider === "bailian" && <label className="field"><span>{language === "zh-CN" ? "服务地域" : "Service region"}</span>
-              <select value={llmRegion} onChange={(event) => { setLlmRegion(event.target.value as BailianRegion); setLlmModels([]); }}>
+              <select value={llmRegion} onChange={(event) => {
+                setLlmRegion(event.target.value as BailianRegion); setLlmModels([]); setLlmModelSearch(""); setLlmTypeFilter("all");
+              }}>
                 <option value="cn-beijing">{language === "zh-CN" ? "中国大陆（北京）" : "China mainland (Beijing)"}</option>
                 <option value="ap-southeast-1">{language === "zh-CN" ? "新加坡" : "Singapore"}</option>
                 <option value="us-east-1">{language === "zh-CN" ? "美国（弗吉尼亚）" : "US (Virginia)"}</option>
                 <option value="cn-hongkong">{language === "zh-CN" ? "中国香港" : "Hong Kong, China"}</option>
               </select><small>{language === "zh-CN" ? "地域必须与你创建 API Key 时选择的地域一致。" : "This must match the region where the API key was created."}</small></label>}
+            {llmProvider === "bailian" && (llmRegion === "cn-beijing" || llmRegion === "us-east-1") &&
+              <label className="field"><span>Workspace ID <em>{language === "zh-CN" ? "（可选）" : "(optional)"}</em></span>
+                <input value={llmWorkspaceId} maxLength={63} placeholder="ws-..." onChange={(event) => {
+                  setLlmWorkspaceId(event.target.value); setLlmModels([]);
+                }} />
+                <small>{language === "zh-CN"
+                  ? "加载北京或美国地域的完整模型目录时需要；不填写仍可连接模型，并显示内置推荐。"
+                  : "Required for the complete Beijing or US catalog. Connecting still works without it, using built-in recommendations."}</small>
+              </label>}
             <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={llmApiKey}
               placeholder={llmSettings.providers[llmProvider]?.credentialConfigured ? (language === "zh-CN" ? "已安全保存在本机；留空则继续使用" : "Saved securely; leave blank to keep using it") : "••••••••"}
               onChange={(event) => setLlmApiKey(event.target.value)} /></label>
-            {!manualLlmModel ? <label className="field"><span>{language === "zh-CN" ? "模型" : "Model"}</span>
-              <div className="model-picker"><select value={llmModel} onChange={(event) => setLlmModel(event.target.value)}>
-                {!llmModel && <option value="">{language === "zh-CN" ? "请选择模型" : "Choose a model"}</option>}
-                {llmModel && !llmModels.some(({ id }) => id === llmModel) && <option value={llmModel}>{llmModel}</option>}
-                {llmModels.map((model) => <option key={model.id} value={model.id}>{model.recommended ? "★ " : ""}{model.name}</option>)}
-              </select><button disabled={busy} onClick={() => void loadLlmModels()}>{language === "zh-CN" ? "加载推荐" : "Load recommendations"}</button></div>
-              <small><button className="text-button" onClick={() => setManualLlmModel(true)}>{language === "zh-CN" ? "使用其他模型名称" : "Use another model name"}</button></small>
-            </label> : <label className="field"><span>{language === "zh-CN" ? "模型名称" : "Model name"}</span>
+            {!manualLlmModel ? <div className="field"><div className="model-field-heading"><span>{language === "zh-CN" ? "模型" : "Model"}</span>
+              <button type="button" disabled={busy} onClick={() => void loadLlmModels()}>{language === "zh-CN" ? "加载全部模型" : "Load all models"}</button></div>
+              <ModelCombobox models={llmModels} selectedModel={llmModel} search={llmModelSearch} typeFilter={llmTypeFilter}
+                language={language} disabled={busy} onSearchChange={setLlmModelSearch} onTypeFilterChange={setLlmTypeFilter}
+                onSelect={(model) => setLlmModel(model.id)} />
+              {llmModels.length === 0 && <small>{language === "zh-CN" ? "先加载服务商模型目录，或手动输入模型名称。" : "Load the provider catalog first, or enter a model name manually."}</small>}
+              <small><button className="text-button" type="button" onClick={() => setManualLlmModel(true)}>{language === "zh-CN" ? "手动输入其他模型名称" : "Enter another model name manually"}</button></small>
+            </div> : <label className="field"><span>{language === "zh-CN" ? "模型名称" : "Model name"}</span>
               <input value={llmModel} maxLength={200} onChange={(event) => setLlmModel(event.target.value)} />
-              <small><button className="text-button" onClick={() => setManualLlmModel(false)}>{language === "zh-CN" ? "返回推荐模型" : "Back to recommended models"}</button></small></label>}
+              <small><button className="text-button" type="button" onClick={() => setManualLlmModel(false)}>{language === "zh-CN" ? "返回模型目录" : "Back to model catalog"}</button></small></label>}
             <div className="connection-note"><strong>{language === "zh-CN" ? "启用前会进行一次连接测试" : "A connection test runs before enabling"}</strong>
               <span>{llmProvider === "nvidia"
                 ? (language === "zh-CN" ? "先确认模型仍在 NVIDIA 目录中，再完成一次最多 8 token 的真实推理；最长等待 360 秒。" : "It confirms the model is still in NVIDIA's catalog, then runs a real inference of at most 8 tokens with a 360-second timeout.")
                 : (language === "zh-CN" ? "只请求一个极短回复，用来验证 API Key 和模型，可能产生极少量服务商费用。" : "It requests one very short reply to verify the API key and model and may incur a tiny provider charge.")}</span></div>
-            <div className="landing-actions"><button disabled={busy || !llmModel.trim()} onClick={() => void saveLlm()}>{language === "zh-CN" ? "保存配置" : "Save configuration"}</button>
-              <button className="primary" disabled={busy || !llmModel.trim()} onClick={() => void connectLlm()}>{language === "zh-CN" ? "连接并启用" : "Connect and enable"}</button>
+            <div className="landing-actions"><button disabled={busy || !llmModel.trim() || llmModels.some(({ id, compatibility }) => id === llmModel && compatibility === "incompatible")} onClick={() => void saveLlm()}>{language === "zh-CN" ? "保存配置" : "Save configuration"}</button>
+              <button className="primary" disabled={busy || !llmModel.trim() || llmModels.some(({ id, compatibility }) => id === llmModel && compatibility === "incompatible")} onClick={() => void connectLlm()}>{language === "zh-CN" ? "连接并启用" : "Connect and enable"}</button>
             </div>
             {llmSettings.providers[llmProvider] && <small><button className="text-button danger-text" disabled={busy} onClick={() => void disconnectLlm()}>{language === "zh-CN" ? "清除已保存配置" : "Clear saved configuration"}</button></small>}
           </div>

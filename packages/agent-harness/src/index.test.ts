@@ -25,6 +25,7 @@ import {
   createDefaultAgentToolRegistry,
   exportAgentToolSchemasV3,
   redactExternalText,
+  resolveBailianCatalogEndpoint,
   routeAgentIntent,
   type AgentModelAdapterPort
 } from "./index";
@@ -218,14 +219,18 @@ describe("Phase 4 Agent Harness", () => {
           return [{ id: "deepseek-ai/deepseek-v4-pro-0813", name: "DeepSeek V4 Pro" }];
         }
         return [
-          { id: "tools-model", name: "Tools model", supportedParameters: ["tools"], outputModalities: ["text"] },
-          { id: "plain-model", name: "Plain model", supportedParameters: ["temperature"], outputModalities: ["text"] }
+          { id: "tools-model", name: "Tools model", supportedParameters: ["tools"], inputModalities: ["text"], outputModalities: ["text"] },
+          { id: "plain-model", name: "Plain model", supportedParameters: ["temperature"], inputModalities: ["text"], outputModalities: ["text"] }
         ];
       }
     };
     const harness = new AgentHarness(context.application, { modelAdapter: adapter });
     const models = await harness.listLlmModels({ provider: "openrouter", apiKey: "temporary-key" });
-    expect(models.map(({ id }) => id)).toEqual(["tools-model"]);
+    expect(models.map(({ id }) => id)).toEqual(["tools-model", "plain-model"]);
+    expect(models[0]).toMatchObject({
+      inputModalities: ["text"], outputModalities: ["text"], compatibility: "compatible", modalitySource: "provider"
+    });
+    expect(models[1]).toMatchObject({ compatibility: "incompatible", compatibilityReason: "no_tool_calling" });
 
     const saved = harness.saveLlm({
       provider: "nvidia", model: "deepseek-ai/deepseek-v4-pro-0813", apiKey: "nvidia-key"
@@ -258,6 +263,127 @@ describe("Phase 4 Agent Harness", () => {
     ).pluck().get())).not.toContain("router-key");
     expect((await harness.activateLlm("nvidia")).activeProvider).toBe("nvidia");
     expect(harness.disconnectLlm("nvidia").activeProvider).toBeUndefined();
+  });
+
+  it("loads complete provider catalogs and conservatively classifies NVIDIA models", async () => {
+    const context = createContext();
+    databases.push(context.database);
+    const nvidiaCatalog = Array.from({ length: 40 }, (_, index) => ({ id: `vendor/chat-${index}` }));
+    nvidiaCatalog.push({ id: "nvidia/llama-nv-embedqa-1b-v2" }, { id: "vendor/vision-vl-model" });
+    const adapter: AgentModelAdapterPort = {
+      identity: "fake.catalog", version: 1,
+      async run(input) { return { model: input.model }; },
+      async listModels() { return nvidiaCatalog; }
+    };
+    const models = await new AgentHarness(context.application, { modelAdapter: adapter })
+      .listLlmModels({ provider: "nvidia", apiKey: "secret" });
+    expect(models).toHaveLength(43);
+    expect(models.find(({ id }) => id === "vendor/chat-39")).toMatchObject({
+      inputModalities: ["unknown"], outputModalities: ["unknown"], compatibility: "unknown", modalitySource: "unknown"
+    });
+    expect(models.find(({ id }) => id === "vendor/vision-vl-model")).toMatchObject({
+      inputModalities: ["text", "image"], outputModalities: ["text"], compatibility: "unknown"
+    });
+    expect(models.find(({ id }) => id === "nvidia/llama-nv-embedqa-1b-v2")).toMatchObject({
+      outputModalities: ["embedding"], compatibility: "incompatible", compatibilityReason: "non_chat_model"
+    });
+  });
+
+  it("parses OpenRouter architecture metadata without server filtering or local truncation", async () => {
+    const requests: string[] = [];
+    const catalog = Array.from({ length: 12 }, (_, index) => ({
+      id: `provider/model-${index}`, name: `Model ${index}`,
+      supported_parameters: index === 11 ? ["temperature"] : ["tools"],
+      architecture: { input_modalities: index === 10 ? ["text", "image"] : ["text"], output_modalities: ["text"] }
+    }));
+    const adapter = new OpenAiCompatibleChatAdapter((async (input) => {
+      requests.push(String(input)); return jsonResponse({ data: catalog });
+    }) as typeof globalThis.fetch);
+    const items = await adapter.listModels({ baseUrl: "https://openrouter.ai/api/v1", apiKey: "secret" });
+    expect(requests).toEqual(["https://openrouter.ai/api/v1/models"]);
+    expect(items).toHaveLength(12);
+    expect(items[10]).toMatchObject({ inputModalities: ["text", "image"], outputModalities: ["text"] });
+
+    const context = createContext();
+    databases.push(context.database);
+    const models = await new AgentHarness(context.application, { modelAdapter: adapter })
+      .listLlmModels({ provider: "openrouter", apiKey: "secret" });
+    expect(models).toHaveLength(12);
+    expect(models.find(({ id }) => id === "provider/model-10")).toMatchObject({
+      compatibility: "compatible", inputModalities: ["text", "image"]
+    });
+    expect(models.find(({ id }) => id === "provider/model-11")).toMatchObject({
+      compatibility: "incompatible", compatibilityReason: "no_tool_calling"
+    });
+  });
+
+  it("builds regional Bailian catalog URLs and aggregates every page of official metadata", async () => {
+    expect(resolveBailianCatalogEndpoint("ap-southeast-1")).toBe("https://dashscope-intl.aliyuncs.com/api/v1/models");
+    expect(resolveBailianCatalogEndpoint("cn-hongkong")).toBe("https://cn-hongkong.dashscope.aliyuncs.com/api/v1/models");
+    expect(resolveBailianCatalogEndpoint("cn-beijing")).toBeUndefined();
+    expect(resolveBailianCatalogEndpoint("cn-beijing", "ws-123"))
+      .toBe("https://ws-123.cn-beijing.maas.aliyuncs.com/api/v1/models");
+    expect(resolveBailianCatalogEndpoint("us-east-1", "ws-456"))
+      .toBe("https://ws-456.us-east-1.maas.aliyuncs.com/api/v1/models");
+
+    const requests: string[] = [];
+    const adapter = new OpenAiCompatibleChatAdapter((async (input) => {
+      const url = String(input); requests.push(url);
+      const page = new URL(url).searchParams.get("page_no");
+      const models = page === "1" ? [
+        { model: "qwen-a", name: "Qwen A", capabilities: ["text-generation"], features: ["function-calling"],
+          inference_metadata: { request_modality: ["text"], response_modality: ["text"] } },
+        { model: "embed-a", name: "Embed A", capabilities: ["text-embedding"], features: [],
+          inference_metadata: { request_modality: ["text"], response_modality: ["embedding"] } }
+      ] : [{ model: "qwen-vl", name: "Qwen VL", capabilities: ["text-generation"], features: ["function-calling"],
+        inference_metadata: { request_modality: ["text", "image"], response_modality: ["text"] } }];
+      return jsonResponse({ success: true, output: { total: 3, page_no: Number(page), page_size: 100, models } });
+    }) as typeof globalThis.fetch);
+    const items = await adapter.listModels({
+      baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", apiKey: "secret",
+      catalogFormat: "bailian", catalogUrl: "https://ws-123.cn-beijing.maas.aliyuncs.com/api/v1/models"
+    });
+    expect(items).toHaveLength(3);
+    expect(requests).toHaveLength(2);
+    expect(requests[0]).toContain("page_size=100");
+    expect(items[2]).toMatchObject({
+      id: "qwen-vl", capabilities: ["text-generation"], features: ["function-calling"],
+      inputModalities: ["text", "image"], outputModalities: ["text"]
+    });
+    const context = createContext();
+    databases.push(context.database);
+    const catalogAdapter: AgentModelAdapterPort = {
+      identity: "fake.bailian-catalog", version: 1,
+      async run(input) { return { model: input.model }; }, async listModels() { return items; }
+    };
+    const classified = await new AgentHarness(context.application, { modelAdapter: catalogAdapter }).listLlmModels({
+      provider: "bailian", region: "ap-southeast-1", apiKey: "secret"
+    });
+    expect(classified.find(({ id }) => id === "qwen-vl")).toMatchObject({
+      compatibility: "compatible", inputModalities: ["text", "image"], outputModalities: ["text"]
+    });
+    expect(classified.find(({ id }) => id === "embed-a")).toMatchObject({
+      compatibility: "incompatible", compatibilityReason: "non_chat_model", outputModalities: ["embedding"]
+    });
+  });
+
+  it("falls back to Bailian recommendations without a required workspace ID and persists one when supplied", async () => {
+    const context = createContext();
+    databases.push(context.database);
+    const listModels = vi.fn(async () => []);
+    const adapter: AgentModelAdapterPort = {
+      identity: "fake.bailian", version: 1,
+      async run(input) { return { model: input.model }; }, listModels
+    };
+    const harness = new AgentHarness(context.application, { modelAdapter: adapter });
+    const fallback = await harness.listLlmModels({ provider: "bailian", region: "cn-beijing", apiKey: "secret" });
+    expect(fallback.every(({ recommended }) => recommended)).toBe(true);
+    expect(listModels).not.toHaveBeenCalled();
+    const saved = harness.saveLlm({
+      provider: "bailian", region: "cn-beijing", workspaceId: "ws-123", model: "qwen3.7-plus", apiKey: "secret"
+    });
+    expect(saved.providers.bailian?.workspaceId).toBe("ws-123");
+    expect(harness.getLlmSettings().providers.bailian?.workspaceId).toBe("ws-123");
   });
 
   it("does not save a failed provider connection and productizes Bailian region failures", async () => {

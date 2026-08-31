@@ -940,6 +940,11 @@ export const DEFAULT_MIGRATIONS: readonly Migration[] = [
         updated_at TEXT NOT NULL
       ) STRICT;
     `
+  },
+  {
+    version: 9,
+    name: "bailian-workspace-catalog",
+    sql: `ALTER TABLE llm_provider_settings ADD COLUMN workspace_id TEXT;`
   }
 ];
 
@@ -2776,6 +2781,7 @@ export class SqliteAgentRepository implements AgentRepositoryPort {
         provider, model: String(config.model), status: config.status as LlmProviderConfig["status"],
         credentialConfigured: Boolean(this.getLlmCredential(provider)),
         ...(config.region ? { region: String(config.region) as NonNullable<LlmProviderConfig["region"]> } : {}),
+        ...(config.workspace_id ? { workspaceId: String(config.workspace_id) } : {}),
         ...(config.last_tested_at ? { lastTestedAt: String(config.last_tested_at) } : {})
       };
     }
@@ -2798,17 +2804,20 @@ export class SqliteAgentRepository implements AgentRepositoryPort {
       provider, model: String(row.model), status: row.status as LlmProviderConfig["status"],
       credentialConfigured: Boolean(this.getLlmCredential(provider)),
       ...(row.region ? { region: String(row.region) as NonNullable<LlmProviderConfig["region"]> } : {}),
+      ...(row.workspace_id ? { workspaceId: String(row.workspace_id) } : {}),
       ...(row.last_tested_at ? { lastTestedAt: String(row.last_tested_at) } : {})
     };
   }
 
   saveLlmProviderConfig(config: LlmProviderConfig, now: string): void {
     this.database.prepare(`
-      INSERT INTO llm_provider_settings(provider, model, region, status, last_tested_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO llm_provider_settings(provider, model, region, workspace_id, status, last_tested_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(provider) DO UPDATE SET model = excluded.model, region = excluded.region,
-        status = excluded.status, last_tested_at = excluded.last_tested_at, updated_at = excluded.updated_at
-    `).run(config.provider, config.model, config.region ?? null, config.status, config.lastTestedAt ?? null, now);
+        workspace_id = excluded.workspace_id, status = excluded.status,
+        last_tested_at = excluded.last_tested_at, updated_at = excluded.updated_at
+    `).run(config.provider, config.model, config.region ?? null, config.workspaceId ?? null,
+      config.status, config.lastTestedAt ?? null, now);
   }
 
   deleteLlmProviderConfig(provider: LlmProvider): void {

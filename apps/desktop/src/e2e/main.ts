@@ -25,7 +25,16 @@ class E2eAgentModelAdapter implements AgentModelAdapterPort {
   }
 
   async listModels() {
-    return [{ id: "openai/gpt-oss-20b", name: "GPT-OSS 20B", supportedParameters: ["tools"], outputModalities: ["text"] }];
+    return [
+      { id: "openai/gpt-oss-20b", name: "GPT-OSS 20B", supportedParameters: ["tools"],
+        inputModalities: ["text"], outputModalities: ["text"] },
+      { id: "e2e/vision-assistant", name: "E2E Vision Assistant", supportedParameters: ["tools"],
+        inputModalities: ["text", "image"], outputModalities: ["text"] },
+      { id: "e2e/text-embedding", name: "E2E Text Embedding", supportedParameters: [],
+        inputModalities: ["text"], outputModalities: ["embedding"] },
+      { id: "e2e/no-tools-chat", name: "E2E Chat Without Tools", supportedParameters: ["temperature"],
+        inputModalities: ["text"], outputModalities: ["text"] }
+    ];
   }
 
   async run(input: Parameters<AgentModelAdapterPort["run"]>[0]) {

@@ -10,13 +10,17 @@ describe("LLM IPC validation", () => {
       provider: "openrouter", model: "provider/model", apiKey: "secret"
     }).success).toBe(true);
     expect(llmConnectSchema.safeParse({
-      provider: "bailian", region: "cn-beijing", model: "qwen3.7-plus", apiKey: "secret"
+      provider: "bailian", region: "cn-beijing", workspaceId: "workspace-123",
+      model: "qwen3.7-plus", apiKey: "secret"
     }).success).toBe(true);
 
     expect(llmConnectSchema.safeParse({ provider: "custom", model: "model", apiKey: "secret" }).success).toBe(false);
     expect(llmConnectSchema.safeParse({ provider: "bailian", model: "model", apiKey: "secret" }).success).toBe(false);
     expect(llmConnectSchema.safeParse({
       provider: "nvidia", region: "cn-beijing", model: "model", apiKey: "secret"
+    }).success).toBe(false);
+    expect(llmConnectSchema.safeParse({
+      provider: "nvidia", workspaceId: "workspace-123", model: "model", apiKey: "secret"
     }).success).toBe(false);
   });
 
@@ -29,6 +33,9 @@ describe("LLM IPC validation", () => {
     }).success).toBe(false);
     expect(llmConnectSchema.safeParse({
       provider: "nvidia", model: "m".repeat(201), apiKey: "secret"
+    }).success).toBe(false);
+    expect(llmListModelsSchema.safeParse({
+      provider: "bailian", region: "cn-beijing", workspaceId: "workspace_unsafe", apiKey: "secret"
     }).success).toBe(false);
   });
 });

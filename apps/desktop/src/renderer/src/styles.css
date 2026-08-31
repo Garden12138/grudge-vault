@@ -352,7 +352,25 @@ fieldset .inline-create { padding: 13px 0 0; }
 .provider-selector button span { color: #7d756b; font-size: 11px; font-weight: 500; }
 .provider-selector button.active { border-color: #8d3b24; color: #7b301f; background: #fbf2ed; box-shadow: 0 0 0 2px rgba(141,59,36,.07); }
 .llm-form { display: grid; max-width: 640px; gap: 20px; padding: 26px 28px 30px; }
-.model-picker { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.model-field-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.model-field-heading > button { min-height: 32px; padding: 5px 10px; font-size: 11px; }
+.model-combobox { position: relative; font-weight: 500; }
+.model-search-row { display: grid; grid-template-columns: minmax(0, 1fr) 132px; gap: 8px; }
+.model-picker-summary { display: flex; justify-content: space-between; gap: 12px; padding: 6px 2px 0; color: #81786d; font-size: 10px; }
+.model-picker-summary strong { overflow: hidden; color: #554d44; text-overflow: ellipsis; white-space: nowrap; }
+.model-options { position: absolute; z-index: 20; top: calc(100% + 6px); right: 0; left: 0; max-height: 360px; padding: 6px; border: 1px solid #cfc3b4; border-radius: 11px; background: #fffefa; box-shadow: 0 18px 42px rgba(66,48,30,.18); overflow-y: auto; }
+.model-options > button { display: flex; width: 100%; min-height: 58px; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 10px 11px; border-color: transparent; text-align: left; background: transparent; }
+.model-options > button:hover:not(:disabled), .model-options > button.active:not(:disabled) { border-color: #d5c2b5; background: #fbf3ec; }
+.model-options > button.selected { box-shadow: inset 3px 0 #8d3b24; }
+.model-options > button:disabled { cursor: not-allowed; opacity: .58; }
+.model-option-copy { display: grid; min-width: 0; gap: 2px; }
+.model-option-copy strong, .model-option-copy code { overflow-wrap: anywhere; }
+.model-option-copy code { color: #7e756b; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 9px; }
+.model-option-copy small { color: #8a3c2b; font-size: 9px; font-weight: 650; }
+.model-type-tag { flex: 0 0 auto; max-width: 190px; padding: 3px 7px; border-radius: 999px; color: #435a49; background: #edf3ec; font-size: 9px; font-weight: 750; text-align: center; }
+.model-type-tag.unknown { color: #6c5a35; background: #f3ead8; }
+.model-type-tag.incompatible { color: #7b3b31; background: #f6e3df; }
+.model-empty { padding: 28px 14px; color: #81786d; text-align: center; font-size: 12px; }
 .text-button { min-height: 0; padding: 0; border: 0; color: #7b321f; background: transparent; font-size: 12px; }
 .connection-note { display: grid; gap: 3px; padding: 13px 14px; border-radius: 10px; color: #655d54; background: #f5f1ea; font-size: 12px; }
 .connection-note span { color: #7a7269; }
@@ -388,6 +406,7 @@ fieldset .inline-create { padding: 13px 0 0; }
   .record-heading h2 { font-size: 25px; }
   .record-panel .composer { padding: 18px 20px 22px; }
   .form-row, .date-filter, .settings-grid, .candidate-actions, .search-toolbar, .evidence-metadata, .compact-form, .structured-row.fact-row, .structured-row.emotion-row, .structured-row.interest-row { grid-template-columns: 1fr; }
+  .model-search-row { grid-template-columns: 1fr; }
   .asset-row { grid-template-columns: 1fr; }
   .agent-analysis { grid-template-columns: 1fr; }
 }

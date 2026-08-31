@@ -15,12 +15,16 @@ import type {
   AgentModelSettings,
   AgentRun,
   AgentToolCall,
+  BailianRegion,
   Case,
   EvidenceDetail,
   Event,
   ExternalContextDisclosure,
   GroundedAgentClaim,
   LlmModelOption,
+  LlmModelCompatibility,
+  LlmModelCompatibilityReason,
+  LlmModelModality,
   LlmProvider,
   LlmSettings,
   Message,
@@ -49,6 +53,7 @@ export const MAX_AGENT_MODEL_ROUNDS = 4;
 export const MAX_AGENT_TOOL_CALLS = 8;
 export const MAX_AGENT_CONTEXT_BYTES = 64 * 1024;
 export const MAX_AGENT_RESPONSE_BYTES = 2 * 1024 * 1024;
+export const MAX_MODEL_CATALOG_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 const idSchema = z.string().trim().min(1).max(200);
 const textSchema = z.string().trim().min(1).max(20_000);
@@ -250,8 +255,17 @@ export interface AgentModelCatalogItem {
   id: string;
   name?: string;
   supportedParameters?: string[];
+  inputModalities?: string[];
   outputModalities?: string[];
+  capabilities?: string[];
+  features?: string[];
   pricing?: { prompt?: string; completion?: string };
+}
+
+export interface AgentModelCatalogRequest extends Omit<AgentModelConnectionRequest, "model"> {
+  query?: globalThis.URLSearchParams;
+  catalogUrl?: string;
+  catalogFormat?: "openai" | "bailian";
 }
 
 export interface AgentModelAdapterResult {
@@ -266,14 +280,14 @@ export interface AgentModelAdapterPort {
   readonly version: number;
   run(input: AgentModelAdapterRequest): Promise<AgentModelAdapterResult>;
   testConnection?(input: AgentModelConnectionRequest): Promise<void>;
-  listModels?(input: Omit<AgentModelConnectionRequest, "model"> & { query?: globalThis.URLSearchParams }): Promise<AgentModelCatalogItem[]>;
+  listModels?(input: AgentModelCatalogRequest): Promise<AgentModelCatalogItem[]>;
 }
 
 type FetchResponse = Awaited<ReturnType<typeof globalThis.fetch>>;
 
-async function readBoundedResponse(response: FetchResponse): Promise<string> {
+async function readBoundedResponse(response: FetchResponse, byteLimit = MAX_AGENT_RESPONSE_BYTES): Promise<string> {
   const declared = Number(response.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > MAX_AGENT_RESPONSE_BYTES) {
+  if (Number.isFinite(declared) && declared > byteLimit) {
     throw new AppError("AGENT_MODEL_UNAVAILABLE", "The model response exceeded the local safety limit.");
   }
   if (!response.body) return "";
@@ -285,7 +299,7 @@ async function readBoundedResponse(response: FetchResponse): Promise<string> {
     if (done) break;
     if (value) {
       total += value.byteLength;
-      if (total > MAX_AGENT_RESPONSE_BYTES) {
+      if (total > byteLimit) {
         await reader.cancel();
         throw new AppError("AGENT_MODEL_UNAVAILABLE", "The model response exceeded the local safety limit.");
       }
@@ -421,15 +435,14 @@ export class OpenAiCompatibleChatAdapter implements AgentModelAdapterPort {
     }
   }
 
-  async listModels(
-    input: Omit<AgentModelConnectionRequest, "model"> & { query?: globalThis.URLSearchParams }
-  ): Promise<AgentModelCatalogItem[]> {
+  async listModels(input: AgentModelCatalogRequest): Promise<AgentModelCatalogItem[]> {
+    if (input.catalogFormat === "bailian") return this.listBailianModels(input);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), Math.min(this.requestTimeoutMs, 20_000));
     let response: FetchResponse;
     const suffix = input.query?.toString();
     try {
-      response = await this.fetcher(`${input.baseUrl.replace(/\/$/, "")}/models${suffix ? `?${suffix}` : ""}`, {
+      response = await this.fetcher(`${input.catalogUrl ?? `${input.baseUrl.replace(/\/$/, "")}/models`}${suffix ? `?${suffix}` : ""}`, {
         method: "GET", redirect: "error", signal: controller.signal,
         headers: { authorization: `Bearer ${input.apiKey}`, ...input.extraHeaders }
       });
@@ -442,11 +455,13 @@ export class OpenAiCompatibleChatAdapter implements AgentModelAdapterPort {
     const schema = z.object({ data: z.array(z.object({
       id: z.string().min(1).max(500), name: z.string().max(500).optional(),
       supported_parameters: z.array(z.string()).optional(),
-      architecture: z.object({ output_modalities: z.array(z.string()).optional() }).optional(),
+      architecture: z.object({
+        input_modalities: z.array(z.string()).optional(), output_modalities: z.array(z.string()).optional()
+      }).optional(),
       pricing: z.object({ prompt: z.string().optional(), completion: z.string().optional() }).optional()
     })).max(2_000) });
     try {
-      return schema.parse(JSON.parse(await readBoundedResponse(response))).data.map((item) => {
+      return schema.parse(JSON.parse(await readBoundedResponse(response, MAX_MODEL_CATALOG_RESPONSE_BYTES))).data.map((item) => {
         const pricing = item.pricing ? {
           ...(item.pricing.prompt !== undefined ? { prompt: item.pricing.prompt } : {}),
           ...(item.pricing.completion !== undefined ? { completion: item.pricing.completion } : {})
@@ -454,6 +469,7 @@ export class OpenAiCompatibleChatAdapter implements AgentModelAdapterPort {
         return {
           id: item.id, ...(item.name ? { name: item.name } : {}),
           ...(item.supported_parameters ? { supportedParameters: item.supported_parameters } : {}),
+          ...(item.architecture?.input_modalities ? { inputModalities: item.architecture.input_modalities } : {}),
           ...(item.architecture?.output_modalities ? { outputModalities: item.architecture.output_modalities } : {}),
           ...(pricing && Object.keys(pricing).length ? { pricing } : {})
         };
@@ -461,6 +477,58 @@ export class OpenAiCompatibleChatAdapter implements AgentModelAdapterPort {
     } catch (cause) {
       if (cause instanceof AppError) throw cause;
       throw new AppError("AGENT_MODEL_UNAVAILABLE", "The model service returned an invalid model list.", false, { cause });
+    }
+  }
+
+  private async listBailianModels(input: AgentModelCatalogRequest): Promise<AgentModelCatalogItem[]> {
+    if (!input.catalogUrl) throw new AppError("AGENT_MODEL_UNAVAILABLE", "The Bailian model catalog URL is missing.");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), Math.min(this.requestTimeoutMs, 60_000));
+    const items: AgentModelCatalogItem[] = [];
+    let total: number | undefined;
+    try {
+      for (let page = 1; total === undefined || items.length < total; page += 1) {
+        const query = new globalThis.URLSearchParams({ page_no: String(page), page_size: "100", language: "zh-CN" });
+        const response = await this.fetcher(`${input.catalogUrl}?${query}`, {
+          method: "GET", redirect: "error", signal: controller.signal,
+          headers: { authorization: `Bearer ${input.apiKey}`, ...input.extraHeaders }
+        });
+        if (!response.ok) throw modelHttpError(response.status);
+        const schema = z.object({
+          success: z.boolean().optional(),
+          output: z.object({
+            total: z.number().int().nonnegative().max(100_000), page_no: z.number().int().positive(),
+            page_size: z.number().int().positive(),
+            models: z.array(z.object({
+              model: z.string().min(1).max(500), name: z.string().max(500).optional(),
+              capabilities: z.array(z.string()).optional(), features: z.array(z.string()).optional(),
+              inference_metadata: z.object({
+                request_modality: z.array(z.string()).optional(), response_modality: z.array(z.string()).optional()
+              }).optional()
+            })).max(1_000)
+          })
+        });
+        const result = schema.parse(JSON.parse(await readBoundedResponse(response, MAX_MODEL_CATALOG_RESPONSE_BYTES)));
+        total = result.output.total;
+        items.push(...result.output.models.map((item) => ({
+          id: item.model, ...(item.name ? { name: item.name } : {}),
+          ...(item.capabilities ? { capabilities: item.capabilities } : {}),
+          ...(item.features ? { features: item.features } : {}),
+          ...(item.inference_metadata?.request_modality
+            ? { inputModalities: item.inference_metadata.request_modality } : {}),
+          ...(item.inference_metadata?.response_modality
+            ? { outputModalities: item.inference_metadata.response_modality } : {})
+        })));
+        if (result.output.models.length === 0) break;
+      }
+      return items;
+    } catch (cause) {
+      if (cause instanceof AppError) throw cause;
+      throw new AppError("AGENT_MODEL_UNAVAILABLE", isAbortError(cause)
+        ? "The Bailian model catalog request timed out."
+        : unreachableMessage(cause, "The Bailian model catalog could not be loaded."), true, { cause });
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
@@ -674,14 +742,131 @@ export interface AgentHarnessOptions {
 
 const NVIDIA_RECOMMENDED: LlmModelOption[] = [{
   id: "openai/gpt-oss-20b", name: "GPT-OSS 20B",
-  recommended: true, toolCapable: true
+  recommended: true, toolCapable: true,
+  inputModalities: ["text"], outputModalities: ["text"],
+  modalitySource: "conservative", compatibility: "compatible"
 }];
 
 const BAILIAN_RECOMMENDED: LlmModelOption[] = [
-  { id: "qwen3.7-plus", name: "Qwen 3.7 Plus", recommended: true, toolCapable: true },
-  { id: "qwen3.8-flash", name: "Qwen 3.8 Flash", recommended: true, toolCapable: true },
-  { id: "qwen3.8-max", name: "Qwen 3.8 Max", recommended: true, toolCapable: true }
+  { id: "qwen3.7-plus", name: "Qwen 3.7 Plus", recommended: true, toolCapable: true,
+    inputModalities: ["text"], outputModalities: ["text"], modalitySource: "conservative", compatibility: "compatible" },
+  { id: "qwen3.8-flash", name: "Qwen 3.8 Flash", recommended: true, toolCapable: true,
+    inputModalities: ["text"], outputModalities: ["text"], modalitySource: "conservative", compatibility: "compatible" },
+  { id: "qwen3.8-max", name: "Qwen 3.8 Max", recommended: true, toolCapable: true,
+    inputModalities: ["text"], outputModalities: ["text"], modalitySource: "conservative", compatibility: "compatible" }
 ];
+
+const MODALITIES = new Set<LlmModelModality>(["text", "image", "audio", "video", "embedding"]);
+
+function normalizeModality(value: string): LlmModelModality {
+  const normalized = value.trim().toLocaleLowerCase("en-US").replaceAll("_", "-");
+  if (MODALITIES.has(normalized as LlmModelModality)) return normalized as LlmModelModality;
+  if (/(?:embed|vector)/.test(normalized)) return "embedding";
+  return normalized ? "other" : "unknown";
+}
+
+function normalizedModalities(values: string[] | undefined): LlmModelModality[] {
+  if (!values?.length) return ["unknown"];
+  return [...new Set(values.map(normalizeModality))];
+}
+
+function incompatible(reason: LlmModelCompatibilityReason): Pick<LlmModelOption, "compatibility" | "compatibilityReason"> {
+  return { compatibility: "incompatible", compatibilityReason: reason };
+}
+
+function classifyOpenRouterModel(item: AgentModelCatalogItem): LlmModelOption {
+  const inputModalities = normalizedModalities(item.inputModalities);
+  const outputModalities = normalizedModalities(item.outputModalities);
+  const toolCapable = Boolean(item.supportedParameters?.some((value) => value.toLocaleLowerCase("en-US") === "tools"));
+  let compatibility: Pick<LlmModelOption, "compatibility" | "compatibilityReason"> = { compatibility: "compatible" };
+  if (!inputModalities.includes("text")) compatibility = incompatible("no_text_input");
+  else if (!outputModalities.includes("text")) compatibility = incompatible("no_text_output");
+  else if (!toolCapable) compatibility = incompatible("no_tool_calling");
+  const hint = pricingHint(item);
+  return {
+    id: item.id, name: item.name ?? item.id, recommended: false, toolCapable,
+    inputModalities, outputModalities, modalitySource: "provider", ...compatibility,
+    ...(hint ? { pricingHint: hint } : {})
+  };
+}
+
+function hasNormalizedValue(values: string[] | undefined, pattern: RegExp): boolean {
+  return Boolean(values?.some((value) => pattern.test(value.trim().toLocaleLowerCase("en-US"))));
+}
+
+function classifyBailianModel(item: AgentModelCatalogItem): LlmModelOption {
+  const inputModalities = normalizedModalities(item.inputModalities);
+  const outputModalities = normalizedModalities(item.outputModalities);
+  const textGeneration = hasNormalizedValue(item.capabilities, /^(?:tg|text[-_ ]?generation|generation|chat)$/);
+  const toolCapable = hasNormalizedValue(item.features, /^(?:function[-_ ]?calling|tool[-_ ]?calling|tools)$/);
+  let compatibility: Pick<LlmModelOption, "compatibility" | "compatibilityReason"> = { compatibility: "compatible" };
+  if (!textGeneration) compatibility = incompatible("non_chat_model");
+  else if (!inputModalities.includes("text")) compatibility = incompatible("no_text_input");
+  else if (!outputModalities.includes("text")) compatibility = incompatible("no_text_output");
+  else if (!toolCapable) compatibility = incompatible("no_tool_calling");
+  return {
+    id: item.id, name: item.name ?? item.id, recommended: false, toolCapable,
+    inputModalities, outputModalities, modalitySource: "provider", ...compatibility
+  };
+}
+
+function classifyNvidiaModel(item: AgentModelCatalogItem): LlmModelOption {
+  const normalizedId = item.id.toLocaleLowerCase("en-US");
+  const knownChat = /^(?:openai\/gpt-oss-|deepseek-ai\/deepseek-v4-)/.test(normalizedId);
+  const embedding = /(?:^|[/_.-])(?:embed(?:ding|qa)?|retriever|nvclip)(?:$|[/_.-])/.test(normalizedId);
+  const nonChat = embedding || /(?:^|[/_.-])(?:rerank(?:er)?|detector|detection|reward|classifier|guard|safety|moderation|parse)(?:$|[/_.-])/.test(normalizedId);
+  const visual = /(?:^|[/_.-])(?:vision|vl|fuyu|kosmos|neva|vila|deplot)(?:$|[/_.-])/.test(normalizedId);
+  const omni = /(?:^|[/_.-])omni(?:$|[/_.-])/.test(normalizedId);
+  if (nonChat) {
+    return {
+      id: item.id, name: item.name ?? item.id, recommended: false, toolCapable: false,
+      inputModalities: visual ? ["text", "image"] : ["text"],
+      outputModalities: embedding ? ["embedding"] : ["other"],
+      modalitySource: "conservative", ...incompatible("non_chat_model")
+    };
+  }
+  if (knownChat) {
+    return {
+      id: item.id, name: item.name ?? item.id, recommended: false, toolCapable: true,
+      inputModalities: ["text"], outputModalities: ["text"],
+      modalitySource: "conservative", compatibility: "compatible"
+    };
+  }
+  if (visual || omni) {
+    return {
+      id: item.id, name: item.name ?? item.id, recommended: false, toolCapable: true,
+      inputModalities: omni ? ["text", "image", "audio", "video"] : ["text", "image"],
+      outputModalities: ["text"], modalitySource: "conservative", compatibility: "unknown"
+    };
+  }
+  return {
+    id: item.id, name: item.name ?? item.id, recommended: false, toolCapable: true,
+    inputModalities: ["unknown"], outputModalities: ["unknown"],
+    modalitySource: "unknown", compatibility: "unknown"
+  };
+}
+
+export function resolveBailianCatalogEndpoint(region: BailianRegion, workspaceId?: string): string | undefined {
+  if (region === "ap-southeast-1") return "https://dashscope-intl.aliyuncs.com/api/v1/models";
+  if (region === "cn-hongkong") return "https://cn-hongkong.dashscope.aliyuncs.com/api/v1/models";
+  const workspace = workspaceId?.trim();
+  return workspace ? `https://${workspace}.${region}.maas.aliyuncs.com/api/v1/models` : undefined;
+}
+
+function modelSort(left: LlmModelOption, right: LlmModelOption): number {
+  if (left.recommended !== right.recommended) return left.recommended ? -1 : 1;
+  const rank: Record<LlmModelCompatibility, number> = { compatible: 0, unknown: 1, incompatible: 2 };
+  return rank[left.compatibility] - rank[right.compatibility] || left.name.localeCompare(right.name, "en");
+}
+
+function mergeRecommended(dynamic: LlmModelOption[], recommended: LlmModelOption[]): LlmModelOption[] {
+  const models = new Map(dynamic.map((item) => [item.id, item]));
+  recommended.forEach((item) => {
+    const catalogItem = models.get(item.id);
+    models.set(item.id, catalogItem ? { ...catalogItem, recommended: true, name: item.name } : item);
+  });
+  return [...models.values()].sort(modelSort);
+}
 
 function pricingHint(item: AgentModelCatalogItem): string | undefined {
   const prompt = Number(item.pricing?.prompt);
@@ -703,31 +888,26 @@ export class AgentHarness {
   saveLlm(input: LlmConnectInput): LlmSettings { return this.application.saveLlmProvider(input); }
 
   async listLlmModels(input: LlmListModelsInput): Promise<LlmModelOption[]> {
-    if (input.provider === "bailian") return BAILIAN_RECOMMENDED;
     const apiKey = input.apiKey?.trim() || this.application.getLlmCredential(input.provider);
+    const savedConfig = this.application.getLlmSettings().providers[input.provider];
+    const workspaceId = input.workspaceId?.trim() || savedConfig?.workspaceId;
     if (!apiKey || !this.modelAdapter.listModels) {
-      return input.provider === "nvidia" ? NVIDIA_RECOMMENDED : [];
+      return input.provider === "nvidia" ? NVIDIA_RECOMMENDED
+        : input.provider === "bailian" ? BAILIAN_RECOMMENDED : [];
     }
-    const query = input.provider === "openrouter"
-      ? new globalThis.URLSearchParams({ supported_parameters: "tools", output_modalities: "text", sort: "most-popular", limit: "8" })
-      : undefined;
+    const catalogUrl = input.provider === "bailian"
+      ? resolveBailianCatalogEndpoint(input.region ?? "cn-beijing", workspaceId) : undefined;
+    if (input.provider === "bailian" && !catalogUrl) return BAILIAN_RECOMMENDED;
     const catalog = await this.modelAdapter.listModels({
       baseUrl: resolveLlmProviderEndpoint(input.provider, input.region), apiKey,
-      extraHeaders: llmProviderHeaders(input.provider), ...(query ? { query } : {})
+      extraHeaders: llmProviderHeaders(input.provider),
+      ...(catalogUrl ? { catalogUrl, catalogFormat: "bailian" as const } : {})
     });
-    const dynamic = catalog.filter((item) => input.provider !== "openrouter" ||
-      (item.supportedParameters?.includes("tools") && (!item.outputModalities || item.outputModalities.includes("text"))))
-      .slice(0, input.provider === "openrouter" ? 8 : 24)
-      .map((item): LlmModelOption => {
-        const hint = pricingHint(item);
-        return {
-          id: item.id, name: item.name ?? item.id, recommended: false,
-          toolCapable: input.provider === "openrouter" ? Boolean(item.supportedParameters?.includes("tools")) : true,
-          ...(hint ? { pricingHint: hint } : {})
-        };
-      });
-    const combined = input.provider === "nvidia" ? [...NVIDIA_RECOMMENDED, ...dynamic] : dynamic;
-    return [...new Map(combined.map((item) => [item.id, item])).values()];
+    const dynamic = catalog.map((item) => input.provider === "openrouter" ? classifyOpenRouterModel(item)
+      : input.provider === "bailian" ? classifyBailianModel(item) : classifyNvidiaModel(item));
+    return input.provider === "nvidia" ? mergeRecommended(dynamic, NVIDIA_RECOMMENDED)
+      : input.provider === "bailian" ? mergeRecommended(dynamic, BAILIAN_RECOMMENDED)
+        : dynamic.sort(modelSort);
   }
 
   async connectLlm(input: LlmConnectInput): Promise<LlmSettings> {

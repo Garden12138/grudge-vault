@@ -622,6 +622,13 @@ export class GrudgeVaultApplication {
     if (input.provider !== "bailian" && input.region !== undefined) {
       throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "This provider does not use a region setting.");
     }
+    const workspaceId = input.workspaceId?.trim();
+    if (input.provider !== "bailian" && workspaceId !== undefined) {
+      throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "This provider does not use a Workspace ID.");
+    }
+    if (workspaceId !== undefined && !/^[A-Za-z0-9-]{1,63}$/.test(workspaceId)) {
+      throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "The Bailian Workspace ID is invalid.");
+    }
     const now = new Date().toISOString();
     if (input.apiKey !== undefined) {
       const apiKey = input.apiKey.trim();
@@ -638,7 +645,7 @@ export class GrudgeVaultApplication {
     }
     session.agents.saveLlmProviderConfig({
       provider: input.provider, model, credentialConfigured: true, status: "ready", lastTestedAt: testedAt,
-      ...(input.region ? { region: input.region } : {})
+      ...(input.region ? { region: input.region } : {}), ...(workspaceId ? { workspaceId } : {})
     }, now);
     const current = this.getLlmSettings();
     session.agents.saveLlmSettings({ ...current, activeProvider: input.provider }, now);
@@ -655,6 +662,13 @@ export class GrudgeVaultApplication {
     if (input.provider !== "bailian" && input.region !== undefined) {
       throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "This provider does not use a region setting.");
     }
+    const workspaceId = input.workspaceId?.trim();
+    if (input.provider !== "bailian" && workspaceId !== undefined) {
+      throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "This provider does not use a Workspace ID.");
+    }
+    if (workspaceId !== undefined && !/^[A-Za-z0-9-]{1,63}$/.test(workspaceId)) {
+      throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "The Bailian Workspace ID is invalid.");
+    }
     const now = new Date().toISOString();
     if (input.apiKey !== undefined) {
       const apiKey = input.apiKey.trim();
@@ -668,12 +682,13 @@ export class GrudgeVaultApplication {
     }
     const credentialConfigured = Boolean(session.agents.getLlmCredential(input.provider));
     const existing = session.agents.getLlmProviderConfig(input.provider);
-    const unchanged = Boolean(existing && existing.model === model && existing.region === input.region && input.apiKey === undefined);
+    const unchanged = Boolean(existing && existing.model === model && existing.region === input.region &&
+      existing.workspaceId === workspaceId && input.apiKey === undefined);
     session.agents.saveLlmProviderConfig({
       provider: input.provider, model, credentialConfigured,
       status: unchanged ? existing!.status : credentialConfigured ? "needs_attention" : "not_configured",
       ...(unchanged && existing?.lastTestedAt ? { lastTestedAt: existing.lastTestedAt } : {}),
-      ...(input.region ? { region: input.region } : {})
+      ...(input.region ? { region: input.region } : {}), ...(workspaceId ? { workspaceId } : {})
     }, now);
     const current = this.getLlmSettings();
     const keepActiveProvider = current.activeProvider && (current.activeProvider !== input.provider || unchanged)
