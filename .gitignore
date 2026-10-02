@@ -4,7 +4,9 @@ dist-types/
 **/dist-types/
 apps/desktop/out/
 apps/desktop/out-e2e/
+apps/desktop/build/
 release/
+release-preview/
 coverage/
 playwright-report/
 test-results/

@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; media-src data: blob:; base-uri 'none'; form-action 'none'">
+  <title>记仇账本 · 精简版交互原型</title>
+  <style>
+    :root { color-scheme:light; --bg:#f6f7f9; --surface:#fff; --ink:#17212f; --muted:#647084; --blue:#245ce4; --blue-soft:#edf3ff; --line:#e6eaf0; --danger:#b64545; --danger-soft:#fff1f0; --amber:#996123; --amber-soft:#fff6e8; --green:#267455; --green-soft:#edf8f1; --purple:#7154aa; --purple-soft:#f4effc; --shadow:0 18px 64px #17212f12; }
+    * { box-sizing:border-box }
+    body { margin:0; font:15px/1.65 -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg) }
+    button,input,textarea,select { font:inherit; color:inherit }
+    button,a,input,textarea,select { -webkit-tap-highlight-color:transparent }
+    button { cursor:pointer; border:0; background:none }
+    button:disabled { cursor:default; opacity:.5 }
+    :focus-visible { outline:3px solid #96b5ff; outline-offset:3px }
+    input,textarea,select { border:1px solid #dce2eb; border-radius:9px; background:var(--surface); padding:10px 12px; max-width:100% }
+    textarea { width:100%; resize:vertical; min-height:168px; line-height:1.85 }
+    input[type=file] { width:100%; background:var(--bg); font-size:13px }
+    a { color:var(--blue); text-decoration:none }
+    [hidden] { display:none!important }
+    h1,h2,h3,p { margin:0 }
+    h1 { font-size:32px; line-height:1.3; letter-spacing:-.7px; font-weight:650 }
+    h2 { font-size:20px; line-height:1.5; font-weight:600 }
+    h3 { font-size:16px; font-weight:600 }
+    svg.icon { width:20px; height:20px; fill:none; stroke:currentColor; stroke-width:1.65; stroke-linecap:round; stroke-linejoin:round; flex:none; vertical-align:middle }
+    .small { font-size:13px }.muted { color:var(--muted) }.blue { color:var(--blue) }
+    .row { display:flex; align-items:center; gap:12px; flex-wrap:wrap }
+    .spread { display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap }
+    .stack { display:grid; gap:16px }.gap8 { gap:8px }.mt16 { margin-top:16px }.mt24 { margin-top:24px }
+    .btn { display:inline-flex; align-items:center; justify-content:center; gap:8px; border-radius:9px; padding:9px 15px; font-weight:500; border:1px solid var(--line); background:var(--surface); min-height:40px }
+    .btn:hover:not(:disabled) { background:#f1f4f8 }
+    .btn.primary { background:var(--blue); border-color:var(--blue); color:#fff; box-shadow:0 3px 8px #245ce414 }
+    .btn.primary:hover:not(:disabled) { background:#174bd0 }
+    .btn.soft { background:var(--blue-soft); color:var(--blue); border-color:transparent }
+    .btn.ghost { border-color:transparent; background:transparent; color:var(--muted) }
+    .icon-btn { padding:8px; display:inline-flex; align-items:center; justify-content:center; border-radius:8px; min-width:36px; min-height:36px }
+    .icon-btn:hover { background:var(--bg) }
+    .badge { display:inline-flex; align-items:center; gap:5px; border-radius:6px; font-size:12px; line-height:1.6; padding:3px 8px; background:#eef1f5; color:#637085; white-space:nowrap }
+    .badge.rights { color:var(--amber); background:var(--amber-soft) }.badge.danger { color:var(--danger); background:var(--danger-soft) }.badge.grudge { color:var(--purple); background:var(--purple-soft) }
+    .badge.ready { color:var(--green); background:var(--green-soft) }.badge.progress { color:var(--blue); background:var(--blue-soft) }
+    .dot { display:inline-block; width:6px; height:6px; border-radius:50%; background:var(--green); margin-right:7px }
+    .app { display:grid; grid-template-columns:224px minmax(0,1fr); min-height:100vh }
+    .sidebar { padding:26px 18px 18px; background:#fafbfd; border-right:1px solid var(--line); position:sticky; top:0; height:100vh; display:flex; flex-direction:column }
+    .brand { display:flex; gap:10px; align-items:center; padding:0 8px 28px; font-size:17px; font-weight:650; letter-spacing:.3px }
+    .brand-mark { display:grid; place-items:center; width:34px; height:38px; color:white; background:var(--blue); border-radius:9px 9px 9px 3px; box-shadow:0 3px 8px #245ce426 }
+    .brand-sub { font-size:10px; letter-spacing:1.2px; font-weight:500; color:#8792a3 }
+    .new-record { width:100%; margin-bottom:25px }
+    .nav { display:grid; gap:5px }
+    .nav button { display:flex; align-items:center; gap:12px; padding:11px 13px; color:var(--muted); text-align:left; border-radius:9px }
+    .nav button:hover { background:#f0f3f8 }.nav button.active { color:var(--blue); background:#eaf0fd; font-weight:550 }
+    .nav .shortcut { margin-left:auto; font-size:11px; opacity:.6 }
+    .sidebar-foot { margin-top:auto; padding-top:32px }
+    .sync-mini { border:1px solid var(--line); border-radius:12px; padding:13px; background:var(--surface) }
+    .sync-mini .small { font-size:12px }
+    .pending-link { display:flex; width:100%; justify-content:space-between; align-items:center; margin-top:10px; padding-top:11px; border-top:1px solid var(--line); color:var(--blue); font-size:13px }
+    .counter { background:var(--blue-soft); color:var(--blue); border-radius:5px; padding:0 6px; font-size:12px }
+    .account { display:flex; align-items:center; gap:10px; padding:18px 5px 0; font-size:13px }
+    .avatar { width:29px; height:29px; display:grid; place-items:center; border-radius:50%; background:#e7ebf2; color:#68758a; font-size:12px }
+    .workspace { min-width:0 }
+    .topbar { padding:16px 38px; display:flex; align-items:center; justify-content:space-between; gap:16px; min-height:68px; border-bottom:1px solid var(--line); background:#ffffffb8 }
+    .crumb { font-size:13px; color:var(--muted) }
+    .proto-tag { font-size:11px; letter-spacing:.4px; color:#7a8494; padding:4px 8px; border:1px solid var(--line); border-radius:5px }
+    .main { max-width:1120px; margin:auto; padding:42px 46px 64px }
+    .page-heading { margin-bottom:29px }.page-heading p { margin-top:10px; color:var(--muted); font-size:14px }
+    .quiet-stat { font-size:13px; color:var(--muted) }
+    .filters { display:flex; gap:6px; flex-wrap:wrap; padding-bottom:24px }
+    .filter { padding:7px 14px; border-radius:8px; color:var(--muted); font-size:13px; border:1px solid transparent }
+    .filter.active { color:var(--ink); background:#fff; border-color:var(--line); box-shadow:0 2px 3px #17212f04 }
+    .timeline { padding-left:26px; position:relative }
+    .timeline:before { content:""; position:absolute; top:14px; bottom:35px; left:5px; width:1px; background:#dde3eb }
+    .month { font-size:13px; color:var(--muted); margin:3px 0 20px; position:relative }
+    .month:before { content:""; position:absolute; width:9px; height:9px; background:#aebbd0; border:3px solid var(--bg); box-sizing:content-box; border-radius:50%; left:-28px; top:4px }
+    .record-card { width:100%; text-align:left; background:white; border:1px solid var(--line); border-radius:14px; margin-bottom:18px; padding:23px 26px; position:relative; transition:border-color .15s,box-shadow .15s }
+    .record-card:hover { border-color:#c9d5ee; box-shadow:0 5px 20px #17212f05 }
+    .record-meta { display:flex; gap:9px; align-items:center; flex-wrap:wrap; margin-bottom:12px; font-size:12px; color:var(--muted) }
+    .record-card h2 { font-size:18px; margin-bottom:8px }
+    .record-card p { max-width:710px; font-size:14px; color:#697486; line-height:1.85 }
+    .record-bottom { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-top:20px }
+    .media-chips { display:flex; gap:8px; flex-wrap:wrap }
+    .media-chip { display:inline-flex; gap:7px; align-items:center; background:#f6f8fb; border:1px solid #edf0f5; border-radius:6px; color:#768195; font-size:12px; padding:4px 8px }
+    .media-chip .icon { width:14px; height:14px }
+    .empty { text-align:center; background:#fff; border:1px dashed #d9e0ec; border-radius:16px; padding:66px 24px }
+    .empty-symbol { width:56px; height:56px; border-radius:16px; color:#8ba5d3; background:var(--blue-soft); display:grid; place-items:center; margin:0 auto 18px }
+    .empty p { color:var(--muted); margin:10px auto 22px; max-width:440px; font-size:14px }
+    .back { display:inline-flex; align-items:center; gap:5px; color:var(--muted); padding:0; margin-bottom:24px; font-size:13px }
+    .detail-head { margin-bottom:26px }.detail-head h1 { font-size:28px; margin:10px 0 13px }
+    .tabs { display:flex; gap:24px; border-bottom:1px solid var(--line); margin-bottom:24px }
+    .tab { padding:11px 2px; color:var(--muted); border-bottom:2px solid transparent }
+    .tab.active { color:var(--blue); border-color:var(--blue); font-weight:550 }
+    .panel { border:1px solid var(--line); border-radius:14px; background:var(--surface); padding:25px 28px }
+    .panel + .panel { margin-top:18px }
+    .section-title { display:flex; align-items:center; gap:9px; margin-bottom:18px; font-size:16px; font-weight:600 }
+    .section-title .icon { color:#8292aa; width:18px; height:18px }
+    .facts { display:grid; grid-template-columns:1fr 1fr; gap:23px 28px }
+    .fact-label { font-size:12px; color:var(--muted); display:block; margin-bottom:7px }
+    .fact-value { font-size:14px; line-height:1.75 }
+    .placeholder { color:var(--blue); border-bottom:1px dashed #aac0f1; padding:0; text-align:left }
+    .fact-edit { display:flex; gap:7px; flex-wrap:wrap }.fact-edit input { min-width:130px; width:190px; flex:1 }
+    .narrative { font-size:14px; color:#536075; line-height:1.95; white-space:pre-wrap }
+    .steps { padding-left:22px; margin:0; color:#536075; font-size:14px }.steps li { padding:4px 0 8px 4px }
+    .note { display:flex; align-items:flex-start; gap:9px; background:var(--blue-soft); color:#43608f; border-radius:10px; padding:13px 15px; font-size:13px; line-height:1.75 }
+    .note.warn { color:#8b6432; background:var(--amber-soft) }.note.error { color:#a84d4d; background:var(--danger-soft) }
+    .note .icon { margin-top:2px; width:17px; height:17px }
+    .legal-source { padding:12px 14px; border:1px solid var(--line); background:var(--bg); border-radius:9px; font-size:13px; margin-top:16px }
+    .legal-source span { display:block; color:var(--muted); margin-top:3px; font-size:12px }
+    .original { white-space:pre-wrap; font-size:15px; line-height:2; color:#4b5870 }
+    .attachment { margin-top:15px; border:1px solid var(--line); border-radius:12px; padding:18px }
+    .attachment.highlight { border-color:#95b5fa; box-shadow:0 0 0 3px #edf3ff }
+    .wave { display:flex; gap:4px; align-items:center; height:44px; margin:12px 0; overflow:hidden }
+    .wave span { width:3px; flex:none; background:#9bb5e7; border-radius:3px }
+    .quote { border-left:3px solid #b5c8ee; padding:10px 14px; color:#596983; font-size:14px; background:#f7f9fd }
+    .segment-note { color:var(--blue); font-size:13px; margin-bottom:12px }
+    .search-box { background:#fff; border:1px solid #dce4f2; border-radius:14px; padding:18px 20px; margin-bottom:24px; box-shadow:0 4px 14px #17212f03 }
+    .search-input-row { display:flex; gap:12px; align-items:center }.search-input-row input { border:0; padding:9px 0; flex:1; min-width:0; font-size:16px }
+    .query-tabs { display:flex; gap:5px; margin-bottom:10px }.query-tabs button { padding:6px 11px; border-radius:7px; font-size:13px; color:var(--muted) }.query-tabs button.active { color:var(--blue); background:var(--blue-soft) }
+    .search-result { margin:0 0 14px; border:1px solid var(--line); border-radius:12px; padding:21px 24px; background:white; width:100%; text-align:left }
+    .search-result:hover { border-color:#aabfe9 }.search-result h3 { margin:9px 0 }.search-result p { color:var(--muted); font-size:14px; margin-bottom:12px }
+    .match { display:inline-flex; align-items:center; gap:7px; color:var(--blue); font-size:12px }
+    .pending-card { background:#fff; border:1px solid var(--line); border-radius:13px; padding:22px 25px; margin-bottom:16px }.pending-card h3 { margin:10px 0 }.pending-card p { color:var(--muted); font-size:14px; line-height:1.8 }
+    .settings { max-width:840px }.field { display:grid; gap:7px; font-size:13px }.field input,.field select { width:100% }.two-fields { display:grid; grid-template-columns:1fr 1fr; gap:18px }
+    .providers { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:17px 0 24px }.provider { border:1px solid var(--line); border-radius:11px; padding:17px; text-align:left; background:white; display:flex; gap:12px; align-items:center }.provider.active { border-color:#82a7ff; box-shadow:0 0 0 2px var(--blue-soft) }
+    .provider-logo { display:grid; place-items:center; width:36px; height:36px; background:var(--blue-soft); color:var(--blue); border-radius:9px; font-weight:650; font-size:16px }.provider small { display:block; color:var(--muted); font-size:11px }
+    .capabilities { display:flex; gap:7px; flex-wrap:wrap; margin-top:15px }
+    .settings-row { padding:17px 0; display:flex; align-items:center; justify-content:space-between; gap:15px; border-bottom:1px solid var(--line) }.settings-row:last-child { border:0 }.settings-row p { font-size:12px; color:var(--muted); margin-top:4px }
+    .stats { display:grid; grid-template-columns:repeat(5,1fr); gap:8px; padding:22px 0 }.stat { font-size:12px; color:var(--muted) }.stat strong { display:block; font-size:25px; color:var(--ink); font-weight:550; margin-bottom:4px; font-variant-numeric:tabular-nums }
+    progress { width:100%; height:7px; border:0; border-radius:5px; overflow:hidden; background:#edf0f6; accent-color:var(--blue) } progress::-webkit-progress-bar { background:#edf0f6 } progress::-webkit-progress-value { background:var(--blue); border-radius:5px }
+    .sync-status { margin-top:12px; font-size:13px; color:var(--muted) }
+    .rule-list { margin:12px 0 0; padding-left:18px; color:var(--muted); font-size:13px; line-height:1.9 }
+    dialog { border:1px solid var(--line); border-radius:18px; width:720px; max-width:calc(100vw - 32px); max-height:90vh; padding:0; color:var(--ink); box-shadow:var(--shadow) }
+    dialog::backdrop { background:#1d2b474b; backdrop-filter:blur(3px) }
+    .modal-head { padding:23px 28px 18px; border-bottom:1px solid var(--line); display:flex; align-items:center; justify-content:space-between; gap:15px; position:sticky; top:0; background:white; z-index:2 }
+    .modal-body { padding:24px 28px }.modal-foot { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; padding:18px 28px; background:#fafbfd; border-top:1px solid var(--line) }
+    .dropzone { padding:15px; border:1px dashed #ced8e9; border-radius:10px; background:#fbfcfe; margin-top:15px }.dropzone.drag { background:var(--blue-soft); border-color:var(--blue) }
+    .demo-controls { margin-top:20px; border-top:1px solid var(--line); padding-top:15px; font-size:12px; color:var(--muted) }.demo-controls summary { cursor:pointer; margin-bottom:10px }.demo-controls select { margin-top:6px; width:100%; font-size:13px }
+    .files { display:flex; gap:7px; flex-wrap:wrap; margin-top:10px }.file-tag { display:inline-flex; max-width:100%; word-break:break-all; gap:5px; padding:4px 8px; border-radius:6px; font-size:12px; color:#617086; background:#eef2f8 }
+    .compose-status { margin-top:15px }.spinner { width:15px; height:15px; border:2px solid #cad8f6; border-top-color:var(--blue); border-radius:50%; display:inline-block; animation:spin .8s linear infinite; flex:none; margin-top:3px }
+    @keyframes spin { to { transform:rotate(360deg) } }
+    .toast { position:fixed; bottom:28px; left:calc(50% + 90px); transform:translateX(-50%); padding:12px 20px; border-radius:10px; background:#233147; color:white; font-size:13px; box-shadow:0 6px 30px #17212f25; z-index:10; max-width:calc(100vw - 36px) }
+    .guide-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px }.guide-item { background:var(--bg); border-radius:10px; padding:15px; font-size:13px }.guide-item p { color:var(--muted); margin-top:7px }
+    .spec-table { width:100%; border-collapse:collapse; margin-top:12px; font-size:12px }.spec-table th,.spec-table td { border-bottom:1px solid var(--line); text-align:left; padding:9px; vertical-align:top }.spec-table th { color:var(--muted); font-weight:500 }
+    .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0 }
+    @media(min-width:1450px) { .main { padding-top:48px } }
+    @media(max-width:1100px) { .app { grid-template-columns:200px minmax(0,1fr) }.sidebar { padding-left:13px; padding-right:13px }.main { padding:32px 28px 50px }.topbar { padding:14px 28px }.record-card { padding:21px }.brand { padding-left:4px } }
+    @media(max-width:839px) { .app { grid-template-columns:1fr }.sidebar { height:auto; position:static; padding:16px 20px; flex-direction:row; flex-wrap:wrap; gap:12px; border-bottom:1px solid var(--line); border-right:0 }.brand { padding:0; margin-right:auto }.brand-sub,.sidebar-foot { display:none }.new-record { width:auto; margin:0; order:1 }.nav { display:flex; order:2; width:100%; gap:8px }.nav button { padding:8px 12px }.nav .shortcut { display:none }.topbar { padding:12px 20px; min-height:54px }.main { padding:26px 20px 46px }.toast { left:50% } }
+    @media(max-width:540px) { h1 { font-size:27px }.topbar .crumb { display:none }.topbar { justify-content:flex-end }.main { padding:25px 16px 40px }.facts,.two-fields,.providers,.guide-grid { grid-template-columns:1fr }.stats { grid-template-columns:repeat(3,1fr); gap:16px }.record-card { padding:18px }.timeline { padding-left:20px }.month:before { left:-22px }.timeline:before { left:5px }.panel { padding:20px }.modal-head,.modal-body { padding:19px }.modal-foot { padding:16px 19px }.detail-head h1 { font-size:24px }.search-input-row { flex-wrap:wrap }.search-input-row input { width:calc(100% - 36px) }.search-input-row .btn { margin-left:auto }.search-box { padding:15px }.record-bottom { align-items:flex-start }.nav button { flex:1; justify-content:center;font-size:13px }.brand { font-size:16px }.new-record { padding:8px 12px;font-size:13px }.query-tabs { flex-wrap:wrap } }
+    @media(prefers-reduced-motion:reduce) { *,*:before,*:after { animation:none!important; transition:none!important; scroll-behavior:auto!important } }
+  </style>
+</head>
+<body>
+  <svg aria-hidden="true" width="0" height="0" style="position:absolute;overflow:hidden">
+    <defs>
+      <symbol id="i-book" viewBox="0 0 24 24"><path d="M6 3h12v18H6a3 3 0 0 1 0-6h12M6 3a3 3 0 0 0-3 3v12M8 7h6M8 10h4"/></symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+      <symbol id="i-time" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3 2"/></symbol>
+      <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol>
+      <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2" fill="white"/><circle cx="16" cy="12" r="2" fill="white"/><circle cx="8" cy="18" r="2" fill="white"/></symbol>
+      <symbol id="i-arrow" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+      <symbol id="i-back" viewBox="0 0 24 24"><path d="m14 6-6 6 6 6M8 12h12"/></symbol>
+      <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+      <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="8" cy="9" r="1.5"/><path d="m4 18 5-5 3 3 4-5 5 6"/></symbol>
+      <symbol id="i-audio" viewBox="0 0 24 24"><path d="M4 9v6M8 5v14M12 8v8M16 3v18M20 9v6"/></symbol>
+      <symbol id="i-video" viewBox="0 0 24 24"><rect x="3" y="5" width="13" height="14" rx="3"/><path d="m16 10 5-3v10l-5-3"/></symbol>
+      <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H5v18h14V8l-5-5v5h5M8 12h8M8 16h6"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+      <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 8a8 8 0 0 0-14-3L3 8m0-5v5h5M4 16a8 8 0 0 0 14 3l3-3m0 5v-5h-5"/></symbol>
+      <symbol id="i-shield" viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6l8-3Z"/><path d="m8 12 3 3 5-6"/></symbol>
+    </defs>
+  </svg>
+  <div class="app">
+    <aside class="sidebar" aria-label="应用导航">
+      <div class="brand"><span class="brand-mark"><svg class="icon"><use href="#i-book"/></svg></span><div>记仇账本<div class="brand-sub">GRUDGE VAULT</div></div></div>
+      <button class="btn primary new-record" id="new-record"><svg class="icon"><use href="#i-plus"/></svg>新建记录</button>
+      <nav class="nav" aria-label="主导航">
+        <button data-nav="timeline" class="active" aria-current="page"><svg class="icon"><use href="#i-time"/></svg>时间线</button>
+        <button data-nav="search" aria-label="搜索"><svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>搜索<span class="shortcut" aria-hidden="true">⌘ K</span></button>
+        <button data-nav="settings"><svg class="icon"><use href="#i-settings"/></svg>设置</button>
+      </nav>
+      <div class="sidebar-foot">
+        <div class="sync-mini"><div class="small"><span class="dot"></span>Day One 导出包<span class="muted"> · 演示</span></div><div class="small muted" style="margin-top:5px">按需导出 JSON ZIP，手动导入</div><button class="pending-link" data-nav="pending">待确认<span class="counter" id="pending-count">1</span></button></div>
+        <div class="account"><span class="avatar">我</span><div>我的账本<div class="muted" style="font-size:11px">个人工作区</div></div></div>
+      </div>
+    </aside>
+    <section class="workspace" aria-label="工作区">
+      <header class="topbar"><div class="crumb" id="breadcrumb">我的账本 / 时间线</div><div class="row gap8"><span class="proto-tag">交互原型 · 虚构数据</span><button class="btn ghost small" id="open-guide">原型说明</button></div></header>
+      <main class="main" id="main"></main>
+    </section>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <div class="sr-only" id="announcer" aria-live="polite"></div>
+
+  <dialog id="compose" aria-labelledby="compose-title">
+    <div class="modal-head"><div><h2 id="compose-title">记下这件事</h2><p class="small muted" style="margin-top:5px">描述经过，也可以添加当时留下的材料。</p></div><button class="icon-btn" id="close-compose" aria-label="关闭新建记录"><svg class="icon"><use href="#i-close"/></svg></button></div>
+    <div class="modal-body">
+      <label class="field" for="draft-text"><span>发生了什么</span><textarea id="draft-text" placeholder="什么时候，谁做了什么？哪些地方让你在意？"></textarea></label>
+      <div class="dropzone" id="dropzone"><div class="row small muted"><svg class="icon"><use href="#i-plus"/></svg>添加图片、音频或视频，也可以拖到这里</div><input id="draft-files" aria-label="添加记录附件" type="file" multiple accept="image/*,audio/*,video/*" style="margin-top:10px"><div class="files" id="draft-file-list"></div></div>
+      <div class="compose-status" id="compose-status" role="status" aria-live="polite"></div>
+      <details class="demo-controls" open><summary>演示场景（仅原型）</summary><label for="scene">此原型不执行 AI；选择下方场景决定模拟结果。文件只展示名称，不读取内容。</label><select id="scene"><option value="include">相关事件 → 收录并分析</option><option value="skip">普通日常 → 不入库</option><option value="review">描述含糊 → 待确认</option><option value="fail">判断失败 → 保留输入并重试</option><option value="partial">相关事件 → 收录，媒体分析部分失败</option></select></details>
+    </div>
+    <div class="modal-foot"><span class="small muted">先判断是否收录，通过后保存并分析。</span><button class="btn primary" id="save-draft">保存</button></div>
+  </dialog>
+
+  <dialog id="guide" aria-labelledby="guide-title">
+    <div class="modal-head"><div><h2 id="guide-title">精简版 · 原型说明</h2><p class="small muted">设计规格与可操作的评审路径 / v1.0 · 2026-09-19</p></div><button class="icon-btn" data-close="guide" aria-label="关闭原型说明"><svg class="icon"><use href="#i-close"/></svg></button></div>
+    <div class="modal-body stack">
+      <div class="note"><svg class="icon"><use href="#i-info"/></svg><span>这是独立交互原型。所有人物和记录均为虚构，模拟分类、手动导入及检索；不会调用模型、读取所选文件内容或保存数据。刷新即重置。</span></div>
+      <div class="guide-grid">
+        <div class="guide-item"><strong>01 / 试一次保存</strong><p>新建记录，切换“相关／普通日常／待确认／失败”。普通日常不能强制入库。</p></div>
+        <div class="guide-item"><strong>02 / 补充一份报告</strong><p>打开“项目奖金迟迟未结清”，补充地点，重新分析后仍保留你的修改。</p></div>
+        <div class="guide-item"><strong>03 / 用媒体找回来</strong><p>搜索里选择图片、音频或视频，再使用演示素材，可跳转到命中片段。</p></div>
+        <div class="guide-item"><strong>04 / 看导入过程</strong><p>设置 → Day One → 模拟导入 JSON ZIP。批次中展示收录、跳过、待确认及失败。</p></div>
+      </div>
+      <section><h3>界面规格</h3><table class="spec-table"><tr><th>项目</th><th>规格</th></tr><tr><td>信息架构</td><td>P01 时间线 / P02 新建 / P03 详情 / P04 搜索 / P05 模型 / P06 Day One / P07 待确认</td></tr><tr><td>视觉</td><td>背景 #F6F7F9，白色内容，蓝色 #245CE4；系统字体，正文 15px，8px 间距基线</td></tr><tr><td>布局</td><td>1440px 标准画布，1024px 双栏；840px 以下导航和字段重排</td></tr><tr><td>交互</td><td>原生按钮和输入、可见焦点、状态播报；⌘/Ctrl K 搜索，⌘/Ctrl N 新建，Esc 关闭弹窗</td></tr><tr><td>存储</td><td>仅浏览器内存；不使用网络、localStorage、IndexedDB 或 cookie</td></tr><tr><td>法律示例</td><td>仅展示报告结构与待核验状态，不提供真实法律意见或伪造已核验引用</td></tr></table></section>
+      <div class="row"><button class="btn" id="show-empty">查看空账本</button><button class="btn" id="reset-demo">重置全部演示</button><a href="PRD.md">产品需求</a><a href="TECHNICAL_DESIGN.md">实现方案</a><a href="IMPLEMENTATION_PLAN.md">实施计划</a></div>
+    </div>
+  </dialog>
+  <dialog id="batch-dialog" aria-labelledby="batch-title">
+    <div class="modal-head"><h2 id="batch-title">检查历史日记</h2><button class="icon-btn" data-close="batch-dialog" aria-label="关闭批次确认"><svg class="icon"><use href="#i-close"/></svg></button></div>
+    <div class="modal-body stack"><p>将检查 <strong>6 篇演示日记</strong>，相关事件才会建立记录并生成报告。普通日常直接跳过。</p><div class="note"><svg class="icon"><use href="#i-info"/></svg><span>实际产品中，筛选也会调用所选模型。首次确认覆盖本批次筛选和入选内容分析，支持暂停。本原型不联网、不产生费用。</span></div><p class="small muted">本批次演示：2 条相关、2 条日常、1 条待确认、1 条读取失败。失败可重试。</p></div>
+    <div class="modal-foot"><button class="btn" data-close="batch-dialog">取消</button><button class="btn primary" id="confirm-batch">确认并开始检查</button></div>
+  </dialog>
+  <script>
+    "use strict";
+    // Standalone prototype. Classification and retrieval below are explicit scenarios,
+    // not production logic. No network, file-content reads or persistent browser storage.
+    const $ = (s, root = document) => root.querySelector(s);
+    const esc = value => String(value == null ? "" : value).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+    const icon = name => '<svg class="icon" aria-hidden="true"><use href="#i-' + name + '"/></svg>';
+    const labels = {rights:"权益受损",danger:"危险事件",grudge:"记仇 / 冲突"};
+    const mediaLabels = {image:"图片",audio:"音频",video:"视频",text:"原文"};
+    const sceneText = {
+      include:"9月19日下午，负责人再次推迟此前承诺的项目奖金，未说明新的结算时间。我保留了当时的通话录音，希望把经过记下来。",
+      skip:"今天午饭后去公园散步，下午工作顺利，晚上看了一部喜欢的电影。",
+      review:"他又这样说了，我有些不安，但现在还不确定具体是什么意思。",
+      fail:"今天有人在楼道里对我说了威胁的话，我想保存这段经过。",
+      partial:"项目奖金迟迟没有结清。我上传了通话录音，希望整理负责人之前的承诺。"
+    };
+    const seed = [
+      {id:"r1",title:"项目奖金迟迟未结清",category:"rights",date:"2026-09-18",time:"下午，具体时间待补充",dateBasis:"发生日期",origin:"Day One",summary:"负责人再次推迟奖金结算，未说明新的时间。已保留沟通记录，需要补充约定及付款依据。",place:"",people:"我、项目负责人（姓名待补充）",state:"complete",body:"9月18日下午，我问项目负责人之前说好的奖金什么时候结算。他说还需要再等等，没有给出新的日期。我有点生气，之前已经问过两次。这次把通话录音留了下来。",media:[{kind:"audio",name:"奖金沟通.m4a",duration:"02:36",anchor:"00:42–01:08",quote:"我问此前承诺的结算时间，对方说还要再等等，没有给出新的日期。",demo:true},{kind:"image",name:"沟通截图.jpg",demo:true}]},
+      {id:"r2",title:"楼道里的威胁",category:"danger",date:"2026-09-16",time:"约 21:00",dateBasis:"发生时间",origin:"手动记录",summary:"晚间在楼道发生争执，对方说出带有威胁意味的话。视频已保留，人物身份和完整经过仍需确认。",place:"居住楼栋的公共楼道",people:"我、身份待确认的人",state:"partial",body:"9月16日晚间，我在楼道被拦住，对方说出威胁的话。我录下了一段视频。事情发生前的经过还需要补充。",media:[{kind:"video",name:"楼道片段.mp4",duration:"00:48",anchor:"00:12–00:24",quote:"视频中有人阻挡通行并说出威胁性话语，具体身份和前因需要补充。",demo:true}]},
+      {id:"r3",title:"退款承诺再次落空",category:"rights",date:"2026-09-12",time:"日期已知，时刻未知",dateBasis:"发生日期",origin:"Day One",summary:"商家承诺的退款日期已过，沟通时再次要求等待。已保存订单和聊天截图，待补充退款金额。",place:"线上沟通",people:"我、商家客服",state:"complete",body:"9月12日，之前承诺的退款仍未到账。我又联系了客服，对方只是让我继续等待。我把订单和聊天记录截了图，准备核对退款的具体约定。",media:[{kind:"image",name:"退款承诺截图.png",anchor:"截图中的退款约定",quote:"截图示例：客服曾承诺一个退款时间，仍需核对完整对话与订单。",demo:true}]}
+    ];
+    const initialPending = [{id:"p1",excerpt:"他又这样说了，我有些不安。",reason:"人物指代和说话内容不明确，无法判断是否存在冲突或风险。",origin:"Day One",date:"2026-09-17",body:"他又这样说了，我有些不安。",category:"grudge"}];
+    const clone = v => JSON.parse(JSON.stringify(v));
+    let records = clone(seed), pending = clone(initialPending), nextId = 10;
+    let page = "timeline", selectedId = "r1", category = "all", detailTab = "report", detailAnchor = "", editingPlace = false;
+    let searchMode = "text", searchText = "", searchSample = false, queryFile = "", searchRan = false, searchCategory = "all";
+    let settingsTab = "models", provider = "bailian", modelReady = true, modelTesting = false, jurisdiction = "中国大陆";
+    let chosenFiles = [], composeBusy = false, submitTimer, reportTimers = new Set(), toastTimer, returnFocus, timelineScroll = 0;
+    let sync = {state:"idle",processed:0,included:0,skipped:0,review:0,failed:0,total:6,step:0}, syncTimer, epoch = 0;
+    const say = text => { $("#announcer").textContent = text; };
+    function toast(text) { clearTimeout(toastTimer); $("#toast").textContent=text; $("#toast").hidden=false; toastTimer=setTimeout(()=>$("#toast").hidden=true,3300); say(text); }
+    function statusBadge(r) {
+      if(r.state==="analyzing") return '<span class="badge progress">正在分析</span>';
+      if(r.state==="partial") return '<span class="badge">部分完成</span>';
+      return '<span class="small muted">' + icon("check") + ' 分析完成</span>';
+    }
+    function mediaChips(r) { return '<div class="media-chips">' + r.media.map(m=>'<span class="media-chip">'+icon(m.kind)+esc(mediaLabels[m.kind])+(m.duration?' '+esc(m.duration):'')+'</span>').join("") + '</div>'; }
+    function nav(target) {
+      if(page==="timeline") timelineScroll=window.scrollY;
+      page=target; editingPlace=false; render(); window.scrollTo(0,target==="timeline"?timelineScroll:0);
+    }
+    function render() {
+      const names={timeline:"时间线",detail:"记录详情",search:"搜索",settings:"设置",pending:"待确认"};
+      $("#breadcrumb").textContent="我的账本 / "+names[page];
+      document.querySelectorAll("[data-nav]").forEach(b=>{
+        const active=b.dataset.nav===page||(page==="detail"&&b.dataset.nav==="timeline");
+        b.classList.toggle("active",active);
+        if(active) b.setAttribute("aria-current","page"); else b.removeAttribute("aria-current");
+      });
+      $("#pending-count").textContent=pending.length;
+      const views={timeline:renderTimeline,detail:renderDetail,search:renderSearch,settings:renderSettings,pending:renderPending};
+      $("#main").innerHTML=views[page]();
+    }
+    function empty(title,subtitle,actions) { return '<div class="empty"><div class="empty-symbol">'+icon("book")+'</div><h2>'+esc(title)+'</h2><p>'+esc(subtitle)+'</p><div class="row" style="justify-content:center">'+actions+'</div></div>'; }
+    function filterButtons(current, action) {
+      return ['all','rights','danger','grudge'].map(k=>'<button class="filter '+(current===k?'active':'')+'" data-action="'+action+'" data-value="'+k+'" aria-pressed="'+(current===k)+'">'+(k==="all"?"全部事件":labels[k])+'</button>').join("");
+    }
+    function renderTimeline() {
+      const items=records.filter(r=>category==="all"||r.category===category).sort((a,b)=>b.date.localeCompare(a.date));
+      const heading='<div class="page-heading spread"><div><h1>时间线</h1><p>把值得记住的事，留下一份清楚的经过。</p></div><span class="quiet-stat">'+records.length+' 条记录 · 仅收录相关事件</span></div><div class="filters">'+filterButtons(category,"category")+'</div>';
+      if(!items.length) return heading+empty(records.length?"这个分类还没有记录":"从一件值得记住的事开始","只有冲突、权益受损和危险等相关事件会被收录。普通日常不进入账本。",'<button class="btn primary" data-action="new">'+icon("plus")+'新建记录</button><button class="btn" data-action="dayone">导入 Day One</button>');
+      let month="";
+      return heading+'<div class="timeline">'+items.map(r=>{
+        let monthHead=""; const key=r.date.slice(0,7);
+        if(key!==month) { month=key; monthHead='<div class="month">'+key.slice(0,4)+' 年 '+Number(key.slice(5))+' 月</div>'; }
+        return monthHead+'<button class="record-card" data-record="'+r.id+'" aria-label="查看记录：'+esc(r.title)+'"><div class="record-meta"><span>'+esc(r.date.slice(5).replace("-","月"))+'日</span><span>·</span><span>'+esc(r.origin)+'</span><span class="badge '+r.category+'">'+labels[r.category]+'</span></div><h2>'+esc(r.title)+'</h2><p>'+esc(r.summary)+'</p><div class="record-bottom">'+mediaChips(r)+statusBadge(r)+'</div></button>';
+      }).join("")+'</div><p class="small muted" style="padding-left:26px;margin-top:12px">每个时间点，都能回到当时的原始记录。</p>';
+    }
+    function renderDetail() {
+      const r=records.find(x=>x.id===selectedId);
+      if(!r) { page="timeline"; return renderTimeline(); }
+      const head='<button class="back" data-action="back">'+icon("back")+'返回'+(detailAnchor?'搜索':'时间线')+'</button><div class="detail-head"><div class="row gap8"><span class="badge '+r.category+'">'+labels[r.category]+'</span><span class="small muted">'+esc(r.origin)+' · '+esc(r.date)+' · '+esc(r.dateBasis)+'</span></div><h1>'+esc(r.title)+'</h1><div class="spread"><span class="small muted">'+(r.userPlace?'有你补充的信息':'原始材料与分析分开保留')+'</span><button class="btn" data-action="reanalyze" '+(r.state==="analyzing"?'disabled':'')+'>'+icon("refresh")+(r.state==="analyzing"?'正在分析':'重新分析')+'</button></div></div><div class="tabs" role="tablist" aria-label="详情内容"><button class="tab '+(detailTab==="report"?'active':'')+'" role="tab" aria-selected="'+(detailTab==="report")+'" data-detail-tab="report">分析报告</button><button class="tab '+(detailTab==="original"?'active':'')+'" role="tab" aria-selected="'+(detailTab==="original")+'" data-detail-tab="original">原始内容 <span class="muted small">'+r.media.length+' 个附件</span></button></div>';
+      if(detailTab==="original") return head+'<div class="panel">'+(detailAnchor?'<p class="segment-note">'+icon("search")+' 已定位：'+esc(detailAnchor)+'</p>':'')+'<div class="section-title">'+icon("file")+'原始记录</div><p class="original">'+esc(r.body)+'</p></div>'+r.media.map((m,i)=>'<div class="attachment '+(detailAnchor&&i===0?'highlight':'')+'"><div class="spread"><div class="row">'+icon(m.kind)+'<strong class="small">'+esc(m.name)+'</strong><span class="muted small">'+esc(m.duration||"")+'</span></div><span class="badge">'+(m.demo?'演示素材':'仅文件名预览')+'</span></div>'+(m.kind==="audio"?'<div class="wave" aria-hidden="true">'+Array.from({length:62},(_,j)=>'<span style="height:'+(8+((j*17)%32))+'px"></span>').join("")+'</div>':'')+'<p class="small muted mt16">'+(m.demo?'原型以文字说明演示媒体定位，不包含真实录音、视频或截图。':'所选文件没有被读取、上传或持久保存。')+'</p>'+(m.quote?'<div class="quote mt16">'+esc(m.anchor||"相关片段")+' · '+esc(m.quote)+'</div>':'')+'</div>').join("");
+      const place=editingPlace?'<div class="fact-edit"><input id="place-input" aria-label="补充地点" value="'+esc(r.place)+'" placeholder="例如：公司会议室"><button class="btn soft" data-action="save-place">保存补充</button><button class="btn ghost" data-action="cancel-place">取消</button></div>':(r.place?'<span>'+esc(r.place)+'</span> <button class="placeholder small" data-action="edit-place">编辑</button>'+(r.userPlace?'<div class="small blue">你已补充 · 重新分析会保留</div>':''):'<button class="placeholder" data-action="edit-place">待补充：事情发生在哪里？</button>');
+      let out=head;
+      if(r.state==="analyzing") out+='<div class="note" style="margin-bottom:18px"><span class="spinner"></span>记录已保存。正在重新整理报告，你补充的信息会被保留。</div>';
+      if(r.state==="partial") out+='<div class="note warn" style="margin-bottom:18px">'+icon("info")+'<div>部分完成：一个媒体片段尚未处理，以下内容基于已读材料。<div class="mt16"><button class="btn" data-action="retry-analysis">重试未完成部分</button></div></div></div>';
+      out+='<section class="panel"><div class="section-title">'+icon("file")+'事件概况</div><div class="facts"><div><span class="fact-label">时间</span><div class="fact-value">'+esc(r.date)+' · '+esc(r.time)+'</div></div><div><span class="fact-label">地点</span><div class="fact-value" id="place-value">'+place+'</div></div><div><span class="fact-label">人物</span><div class="fact-value">'+esc(r.people)+'</div></div><div><span class="fact-label">分析地域</span><div class="fact-value">'+esc(jurisdiction)+' <span class="muted small">· 默认设置</span></div></div></div></section>';
+      out+='<section class="panel"><div class="section-title">'+icon("time")+'发生了什么</div><p class="narrative">'+esc(r.summary)+'</p><div class="note mt16">'+icon("info")+'<span>待补充：具体约定、完整对话和相关人的身份。未明确的部分不会自动写成事实。</span></div></section>';
+      const steps=r.category==="danger"?["先确认当前是否仍存在风险，整理你实际观察到的行为和原话。","保留完整原件与上下文，补充时间、地点及在场人员。","根据具体情况选择求助或咨询路径，相关法律问题需进一步核验。"]:["整理约定的时间、内容和对方的回应，补全金额或其他关键条件。","保留完整聊天、订单、录音等原件，并把它们与具体事实对应。","根据补充后的事实评估沟通、投诉或专业咨询等选项。"];
+      out+='<section class="panel"><div class="section-title">'+icon("check")+'可以怎样处理</div><ol class="steps">'+steps.map(s=>'<li>'+esc(s)+'</li>').join("")+'</ol></section>';
+      if(r.category==="rights"||r.category==="danger") out+='<section class="panel"><div class="spread"><div class="section-title" style="margin-bottom:0">'+icon("shield")+'法律视角</div><span class="badge">依据待核验</span></div><p class="narrative mt16">需要先明确当事人关系、事件发生地和具体约定，再核验相应的权利义务及处理路径。当前信息不足以认定责任或给出确定结论。</p><div class="legal-source">法律来源尚未核验<span>真实产品会显示官方原文、发布机构、适用时间及核验时间。本原型没有执行法律检索。</span></div><p class="small muted mt16">演示报告 · 用于评审信息结构，不是针对真实事件的法律意见。</p></section>';
+      return out;
+    }
+    function renderSearch() {
+      const modes=["text","image","audio","video"];
+      let html='<div class="page-heading"><h1>搜索</h1><p>一句描述、一张图片，或一段声音，都可以成为线索。</p></div><div class="search-box"><div class="query-tabs" role="tablist" aria-label="搜索输入类型">'+modes.map(m=>'<button role="tab" aria-selected="'+(searchMode===m)+'" class="'+(searchMode===m?'active':'')+'" data-search-mode="'+m+'">'+(m==="text"?"文字":mediaLabels[m])+'</button>').join("")+'</div><div class="search-input-row">'+icon("search")+'<label class="sr-only" for="search-text">搜索描述</label><input id="search-text" placeholder="'+(searchMode==="text"?'搜索事件、人物或你记得的细节…':'可以补充一句描述…')+'" value="'+esc(searchText)+'"><button class="btn primary" data-action="run-search">搜索记录</button></div>';
+      if(searchMode!=="text") html+='<div class="dropzone"><label class="small muted" for="query-file">选择'+mediaLabels[searchMode]+'（原型只显示文件名）</label><input type="file" id="query-file" accept="'+searchMode+'/*" style="margin:9px 0"><div class="spread"><span class="small muted">'+esc(searchSample?'已选择演示'+mediaLabels[searchMode]:(queryFile||"尚未选择素材"))+'</span><button class="btn soft small" data-action="sample-query">使用演示'+mediaLabels[searchMode]+'</button></div></div>';
+      html+='</div><div class="filters">'+filterButtons(searchCategory,"search-category")+'</div>';
+      if(!searchRan) return html+empty("从你记得的细节开始","只搜索正式收录的记录。普通日常和待确认内容不在结果中。",'<button class="btn soft" data-action="example-query">试试：奖金</button>');
+      if(searchMode!=="text"&&!modelReady) return html+'<div class="note warn">'+icon("info")+'<div>媒体搜索不可用：尚未配置所需模型能力。这不是“没有相关记录”。<div class="mt16"><button class="btn" data-action="models">去模型设置</button></div></div></div>';
+      if(searchMode!=="text"&&!searchSample) return html+'<div class="note">'+icon("info")+'<div>原型没有执行媒体理解，也未读取所选文件。使用演示素材可查看预设的匹配和片段跳转。</div></div>';
+      const target={image:"r3",audio:"r1",video:"r2"};
+      let hits=searchMode==="text"?records.filter(r=>{const q=searchText.trim().toLowerCase();return q&&(r.title+r.summary+r.body+r.people+r.place).toLowerCase().includes(q);}):records.filter(r=>r.id===target[searchMode]);
+      hits=hits.filter(r=>searchCategory==="all"||r.category===searchCategory);
+      if(!hits.length) return html+empty("没有找到相关记录","换一种描述，或扩大事件类别再试一次。",'<button class="btn" data-action="clear-search">清除搜索条件</button>');
+      html+='<p class="small muted" style="margin-bottom:15px">'+hits.length+' 条相关记录'+(searchMode!=="text"?' · 预设媒体检索演示':' · 原型内存关键词匹配')+'</p>';
+      return html+hits.map(r=>{const anchor=searchMode==="text"?"原文相关段落":((r.media[0]||{}).anchor||"相关图片");return '<button class="search-result" data-hit="'+r.id+'" data-anchor="'+esc(anchor)+'"><div class="row gap8"><span class="badge '+r.category+'">'+labels[r.category]+'</span><span class="small muted">'+esc(r.date)+' · '+esc(r.origin)+'</span></div><h3>'+esc(r.title)+'</h3><p>'+esc(r.summary)+'</p><span class="match">'+icon(searchMode==="text"?"file":searchMode)+(searchMode==="text"?'匹配原文中的描述':'演示素材与该事件相关')+' · '+esc(anchor)+' '+icon("arrow")+'</span></button>';}).join("");
+    }
+    function renderPending() {
+      const head='<div class="page-heading spread"><div><h1>待确认</h1><p>有些事还缺少上下文，由你决定是否需要留下。</p></div><span class="quiet-stat">'+pending.length+' 项 · 尚未进入正式账本</span></div>';
+      if(!pending.length) return head+empty("暂时没有待确认内容","所有已判断的内容都有了去处。普通日常不会出现在这里。",'<button class="btn" data-action="timeline">返回时间线</button>');
+      return head+pending.map(p=>'<article class="pending-card"><div class="row gap8"><span class="badge">需要你判断</span><span class="small muted">'+esc(p.origin)+' · '+esc(p.date)+'</span></div><h3>'+esc(p.excerpt)+'</h3><p>'+esc(p.reason)+'</p><div class="spread mt24"><span class="small muted">'+(p.origin==="手动记录"?'完整输入仅在本次演示会话中可用':'保留时重新读取来源；忽略后清理摘录')+'</span><div class="row gap8"><button class="btn" data-ignore="'+p.id+'">忽略</button><button class="btn primary" data-keep="'+p.id+'">保留并分析</button></div></div></article>').join("");
+    }
+    function renderSettings() {
+      let html='<div class="settings"><div class="page-heading"><h1>设置</h1><p>配置模型，按需导入 Day One 导出包。</p></div><div class="tabs" role="tablist" aria-label="设置分类"><button class="tab '+(settingsTab==="models"?'active':'')+'" role="tab" aria-selected="'+(settingsTab==="models")+'" data-settings-tab="models">AI 模型</button><button class="tab '+(settingsTab==="dayone"?'active':'')+'" role="tab" aria-selected="'+(settingsTab==="dayone")+'" data-settings-tab="dayone">Day One</button></div>';
+      if(settingsTab==="models") {
+        html+='<div class="panel"><div class="spread"><h2>分析模型</h2><span class="badge '+(modelReady?'ready':'')+'">'+(modelReady?'演示连接正常':'未连接')+'</span></div><p class="small muted mt16">优先选择能够理解图片、音频和视频的模型。</p><div class="providers"><button class="provider '+(provider==="bailian"?'active':'')+'" data-provider="bailian" aria-pressed="'+(provider==="bailian")+'"><span class="provider-logo">百</span><span>百炼<small>默认完整能力方案</small></span></button><button class="provider '+(provider==="minimax"?'active':'')+'" data-provider="minimax" aria-pressed="'+(provider==="minimax")+'"><span class="provider-logo" style="color:#7a5bb5;background:#f4effc">M</span><span>MiniMax<small>主分析模型可选</small></span></button></div><div class="two-fields"><label class="field">推荐模型（演示）<select id="model-choice"><option>'+(provider==="bailian"?'Qwen-Omni · 多模态理解':'MiniMax M3 · 文字 / 视觉')+'</option></select></label><label class="field">'+(provider==="bailian"?'服务地域':'辅助能力')+'<select><option>'+(provider==="bailian"?'北京（具体可用性需验证）':'使用已配置百炼补齐')+'</option></select></label></div><label class="field mt16">API Key<input type="password" disabled placeholder="演示无需输入真实密钥"></label><div class="capabilities">'+(provider==="bailian"?['文字','图片','音频','视频']:['文字','图片','视频']).map(t=>'<span class="badge progress">'+t+'</span>').join("")+'<span class="badge">能力标签为演示</span></div>';
+        if(provider==="minimax") html+='<div class="note warn mt16">'+icon("info")+'音频、检索向量及法律来源核验使用已配置并授权的百炼能力；缺少配置时，对应功能不可用。</div>';
+        html+='<div class="spread mt24"><span class="small muted">这里只模拟连接，不发送请求。</span><div class="row gap8"><button class="btn ghost" data-action="disconnect-model">断开演示连接</button><button class="btn primary" data-action="test-model" '+(modelTesting?'disabled':'')+'>'+(modelTesting?'正在模拟测试…':'测试演示连接')+'</button></div></div></div><div class="panel"><div class="settings-row"><div><h3>默认法律地域</h3><p>记录详情中可以补充具体所在地。</p></div><label class="sr-only" for="jurisdiction">默认法律地域</label><select id="jurisdiction"><option '+(jurisdiction==="中国大陆"?'selected':'')+'>中国大陆</option><option '+(jurisdiction==="待补充"?'selected':'')+'>待补充</option></select></div><div class="settings-row"><div><h3>自动处理</h3><p>相关记录保存后自动分析；普通日常不入库。</p></div><span class="badge ready">已启用 · 演示</span></div><p class="small muted mt16">真实产品首次配置时说明筛选与媒体发送范围。没有模型连接时，输入可留在当前编辑框，不会假装已保存。</p></div>';
+      } else {
+        const running=sync.state==="running", paused=sync.state==="paused";
+        html+='<div class="panel"><div class="spread"><div class="row"><span class="provider-logo">D</span><div><h2>Day One</h2><p class="small muted">用户手动导出的 JSON ZIP · 演示</p></div></div><span class="badge">未连接直读</span></div><div class="settings-row mt16"><div><h3>按需导入</h3><p>在 Day One 选择“文件 → 导出 → JSON”，再把生成的 ZIP 导入本机应用；没有定时同步。</p></div><span class="badge">手动</span></div><div class="settings-row"><div><h3>只收录相关事件</h3><p>冲突、权益受损和危险等事件会留下，普通日常直接跳过。</p></div><span class="badge progress">所有入口适用</span></div><div class="spread mt24"><button class="btn primary" data-action="start-batch" '+(running||paused?'disabled':'')+'>模拟导入 JSON ZIP</button></div></div>';
+        html+='<div class="panel"><div class="spread"><h3>本次检查</h3><span class="badge">'+({idle:"尚未开始",running:"正在检查",paused:"已暂停",done:"检查结束",cancelled:"已取消"}[sync.state])+'</span></div><div class="stats"><div class="stat"><strong>'+sync.processed+'</strong>已检查</div><div class="stat"><strong>'+sync.included+'</strong>已收录</div><div class="stat"><strong>'+sync.skipped+'</strong>已跳过</div><div class="stat"><strong>'+sync.review+'</strong>待确认</div><div class="stat"><strong>'+sync.failed+'</strong>失败</div></div><progress value="'+sync.processed+'" max="'+sync.total+'" aria-label="日记检查进度"></progress><p class="sync-status" aria-live="polite">'+sync.processed+' / '+sync.total+' 篇 · '+(sync.failed?'有读取失败项，未将其计为跳过':sync.state==="done"?'筛选已完成，演示报告已生成':'筛选和报告生成分阶段处理')+'</p><div class="row mt16">'+(running?'<button class="btn" data-action="pause-sync">暂停检查</button>':paused?'<button class="btn primary" data-action="resume-sync">继续检查</button>':'')+((running||paused)?'<button class="btn ghost" data-action="cancel-sync">取消本批次</button>':'')+(sync.failed&&sync.state==="done"?'<button class="btn" data-action="retry-sync">重试失败项</button>':'')+'<button class="btn ghost" data-action="pending">查看待确认（'+pending.length+'）</button></div></div>';
+        html+='<div class="note mt16">'+icon("shield")+'<div>跳过只有汇总，没有日记清单。普通日常的正文、附件和派生内容都不进入账本。</div></div><details class="demo-controls"><summary>接入说明（原型评审）</summary>本页模拟用户选择 Day One 官方 JSON 导出 ZIP 后的筛选，不读取实际文件，也不表示已经连接 Day One。</details>';
+      }
+      return html+'</div>';
+    }
+    function openCompose() {
+      returnFocus=document.activeElement; chosenFiles=[]; composeBusy=false; $("#scene").value="include"; $("#draft-text").value=sceneText.include; $("#draft-files").value=""; $("#draft-file-list").innerHTML=""; $("#compose-status").innerHTML=""; $("#save-draft").disabled=false; $("#save-draft").textContent="保存"; $("#scene").disabled=false; $("#draft-text").disabled=false; $("#draft-files").disabled=false; $("#compose").showModal(); $("#draft-text").focus();
+    }
+    function closeCompose(force=false) {
+      if(!force&&$("#draft-text").value.trim()&&!window.confirm("当前输入尚未保存到正式账本，确定放弃吗？")) return;
+      clearTimeout(submitTimer); composeBusy=false; chosenFiles=[]; $("#draft-text").value=""; $("#draft-files").value=""; $("#compose").close(); if(returnFocus&&returnFocus.isConnected) returnFocus.focus();
+    }
+    function fileList(files) {
+      const incoming=Array.from(files);if(composeBusy||!incoming.length)return;
+      chosenFiles=incoming.map(f=>({name:f.name,kind:f.type.startsWith("image/")?"image":f.type.startsWith("audio/")?"audio":f.type.startsWith("video/")?"video":"unsupported",size:f.size,demo:false}));
+      $("#draft-file-list").innerHTML=chosenFiles.map(f=>'<span class="file-tag">'+esc(f.name)+'</span>').join("");
+      $("#draft-files").value="";$("#compose-status").innerHTML="";$("#save-draft").textContent="保存";
+    }
+    function draftStatus(text,type="") { $("#compose-status").innerHTML='<div class="note '+type+'">'+icon("info")+'<span>'+esc(text)+'</span></div>'; say(text); }
+    function newRecord(body,media,origin="手动记录",cat="rights",title="奖金结算的进一步沟通") {
+      return {id:"r"+nextId++,title,category:cat,date:"2026-09-19",time:"待补充具体发生时间",dateBasis:"记录日期",origin,summary:body.slice(0,125),place:"",people:"我、相关人（待补充）",state:"analyzing",body,media:clone(media)};
+    }
+    function analyze(r,partial=false) {
+      r.state="analyzing"; const currentEpoch=epoch;
+      const timer=setTimeout(()=>{reportTimers.delete(timer);if(currentEpoch!==epoch||!records.some(x=>x.id===r.id))return;r.state=partial?"partial":"complete";render();say(partial?"报告部分完成，可重试未完成部分":"分析完成");},1100);
+      reportTimers.add(timer);
+    }
+    function submitDraft() {
+      if(composeBusy)return;
+      const inputText=$("#draft-text").value, body=inputText.trim(), scene=$("#scene").value;
+      if(!body&&!chosenFiles.length) {draftStatus("请先输入文字或添加媒体。","error");return;}
+      if(Array.from(inputText).length>50000||chosenFiles.length>20||chosenFiles.some(f=>f.size>500*1024*1024||f.kind==="unsupported")) {draftStatus("输入超出范围：最多 50,000 字、20 个图片／音频／视频附件，每个不超过 500 MB。","error");return;}
+      if(!modelReady) {draftStatus("尚未配置模型，无法判断是否收录。请先在设置中测试演示连接。","warn");return;}
+      composeBusy=true; $("#save-draft").disabled=true; $("#scene").disabled=true; $("#draft-text").disabled=true; $("#draft-files").disabled=true; $("#save-draft").textContent="正在判断…"; $("#compose-status").innerHTML='<div class="note"><span class="spinner"></span>正在判断是否收录，尚未建立正式记录。</div>'; say("正在判断是否收录");
+      submitTimer=setTimeout(()=>{
+        composeBusy=false; $("#save-draft").disabled=false; $("#scene").disabled=false; $("#draft-text").disabled=false; $("#draft-files").disabled=false; $("#save-draft").textContent="保存";
+        if(scene==="skip"){draftStatus("不属于收录范围。普通日常未入库，输入仍留在这里供你修改。");return;}
+        if(scene==="fail"){draftStatus("未完成判断：模拟连接超时。没有建立记录，请重试。","error");$("#save-draft").textContent="重试判断";$("#scene").value="include";return;}
+        if(scene==="review"){
+          pending.push({id:"p"+nextId++,excerpt:body.slice(0,160)||"媒体中的事件尚不明确",reason:"上下文不足，无法确认是否需要留存。请判断是否与你的冲突、权益或安全有关。",origin:"手动记录",date:"2026-09-19",body,media:clone(chosenFiles),category:"grudge"});
+          closeCompose(true); nav("pending"); toast("已加入待确认，尚未建立正式记录");return;
+        }
+        const r=newRecord(body||"媒体记录：具体经过待补充",chosenFiles);records.unshift(r);analyze(r,scene==="partial");selectedId=r.id;detailTab="report";detailAnchor="";closeCompose(true);nav("detail");toast("已保存，正在分析");
+      },850);
+    }
+    function openRecord(id,anchor="") {
+      if(page==="timeline")timelineScroll=window.scrollY;
+      selectedId=id; detailAnchor=anchor; detailTab=anchor?"original":"report"; editingPlace=false; page="detail";render();window.scrollTo(0,0);
+    }
+    function runSearch() { searchText=$("#search-text")?$("#search-text").value:searchText;searchRan=true;render();say("搜索结果已更新"); }
+    function keepPending(id) {
+      const p=pending.find(x=>x.id===id);if(!p)return;
+      if(!modelReady){toast("请先完成模型演示连接，再保留并分析");return;}
+      const r=newRecord(p.body||p.excerpt,p.media||[],p.origin,p.category,"需要留存的一次不安经历");records.unshift(r);pending=pending.filter(x=>x.id!==id);analyze(r);render();toast("已保存为正式记录，正在分析");
+    }
+    function advanceSync() {
+      if(sync.state!=="running")return;
+      const outcomes=["include","skip","review","include","skip","error"], outcome=outcomes[sync.step];
+      if(outcome==="include") {
+        const title=sync.step===0?"承诺过的安排再次被取消":"沟通中出现的人身威胁";
+        const cat=sync.step===0?"grudge":"danger";
+        if(!records.some(r=>r.title===title)){
+          const r=newRecord("演示日记中的相关事件，需要保留完整经过与沟通材料。",[],"Day One",cat,title);r.state="complete";records.unshift(r);
+        }
+        sync.included++;
+      } else if(outcome==="skip") sync.skipped++;
+      else if(outcome==="review") {
+        if(!pending.some(p=>p.id==="p-sync")) pending.push({id:"p-sync",excerpt:"这件事让我有点在意，但还没有说清楚。",reason:"没有明确经过，需要确认是否属于冲突或权益风险。",origin:"Day One",date:"2026-09-19",body:"演示日记：这件事让我有点在意，但还没有说清楚。",category:"grudge"});
+        sync.review++;
+      } else sync.failed++;
+      sync.step++;sync.processed++;
+      if(sync.step===sync.total){clearInterval(syncTimer);sync.state="done";say("演示批次结束，有一项失败可重试");}
+      render();
+    }
+    function startSync() {
+      if(sync.state==="running"||sync.state==="paused")return;
+      if(!modelReady){toast("请先配置筛选模型，本次没有开始检查");return;}
+      clearInterval(syncTimer);sync={state:"running",processed:0,included:0,skipped:0,review:0,failed:0,total:6,step:0};settingsTab="dayone";nav("settings");syncTimer=setInterval(advanceSync,700);
+    }
+    function resetDemo(makeEmpty=false) {
+      epoch++;clearInterval(syncTimer);clearTimeout(submitTimer);reportTimers.forEach(clearTimeout);reportTimers.clear();
+      records=makeEmpty?[]:clone(seed);pending=makeEmpty?[]:clone(initialPending);nextId=10;category="all";searchText="";searchRan=false;queryFile="";searchSample=false;modelReady=true;modelTesting=false;provider="bailian";settingsTab="models";jurisdiction="中国大陆";detailAnchor="";timelineScroll=0;
+      sync={state:"idle",processed:0,included:0,skipped:0,review:0,failed:0,total:6,step:0};
+      $("#guide").close();nav("timeline");toast(makeEmpty?"已切换为空账本演示":"演示数据已重置");
+    }
+    $("#new-record").addEventListener("click",openCompose);
+    $("#open-guide").addEventListener("click",()=>$("#guide").showModal());
+    $("#close-compose").addEventListener("click",()=>closeCompose());
+    $("#compose").addEventListener("cancel",e=>{e.preventDefault();closeCompose();});
+    $("#scene").addEventListener("change",e=>{$("#draft-text").value=sceneText[e.target.value];$("#compose-status").innerHTML="";$("#save-draft").textContent="保存";});
+    $("#draft-text").addEventListener("input",()=>{if(!composeBusy){$("#compose-status").innerHTML="";$("#save-draft").textContent="保存";}});
+    $("#draft-files").addEventListener("change",e=>fileList(e.target.files));
+    $("#save-draft").addEventListener("click",submitDraft);
+    $("#show-empty").addEventListener("click",()=>resetDemo(true));
+    $("#reset-demo").addEventListener("click",()=>resetDemo(false));
+    $("#confirm-batch").addEventListener("click",()=>{$("#batch-dialog").close();startSync();});
+    ["dragover","dragleave","drop"].forEach(type=>$("#dropzone").addEventListener(type,e=>{
+      e.preventDefault();$("#dropzone").classList.toggle("drag",type==="dragover");
+      if(type==="drop"&&!composeBusy)fileList(e.dataTransfer.files);
+    }));
+    document.addEventListener("keydown",e=>{
+      if((e.metaKey||e.ctrlKey)&&!document.querySelector("dialog[open]")) {
+        if(e.key.toLowerCase()==="k"){e.preventDefault();nav("search");$("#search-text").focus();}
+        if(e.key.toLowerCase()==="n"){e.preventDefault();openCompose();}
+      }
+      if(e.key==="Enter"&&e.target.id==="search-text"){e.preventDefault();runSearch();}
+    });
+    document.addEventListener("change",e=>{
+      if(e.target.id==="query-file"){queryFile=e.target.files[0]?e.target.files[0].name:"";searchSample=false;searchRan=false;searchText=$("#search-text").value;render();}
+      if(e.target.id==="jurisdiction"){jurisdiction=e.target.value;toast("已更新演示地域");}
+    });
+    document.addEventListener("input",e=>{if(e.target.id==="search-text")searchText=e.target.value;});
+    document.addEventListener("click",e=>{
+      const b=e.target.closest("button");if(!b)return;
+      if(b.dataset.close){$("#"+b.dataset.close).close();return;}
+      if(b.dataset.nav){nav(b.dataset.nav);return;}
+      if(b.dataset.record){openRecord(b.dataset.record);return;}
+      if(b.dataset.hit){openRecord(b.dataset.hit,b.dataset.anchor);return;}
+      if(b.dataset.detailTab){detailTab=b.dataset.detailTab;editingPlace=false;render();return;}
+      if(b.dataset.searchMode){searchMode=b.dataset.searchMode;searchSample=false;queryFile="";searchRan=false;render();return;}
+      if(b.dataset.settingsTab){settingsTab=b.dataset.settingsTab;render();return;}
+      if(b.dataset.provider){provider=b.dataset.provider;render();return;}
+      if(b.dataset.keep){keepPending(b.dataset.keep);return;}
+      if(b.dataset.ignore){pending=pending.filter(p=>p.id!==b.dataset.ignore);render();toast("已忽略并清理待确认内容");return;}
+      const action=b.dataset.action;
+      if(action==="new")openCompose();
+      if(action==="timeline")nav("timeline");
+      if(action==="pending")nav("pending");
+      if(action==="dayone"){settingsTab="dayone";nav("settings");}
+      if(action==="models"){settingsTab="models";nav("settings");}
+      if(action==="category"){category=b.dataset.value;render();}
+      if(action==="search-category"){searchCategory=b.dataset.value;render();}
+      if(action==="back")nav(detailAnchor?"search":"timeline");
+      if(action==="edit-place"){editingPlace=true;render();$("#place-input").focus();}
+      if(action==="cancel-place"){editingPlace=false;render();}
+      if(action==="save-place"){
+        const input=$("#place-input").value.trim();if(!input){toast("请填写地点，或取消此次补充");return;}
+        const r=records.find(x=>x.id===selectedId);r.place=input;r.userPlace=true;editingPlace=false;render();toast("地点已补充，重新分析会保留");
+      }
+      if(action==="reanalyze"||action==="retry-analysis"){const r=records.find(x=>x.id===selectedId);analyze(r);render();}
+      if(action==="run-search")runSearch();
+      if(action==="sample-query"){searchSample=true;queryFile="";searchRan=false;render();}
+      if(action==="example-query"){searchMode="text";searchText="奖金";searchRan=true;render();}
+      if(action==="clear-search"){searchCategory="all";searchText="";searchRan=false;searchSample=false;queryFile="";render();}
+      if(action==="test-model"&&!modelTesting){
+        modelTesting=true;render();const currentEpoch=epoch;
+        const timer=setTimeout(()=>{reportTimers.delete(timer);if(currentEpoch!==epoch)return;modelTesting=false;modelReady=true;render();toast("模拟连接成功，没有发送真实请求");},650);reportTimers.add(timer);
+      }
+      if(action==="disconnect-model"){modelReady=false;render();toast("演示模型已断开，可查看能力不足状态");}
+      if(action==="start-batch")$("#batch-dialog").showModal();
+      if(action==="incremental"){startSync();toast("正在演示检查新增与修改，重复正式记录会去重");}
+      if(action==="pause-sync"){sync.state="paused";clearInterval(syncTimer);render();}
+      if(action==="resume-sync"){sync.state="running";syncTimer=setInterval(advanceSync,700);render();}
+      if(action==="cancel-sync"){clearInterval(syncTimer);sync.state="cancelled";render();toast("本批次已取消，已收录记录保留");}
+      if(action==="retry-sync"){
+        sync.failed=0;sync.skipped++;render();toast("重试完成：判断为普通日常，已跳过，没有建立记录");
+      }
+    });
+    render();
+  </script>
+</body>
+</html>

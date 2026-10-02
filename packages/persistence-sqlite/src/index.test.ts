@@ -39,8 +39,10 @@ describe("SQLite foundation", () => {
       runMigrations(database);
       expect(database.pragma("journal_mode", { simple: true })).toBe("wal");
       expect(database.pragma("foreign_keys", { simple: true })).toBe(1);
-      expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 9 });
+      expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 24 });
       expect(database.prepare("SELECT count(*) AS count FROM pragma_module_list WHERE name = 'fts5'").get()).toEqual({ count: 1 });
+      const sourceAssetColumns = database.prepare("PRAGMA table_info(redesign_record_assets)").all() as Array<{ name: string }>;
+      expect(sourceAssetColumns.map(({ name }) => name)).toContain("source_id");
       database.close();
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -55,12 +57,111 @@ describe("SQLite foundation", () => {
     database.close();
   });
 
+  it("sanitizes prior redesigned failure diagnostics while preserving legacy jobs", () => {
+    const database = new Database(":memory:");
+    database.pragma("foreign_keys = ON");
+    runMigrations(database, DEFAULT_MIGRATIONS.slice(0, 23));
+    const privateMarker = "private-diary-path-in-old-error";
+    const timestamp = "2026-09-27T00:00:00.000Z";
+    database.prepare(`
+      INSERT INTO redesign_search_generations
+        (id, adapter_identity, adapter_version, dimensions, input_modalities_json,
+         state, fragment_count, last_error, created_at)
+      VALUES ('old-index', 'test', 1, 2, '["text"]', 'failed', 0, ?, ?)
+    `).run(privateMarker, timestamp);
+    const insertJob = database.prepare(`
+      INSERT INTO jobs(id, type, payload_json, state, progress, attempts, max_attempts,
+        available_at, last_error, created_at, updated_at)
+      VALUES (?, ?, '{}', 'failed', 0, 1, 1, ?, ?, ?, ?)
+    `);
+    insertJob.run("new-job", "record.analyze", timestamp, privateMarker, timestamp, timestamp);
+    insertJob.run("old-job", "dayone.import", timestamp, "legacy diagnostic", timestamp, timestamp);
+    const insertAttempt = database.prepare(`
+      INSERT INTO job_attempts(job_id, attempt_number, started_at, finished_at, outcome, error)
+      VALUES (?, 1, ?, ?, 'failed', ?)
+    `);
+    insertAttempt.run("new-job", timestamp, timestamp, privateMarker);
+    insertAttempt.run("old-job", timestamp, timestamp, "legacy diagnostic");
+
+    runMigrations(database);
+    expect(database.prepare("SELECT last_error FROM redesign_search_generations WHERE id = 'old-index'").pluck().get())
+      .toBe("INTERNAL_ERROR");
+    expect(database.prepare("SELECT id, last_error FROM jobs ORDER BY id").all()).toEqual([
+      { id: "new-job", last_error: "INTERNAL_ERROR" },
+      { id: "old-job", last_error: "legacy diagnostic" }
+    ]);
+    expect(database.prepare("SELECT job_id, error FROM job_attempts ORDER BY job_id").all()).toEqual([
+      { job_id: "new-job", error: "INTERNAL_ERROR" },
+      { job_id: "old-job", error: "legacy diagnostic" }
+    ]);
+    database.close();
+  });
+
+  it("adds report clarifications without losing existing user overrides", () => {
+    const database = new Database(":memory:");
+    database.pragma("foreign_keys = ON");
+    runMigrations(database, DEFAULT_MIGRATIONS.slice(0, 22));
+    const timestamp = "2026-09-27T00:00:00.000Z";
+    database.prepare(`
+      INSERT INTO redesign_records(id, origin, categories_json, title, summary, revision,
+        occurred_at_json, recorded_at, report_state, created_at, updated_at)
+      VALUES ('record-1', 'manual', '["rights"]', '旧记录', '旧摘要', 2,
+        '{"kind":"unknown"}', ?, 'stale', ?, ?)
+    `).run(timestamp, timestamp, timestamp);
+    database.prepare(`
+      INSERT INTO redesign_field_overrides(id, record_id, field_key, value_json, actor, revision, created_at, updated_at)
+      VALUES ('override-1', 'record-1', 'location', '"上海办公室"', 'user', 2, ?, ?)
+    `).run(timestamp, timestamp);
+
+    runMigrations(database);
+    expect(database.prepare("SELECT field_key, value_json FROM redesign_field_overrides WHERE record_id = 'record-1'").all())
+      .toEqual([{ field_key: "location", value_json: '"上海办公室"' }]);
+    database.prepare(`
+      INSERT INTO redesign_field_overrides(id, record_id, field_key, value_json, actor, revision, created_at, updated_at)
+      VALUES ('override-2', 'record-1', 'clarifications', '[]', 'user', 3, ?, ?)
+    `).run(timestamp, timestamp);
+    expect(database.prepare("SELECT count(*) AS count FROM redesign_field_overrides WHERE record_id = 'record-1'").get())
+      .toEqual({ count: 2 });
+    database.close();
+  });
+
+  it("restores unresolved source-review flags when upgrading an existing redesigned workspace", () => {
+    const database = new Database(":memory:");
+    runMigrations(database, DEFAULT_MIGRATIONS.slice(0, 19));
+    const timestamp = "2026-09-24T00:00:00.000Z";
+    const insertRecord = database.prepare(`
+      INSERT INTO redesign_records(id, origin, categories_json, title, summary, revision,
+        occurred_at_json, recorded_at, report_state, source_updated, created_at, updated_at)
+      VALUES (?, 'zip', '["rights"]', '合成记录', '旧报告', ?, '{"kind":"unknown"}', ?, 'complete', 0, ?, ?)
+    `);
+    insertRecord.run("unretained", 2, timestamp, timestamp, timestamp);
+    insertRecord.run("later-retained", 3, timestamp, timestamp, timestamp);
+    const insertRevision = database.prepare(`
+      INSERT INTO redesign_record_revisions(id, record_id, revision, snapshot_json, actor, reason, created_at)
+      VALUES (?, ?, ?, '{}', 'source', ?, ?)
+    `);
+    insertRevision.run("unretained:2", "unretained", 2, "来源出现未收录的新版本", timestamp);
+    insertRevision.run("later-retained:2", "later-retained", 2, "来源出现未收录的新版本", timestamp);
+    insertRevision.run("later-retained:3", "later-retained", 3, "来源版本更新并重新收录", timestamp);
+
+    runMigrations(database);
+    expect(database.prepare(`
+      SELECT id, source_updated, source_review_required FROM redesign_records ORDER BY id
+    `).all()).toEqual([
+      { id: "later-retained", source_updated: 0, source_review_required: 0 },
+      { id: "unretained", source_updated: 1, source_review_required: 1 }
+    ]);
+    runMigrations(database);
+    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 24 });
+    database.close();
+  });
+
   it("upgrades a Phase 0 database without changing the original migration", () => {
     const database = new Database(":memory:");
     runMigrations(database, [DEFAULT_MIGRATIONS[0]!]);
     expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 1 });
     runMigrations(database);
-    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 9 });
+    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 24 });
     expect(database.prepare("SELECT name FROM sqlite_master WHERE name = 'events'").get()).toEqual({ name: "events" });
     database.close();
   });
@@ -118,7 +219,7 @@ describe("SQLite foundation", () => {
       "agent_runs", "agent_tool_calls", "external_context_disclosures", "llm_provider_credentials",
       "llm_provider_settings", "llm_settings"
     ]);
-    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 9 });
+    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 24 });
     database.close();
   });
 
@@ -142,6 +243,136 @@ describe("SQLite foundation", () => {
       credentialConfigured: false, status: "not_configured"
     }, "2026-08-30T01:00:00.000Z");
     expect(repository.getLlmProviderConfig("bailian")?.workspaceId).toBe("ws-123");
+    database.close();
+  });
+
+  it("expands the provider constraints for MiniMax without changing existing settings", () => {
+    const database = new Database(":memory:");
+    runMigrations(database, DEFAULT_MIGRATIONS.slice(0, 9));
+    database.prepare(`
+      INSERT INTO llm_provider_settings(provider, model, region, workspace_id, status, last_tested_at, updated_at)
+      VALUES ('openrouter', 'existing-model', NULL, NULL, 'ready', '2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z')
+    `).run();
+    database.prepare(`
+      INSERT INTO llm_settings(singleton, active_provider, updated_at)
+      VALUES (1, 'openrouter', '2026-09-01T00:00:00.000Z')
+    `).run();
+    runMigrations(database);
+
+    const repository = new SqliteAgentRepository(database);
+    expect(repository.getLlmSettings()).toMatchObject({
+      activeProvider: "openrouter", providers: { openrouter: { model: "existing-model", status: "ready" } }
+    });
+    repository.saveLlmProviderConfig({
+      provider: "minimax", model: "MiniMax-M3", credentialConfigured: false, status: "not_configured",
+      capabilities: {
+        inputModalities: ["text", "image"], outputModalities: ["text"], structuredOutput: true,
+        verifiedTasks: ["connection", "structured_output", "screening"],
+        lastVerifiedAt: "2026-09-19T00:00:00.000Z"
+      }
+    }, "2026-09-19T00:00:00.000Z");
+    repository.saveLlmSettings({ providers: {}, activeProvider: "minimax" }, "2026-09-19T00:00:00.000Z");
+    expect(repository.getLlmSettings()).toMatchObject({
+      activeProvider: "minimax", providers: { minimax: {
+        model: "MiniMax-M3", status: "not_configured",
+        capabilities: {
+          inputModalities: ["text", "image"], outputModalities: ["text"], structuredOutput: true,
+          verifiedTasks: ["connection", "structured_output", "screening"]
+        }
+      } }
+    });
+    database.close();
+  });
+
+  it("marks pre-normalization search generations for an explicit rebuild", () => {
+    const database = new Database(":memory:");
+    runMigrations(database, DEFAULT_MIGRATIONS.slice(0, 16));
+    database.prepare(`
+      INSERT INTO redesign_search_generations(
+        id, adapter_identity, adapter_version, dimensions, input_modalities_json,
+        state, fragment_count, created_at
+      ) VALUES ('old-generation', 'bailian:qwen3-vl-embedding:dimension-1024', 1, 1024, '["text","image"]',
+        'active', 0, '2026-09-19T00:00:00.000Z')
+    `).run();
+    runMigrations(database);
+    expect(database.prepare(
+      "SELECT normalization FROM redesign_search_generations WHERE id = 'old-generation'"
+    ).get()).toEqual({ normalization: "none" });
+    database.close();
+  });
+
+  it("upgrades existing record attachments to source-revision associations", () => {
+    const database = new Database(":memory:");
+    runMigrations(database, DEFAULT_MIGRATIONS.slice(0, 17));
+    database.prepare(`
+      INSERT INTO redesign_records(
+        id, origin, categories_json, title, summary, revision, occurred_at_json, recorded_at,
+        report_state, source_updated, created_at, updated_at
+      ) VALUES ('record-upgrade', 'manual', '["rights"]', '旧记录', '旧摘要', 1,
+        '{"kind":"unknown","prompt":"待补充"}', '2026-09-01T00:00:00.000Z',
+        'queued', 0, '2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z')
+    `).run();
+    database.prepare(`
+      INSERT INTO redesign_sources(
+        id, record_id, origin, source_version, content_hash, text, recorded_at, created_at
+      ) VALUES ('source-upgrade', 'record-upgrade', 'manual', 'source-v1', ?, '原文',
+        '2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z')
+    `).run("a".repeat(64));
+    database.prepare(`
+      INSERT INTO assets(
+        id, sha256, byte_size, mime_type, original_file_name, vault_format, integrity_status,
+        verified_at, availability_status, superseded_by_asset_id, deleted_at, created_at
+      ) VALUES ('asset-upgrade', ?, 8, 'image/png', 'old.png', 2, 'verified',
+        '2026-09-01T00:00:00.000Z', 'available', NULL, NULL, '2026-09-01T00:00:00.000Z')
+    `).run("b".repeat(64));
+    database.prepare(
+      "INSERT INTO redesign_record_assets(record_id, asset_id) VALUES ('record-upgrade', 'asset-upgrade')"
+    ).run();
+
+    runMigrations(database);
+    expect(database.prepare(
+      "SELECT record_id, source_id, asset_id FROM redesign_record_assets"
+    ).get()).toEqual({ record_id: "record-upgrade", source_id: "source-upgrade", asset_id: "asset-upgrade" });
+    database.close();
+  });
+
+  it("deduplicates pre-idempotency reports before adding the unique key", () => {
+    const database = new Database(":memory:");
+    runMigrations(database, DEFAULT_MIGRATIONS.slice(0, 18));
+    database.prepare(`
+      INSERT INTO redesign_records(
+        id, origin, categories_json, title, summary, revision, occurred_at_json, recorded_at,
+        report_state, source_updated, created_at, updated_at
+      ) VALUES ('record-report-upgrade', 'manual', '["rights"]', '旧记录', '旧摘要', 1,
+        '{"kind":"unknown","prompt":"待补充"}', '2026-09-01T00:00:00.000Z',
+        'complete', 0, '2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z')
+    `).run();
+    const insert = database.prepare(`
+      INSERT INTO redesign_reports(
+        id, record_id, record_revision, input_hash, prompt_version, model_profile,
+        content_json, state, error_code, created_at, updated_at
+      ) VALUES (?, 'record-report-upgrade', 1, ?, 'report-v1', 'test:model',
+        '{"summary":"报告"}', 'complete', NULL, ?, ?)
+    `);
+    insert.run("report-old", "c".repeat(64), "2026-09-01T00:00:00.000Z", "2026-09-01T00:00:00.000Z");
+    insert.run("report-new", "c".repeat(64), "2026-09-01T00:01:00.000Z", "2026-09-01T00:01:00.000Z");
+
+    runMigrations(database);
+    expect(database.prepare("SELECT id FROM redesign_reports").all()).toEqual([{ id: "report-new" }]);
+    expect(() => insert.run(
+      "report-duplicate", "c".repeat(64), "2026-09-01T00:02:00.000Z", "2026-09-01T00:02:00.000Z"
+    )).toThrow(/UNIQUE/);
+    const insertRun = database.prepare(`
+      INSERT INTO redesign_reports(
+        id, record_id, record_revision, input_hash, prompt_version, model_profile,
+        content_json, state, created_at, updated_at, analysis_run_id
+      ) VALUES (?, 'record-report-upgrade', 1, ?, 'report-v1', 'test:model',
+        '{"summary":"重跑报告"}', 'complete', '2026-09-01T00:03:00.000Z', '2026-09-01T00:03:00.000Z', ?)
+    `);
+    insertRun.run("report-rerun", "c".repeat(64), "job-rerun");
+    expect(database.prepare("SELECT id, analysis_run_id FROM redesign_reports ORDER BY rowid").all())
+      .toEqual([{ id: "report-new", analysis_run_id: null }, { id: "report-rerun", analysis_run_id: "job-rerun" }]);
+    expect(() => insertRun.run("report-duplicate-run", "c".repeat(64), "job-rerun")).toThrow(/UNIQUE/);
     database.close();
   });
 
@@ -330,6 +561,25 @@ describe("SQLite foundation", () => {
     database.close();
   });
 
+  it("leaves queued and expired legacy jobs untouched when claiming only redesigned job types", () => {
+    const database = new Database(":memory:");
+    runMigrations(database);
+    const jobs = new SqliteJobRepository(database);
+    const oldRunning = jobs.enqueue("dayone.import", {}, "2026-01-01T00:00:00.000Z");
+    jobs.claimNext("2026-01-01T00:00:00.000Z", "2026-01-01T00:00:30.000Z");
+    const oldQueued = jobs.enqueue("media.process", {}, "2026-01-01T00:00:00.000Z");
+    const current = jobs.enqueue("record.analyze", {}, "2026-01-01T00:00:00.000Z");
+    expect(jobs.claimNext("2026-01-01T00:00:31.000Z", "2026-01-01T00:01:01.000Z", [])).toBeUndefined();
+    expect(jobs.claimNext("2026-01-01T00:00:31.000Z", "2026-01-01T00:01:01.000Z", ["record.analyze"])?.id)
+      .toBe(current.id);
+    expect(jobs.list().find(({ id }) => id === oldQueued.id)).toMatchObject({ state: "queued", attempts: 0 });
+    expect(jobs.list().find(({ id }) => id === oldRunning.id)).toMatchObject({ state: "running", attempts: 1 });
+    expect(database.prepare("SELECT outcome FROM job_attempts WHERE job_id = ?").get(oldRunning.id))
+      .toEqual({ outcome: null });
+    expect(jobs.claimNext("2026-01-01T00:00:31.000Z", "2026-01-01T00:01:01.000Z")?.id).toBe(oldRunning.id);
+    database.close();
+  });
+
   it("allows a failed job to start a new manual retry cycle without reusing attempt numbers", () => {
     const database = new Database(":memory:");
     runMigrations(database);
@@ -339,7 +589,7 @@ describe("SQLite foundation", () => {
     jobs.fail(queued.id, "failed", "2026-01-01T00:00:01.000Z");
     const retried = jobs.retry(queued.id, "2026-01-01T00:00:02.000Z");
     expect(retried.attempts).toBe(1);
-    expect(retried.maxAttempts).toBe(4);
+    expect(retried.maxAttempts).toBe(5);
     expect(jobs.claimNext("2026-01-01T00:00:02.000Z", "2026-01-01T00:00:32.000Z")?.attempts).toBe(2);
     database.close();
   });

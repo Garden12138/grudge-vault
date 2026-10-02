@@ -1,7 +1,23 @@
 import { z } from "zod";
+import type { LlmSettings } from "@grudge-vault/domain";
 
-export const llmProviderSchema = z.enum(["nvidia", "openrouter", "bailian"]);
+export const llmProviderSchema = z.enum(["bailian", "minimax"]);
 export const bailianRegionSchema = z.enum(["cn-beijing", "ap-southeast-1", "us-east-1", "cn-hongkong"]);
+
+/** Legacy provider configuration stays in the workspace for rollback, but is not active in the redesigned UI. */
+export function redesignLlmSettings(settings: LlmSettings): LlmSettings {
+  const candidate = settings.activeProvider === "bailian" || settings.activeProvider === "minimax"
+    ? settings.activeProvider : undefined;
+  const activeConfig = candidate ? settings.providers[candidate] : undefined;
+  const activeProvider = activeConfig?.status === "ready" && activeConfig.credentialConfigured ? candidate : undefined;
+  return {
+    providers: {
+      ...(settings.providers.bailian ? { bailian: settings.providers.bailian } : {}),
+      ...(settings.providers.minimax ? { minimax: settings.providers.minimax } : {})
+    },
+    ...(activeProvider ? { activeProvider } : {})
+  };
+}
 
 function validateRegion(
   value: {
@@ -36,5 +52,6 @@ export const llmListModelsSchema = z.object({
   provider: llmProviderSchema,
   region: bailianRegionSchema.optional(),
   workspaceId: workspaceIdSchema,
-  apiKey: z.string().trim().min(1).max(10_000).optional()
+  apiKey: z.string().trim().min(1).max(10_000).optional(),
+  recommendationsOnly: z.boolean().optional()
 }).strict().superRefine(validateRegion);

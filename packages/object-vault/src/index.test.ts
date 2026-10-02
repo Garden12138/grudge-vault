@@ -38,6 +38,37 @@ describe("EncryptedObjectVault", () => {
     }
   });
 
+  it("does not remove a partial object while another write is in progress", async () => {
+    const root = await mkdtemp(join(tmpdir(), "grudge-vault-concurrent-object-"));
+    const vault = new EncryptedObjectVault(join(root, "vault"));
+    const key = randomBytes(32);
+    let releaseFirst!: () => void;
+    let firstChunkConsumed!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const started = new Promise<void>((resolve) => { firstChunkConsumed = resolve; });
+    const firstContent = Buffer.from("first object written across two chunks");
+    const secondContent = Buffer.from("second object");
+    const slowInput = Readable.from((async function* () {
+      yield firstContent.subarray(0, 12);
+      firstChunkConsumed();
+      await gate;
+      yield firstContent.subarray(12);
+    })());
+    const firstWrite = vault.putStream(slowInput, key);
+    try {
+      await started;
+      const second = await vault.putStream(Readable.from(secondContent), key);
+      expect(await vault.verify(second.sha256, key)).toBe(true);
+      releaseFirst();
+      const first = await firstWrite;
+      expect(await readAll(await vault.open(first.sha256, key))).toEqual(firstContent);
+    } finally {
+      releaseFirst();
+      await firstWrite.catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("detects authenticated ciphertext tampering", async () => {
     const root = await mkdtemp(join(tmpdir(), "grudge-vault-tamper-"));
     try {

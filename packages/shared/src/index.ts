@@ -1,5 +1,6 @@
 import type {
   Asset,
+  NativeMediaProgress,
   AgentAction,
   AgentDataCategory,
   AgentExecutionMode,
@@ -61,7 +62,17 @@ import type {
   WorkspaceSecuritySettings,
   RecoveryPackageSummary,
   LegalVerificationResult
+  , PreparedIntake, ScreenAndSaveResult, ScreenedZipImportSummary, ScreenedZipImportProgress, ScreenedZipImportReceipt, LegacyMigrationSummary, PendingReview, TimelineFilter, TimelinePage,
+  EventRecordDetail, FieldOverride, PreparedSearchQuery, RecordSearchIndexStatus, RecordSearchQuery, RecordSearchPage
 } from "@grudge-vault/domain";
+
+export { codePointLength, RECORD_QUERY_TEXT_LIMIT, RECORD_TEXT_LIMIT } from "./text-limits";
+export { findCaseInsensitiveTextRange } from "./text-anchors";
+export { reportContentSearchText } from "./report-search-text";
+export { calendarDateDay, projectRecordDate, recordDateMatches, recordTimeZone, resolveRecordDateFilter } from "./record-dates";
+export type { RecordDateFilter, RecordDateProjection } from "./record-dates";
+export { projectRecordOccurrence } from "./record-occurrence";
+export type { RecordOccurrenceProjection } from "./record-occurrence";
 
 export const APP_ERROR_CODES = [
   "NO_ACTIVE_WORKSPACE",
@@ -69,6 +80,7 @@ export const APP_ERROR_CODES = [
   "WORKSPACE_EXISTS",
   "WORKSPACE_KEY_UNAVAILABLE",
   "WORKSPACE_LOCKED",
+  "WORKSPACE_MIGRATION_REQUIRED",
   "RECOVERY_PACKAGE_INVALID",
   "CRYPTO_MIGRATION_CONFLICT",
   "INSECURE_KEY_BACKEND",
@@ -89,6 +101,7 @@ export const APP_ERROR_CODES = [
   "BACKUP_EXISTS",
   "IMPORT_INVALID_ARCHIVE",
   "IMPORT_LIMIT_EXCEEDED",
+  "IMPORT_CANCELLED",
   "IMPORT_RUN_STATE_CONFLICT",
   "BACKFILL_STATE_CONFLICT",
   "CANDIDATE_STATE_CONFLICT",
@@ -109,6 +122,16 @@ export const APP_ERROR_CODES = [
   "LLM_TOOL_UNSUPPORTED",
   "LLM_RATE_LIMITED",
   "LLM_REGION_MISMATCH",
+  "LLM_CONFIGURATION_CHANGED",
+  "MODEL_NOT_CONFIGURED",
+  "MODALITY_UNAVAILABLE",
+  "SOURCE_UNAVAILABLE",
+  "SOURCE_VERSION_CHANGED",
+  "INVALID_INPUT",
+  "SCREENING_FAILED",
+  "WRITE_FAILED",
+  "REVISION_CONFLICT",
+  "CLEANUP_FAILED",
   "AGENT_TOOL_FAILED",
   "JOB_NOT_RETRYABLE",
   "JOB_STATE_CONFLICT",
@@ -192,6 +215,7 @@ export interface AssetPreview {
   fileName: string;
   mimeType: string;
   bytes: Uint8Array;
+  representation?: "converted-image";
 }
 
 export interface BackupSummary {
@@ -283,6 +307,8 @@ export interface LlmListModelsInput {
   region?: BailianRegion;
   workspaceId?: string;
   apiKey?: string;
+  /** Return built-in candidates without reading credentials or contacting a provider. */
+  recommendationsOnly?: boolean;
 }
 
 export type CaseWriteFields = Omit<Case, "id" | "currentRevision" | "createdAt" | "updatedAt">;
@@ -315,9 +341,32 @@ export interface RecoveryImportInput {
   passphrase: string;
 }
 
+export interface PrepareIntakeInput {
+  requestId: string;
+  text: string;
+  files: File[];
+}
+
+export interface AssetMediaPreview {
+  requestId: string;
+  assetId: string;
+  url: string;
+  mimeType: string;
+  byteSize: number;
+}
+
+export interface PatchRecordFieldsInput {
+  recordId: string;
+  expectedRevision: number;
+  patch: Partial<Record<FieldOverride["fieldKey"], unknown>>;
+}
+
 export type LocalProcessorPathKind = "tesseract" | "poppler" | "ffmpeg" | "whisper" | "whisper_model";
 
 export interface GrudgeVaultApi {
+  external: {
+    open(url: string): Promise<IpcResult<boolean>>;
+  };
   workspace: {
     current(): Promise<IpcResult<Workspace | null>>;
     status(): Promise<IpcResult<WorkspaceLockState>>;
@@ -357,7 +406,49 @@ export interface GrudgeVaultApi {
     save(input: LlmConnectInput): Promise<IpcResult<LlmSettings>>;
     connect(input: LlmConnectInput): Promise<IpcResult<LlmSettings>>;
     activate(provider: LlmProvider): Promise<IpcResult<LlmSettings>>;
+    pause(): Promise<IpcResult<LlmSettings>>;
     disconnect(provider: LlmProvider): Promise<IpcResult<LlmSettings>>;
+  };
+  intake: {
+    onMediaProgress(callback: (value: NativeMediaProgress & { sessionId: string }) => void): () => void;
+    prepare(input: PrepareIntakeInput): Promise<IpcResult<PreparedIntake>>;
+    abandonPreparation(requestId: string): Promise<IpcResult<void>>;
+    abandon(sessionId: string): Promise<IpcResult<void>>;
+    screenAndSave(sessionId: string, operationId: string): Promise<IpcResult<ScreenAndSaveResult>>;
+    chooseDayOneZip(): Promise<IpcResult<ScreenedZipImportSummary | null>>;
+    dayOneImportProgress(): Promise<IpcResult<ScreenedZipImportProgress | null>>;
+    lastDayOneImportReceipt(): Promise<IpcResult<ScreenedZipImportReceipt | null>>;
+    pauseDayOneZip(operationId: string): Promise<IpcResult<boolean>>;
+    resumeDayOneZip(operationId: string): Promise<IpcResult<boolean>>;
+    cancelDayOneZip(): Promise<IpcResult<boolean>>;
+    chooseLegacyWorkspace(): Promise<IpcResult<LegacyMigrationSummary | null>>;
+    cancelLegacyWorkspace(): Promise<IpcResult<boolean>>;
+  };
+  records: {
+    onSearchMediaProgress(callback: (value: NativeMediaProgress & { sessionId: string }) => void): () => void;
+    timeline(filter: TimelineFilter): Promise<IpcResult<TimelinePage>>;
+    get(id: string): Promise<IpcResult<EventRecordDetail>>;
+    patchFields(input: PatchRecordFieldsInput): Promise<IpcResult<EventRecordDetail>>;
+    reanalyze(id: string, expectedRevision: number): Promise<IpcResult<string>>;
+    search(query: RecordSearchQuery): Promise<IpcResult<RecordSearchPage>>;
+    prepareSearch(input: { requestId: string; text: string; files: File[] }): Promise<IpcResult<PreparedSearchQuery>>;
+    abandonSearchPreparation(requestId: string): Promise<IpcResult<void>>;
+    executeSearch(sessionId: string, filters: Omit<RecordSearchQuery, "text">): Promise<IpcResult<RecordSearchPage>>;
+    abandonSearch(sessionId: string): Promise<IpcResult<void>>;
+    searchIndexStatus(): Promise<IpcResult<RecordSearchIndexStatus>>;
+    rebuildSearchIndex(): Promise<IpcResult<RecordSearchIndexStatus>>;
+    setSearchIndexEnabled(enabled: boolean): Promise<IpcResult<RecordSearchIndexStatus>>;
+  };
+  pending: {
+    list(): Promise<IpcResult<PendingReview[]>>;
+    resolve(id: string, action: "keep" | "ignore", operationId: string): Promise<IpcResult<ScreenAndSaveResult | null>>;
+    rescreenManual(id: string, sessionId: string): Promise<IpcResult<ScreenAndSaveResult>>;
+    chooseDayOneZip(id: string, operationId: string): Promise<IpcResult<ScreenAndSaveResult | null>>;
+    chooseLegacyWorkspace(id: string, operationId: string): Promise<IpcResult<ScreenAndSaveResult | null>>;
+  };
+  legal: {
+    getDefaultJurisdiction(): Promise<IpcResult<string>>;
+    setDefaultJurisdiction(jurisdiction: string): Promise<IpcResult<string>>;
   };
   events: {
     search(query: EventSearchQuery): Promise<IpcResult<Event[]>>;
@@ -430,6 +521,8 @@ export interface GrudgeVaultApi {
     list(): Promise<IpcResult<Asset[]>>;
     verify(assetId: string): Promise<IpcResult<Job>>;
     preview(assetId: string): Promise<IpcResult<AssetPreview>>;
+    openMediaPreview(input: { requestId: string; assetId: string }): Promise<IpcResult<AssetMediaPreview>>;
+    closeMediaPreview(requestId: string): Promise<IpcResult<boolean>>;
     exportCopy(assetId: string): Promise<IpcResult<string | null>>;
   };
   evidence: {

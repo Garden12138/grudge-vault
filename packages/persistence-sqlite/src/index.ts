@@ -4,7 +4,7 @@ import { dirname } from "node:path";
 import Database from "better-sqlite3";
 import type {
   AgentCredentialEnvelope, AgentRepositoryPort, AssetRepositoryPort, DayOneRepositoryPort, EventCommitExtras,
-  JobRepositoryPort, MemoryRepositoryPort, NormalizedDayOneEntry
+  JobRepositoryPort, MemoryRepositoryPort, NormalizedDayOneEntry, VaultKey
 } from "@grudge-vault/application";
 import type {
   AgentAction, AgentExecutionMode, AgentModelCallAudit, AgentModelSettings, AgentRun, AgentToolCall, Asset, BackfillRun,
@@ -20,6 +20,8 @@ import { SqlitePhaseSixRepository } from "./phase6";
 
 export { SqlitePhaseFiveRepository } from "./phase5";
 export { SqlitePhaseSixRepository } from "./phase6";
+export { SqliteRecordRepository } from "./redesign";
+import { SqliteRecordRepository } from "./redesign";
 
 export interface Migration {
   version: number;
@@ -945,6 +947,455 @@ export const DEFAULT_MIGRATIONS: readonly Migration[] = [
     version: 9,
     name: "bailian-workspace-catalog",
     sql: `ALTER TABLE llm_provider_settings ADD COLUMN workspace_id TEXT;`
+  },
+  {
+    version: 10,
+    name: "minimax-provider",
+    sql: `
+      CREATE TABLE llm_settings_v10 (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        active_provider TEXT CHECK(active_provider IS NULL OR active_provider IN ('nvidia', 'openrouter', 'bailian', 'minimax')),
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      INSERT INTO llm_settings_v10 SELECT * FROM llm_settings;
+      DROP TABLE llm_settings;
+      ALTER TABLE llm_settings_v10 RENAME TO llm_settings;
+
+      CREATE TABLE llm_provider_settings_v10 (
+        provider TEXT PRIMARY KEY CHECK(provider IN ('nvidia', 'openrouter', 'bailian', 'minimax')),
+        model TEXT NOT NULL,
+        region TEXT CHECK(region IS NULL OR region IN ('cn-beijing', 'ap-southeast-1', 'us-east-1', 'cn-hongkong')),
+        status TEXT NOT NULL CHECK(status IN ('not_configured', 'ready', 'needs_attention')),
+        last_tested_at TEXT,
+        updated_at TEXT NOT NULL,
+        workspace_id TEXT
+      ) STRICT;
+      INSERT INTO llm_provider_settings_v10 SELECT * FROM llm_provider_settings;
+      DROP TABLE llm_provider_settings;
+      ALTER TABLE llm_provider_settings_v10 RENAME TO llm_provider_settings;
+
+      CREATE TABLE llm_provider_credentials_v10 (
+        provider TEXT PRIMARY KEY CHECK(provider IN ('nvidia', 'openrouter', 'bailian', 'minimax')),
+        envelope_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      INSERT INTO llm_provider_credentials_v10 SELECT * FROM llm_provider_credentials;
+      DROP TABLE llm_provider_credentials;
+      ALTER TABLE llm_provider_credentials_v10 RENAME TO llm_provider_credentials;
+    `
+  },
+  {
+    version: 11,
+    name: "redesign-record-pipeline",
+    sql: `
+      CREATE TABLE redesign_records (
+        id TEXT PRIMARY KEY,
+        origin TEXT NOT NULL CHECK(origin IN ('manual', 'dayone', 'zip', 'migration')),
+        categories_json TEXT NOT NULL,
+        title TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        occurred_at_json TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        report_state TEXT NOT NULL CHECK(report_state IN ('queued', 'running', 'partial', 'failed', 'complete', 'stale')),
+        source_updated INTEGER NOT NULL DEFAULT 0 CHECK(source_updated IN (0, 1)),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX redesign_records_timeline_idx ON redesign_records(recorded_at DESC, id DESC);
+
+      CREATE TABLE redesign_sources (
+        id TEXT PRIMARY KEY,
+        record_id TEXT NOT NULL REFERENCES redesign_records(id) ON DELETE CASCADE,
+        origin TEXT NOT NULL CHECK(origin IN ('manual', 'dayone', 'zip', 'migration')),
+        connector_id TEXT,
+        journal_id TEXT,
+        entry_id TEXT,
+        source_version TEXT NOT NULL,
+        content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+        text TEXT,
+        recorded_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(connector_id, journal_id, entry_id)
+      ) STRICT;
+      CREATE INDEX redesign_sources_record_idx ON redesign_sources(record_id, created_at DESC);
+
+      CREATE TABLE redesign_record_assets (
+        record_id TEXT NOT NULL REFERENCES redesign_records(id) ON DELETE CASCADE,
+        asset_id TEXT NOT NULL REFERENCES assets(id),
+        PRIMARY KEY(record_id, asset_id)
+      ) STRICT;
+
+      CREATE TABLE redesign_screening_results (
+        record_id TEXT PRIMARY KEY REFERENCES redesign_records(id) ON DELETE CASCADE,
+        decision TEXT NOT NULL CHECK(decision = 'include'),
+        categories_json TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        anchors_json TEXT NOT NULL,
+        coverage TEXT NOT NULL CHECK(coverage IN ('complete', 'partial')),
+        policy_version TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE redesign_pending_reviews (
+        id TEXT PRIMARY KEY,
+        origin TEXT NOT NULL CHECK(origin IN ('manual', 'dayone', 'zip', 'migration')),
+        origin_locator TEXT,
+        source_version TEXT NOT NULL,
+        excerpt TEXT NOT NULL CHECK(length(excerpt) <= 160),
+        reason TEXT NOT NULL CHECK(length(reason) <= 120),
+        categories_json TEXT NOT NULL,
+        coverage TEXT NOT NULL CHECK(coverage IN ('complete', 'partial')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE redesign_operations (
+        operation_id TEXT PRIMARY KEY,
+        result_json TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE redesign_reports (
+        id TEXT PRIMARY KEY,
+        record_id TEXT NOT NULL REFERENCES redesign_records(id) ON DELETE CASCADE,
+        record_revision INTEGER NOT NULL CHECK(record_revision > 0),
+        input_hash TEXT NOT NULL CHECK(length(input_hash) = 64),
+        prompt_version TEXT NOT NULL,
+        model_profile TEXT NOT NULL,
+        content_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('partial', 'failed', 'complete')),
+        error_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX redesign_reports_record_idx ON redesign_reports(record_id, record_revision DESC, updated_at DESC);
+
+      CREATE TABLE redesign_field_overrides (
+        id TEXT PRIMARY KEY,
+        record_id TEXT NOT NULL REFERENCES redesign_records(id) ON DELETE CASCADE,
+        field_key TEXT NOT NULL CHECK(field_key IN ('title', 'occurredAt', 'location', 'jurisdiction')),
+        value_json TEXT NOT NULL,
+        actor TEXT NOT NULL CHECK(actor = 'user'),
+        revision INTEGER NOT NULL CHECK(revision > 1),
+        basis TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(record_id, field_key)
+      ) STRICT;
+
+      CREATE VIRTUAL TABLE redesign_record_fts USING fts5(
+        record_id UNINDEXED,
+        title,
+        source_text,
+        report_text,
+        user_text,
+        tokenize = 'unicode61 remove_diacritics 2'
+      );
+
+      CREATE TABLE redesign_connector_states (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK(kind IN ('dayone', 'zip')),
+        selected_journals_json TEXT NOT NULL,
+        committed_cursor TEXT,
+        scan_boundary TEXT,
+        policy_version TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('idle', 'running', 'paused', 'cancelled', 'failed')),
+        counts_json TEXT NOT NULL,
+        last_success TEXT,
+        next_check TEXT,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+    `
+  },
+  {
+    version: 12,
+    name: "redesign-source-version-history",
+    sql: `
+      CREATE TABLE redesign_sources_v12 (
+        id TEXT PRIMARY KEY,
+        record_id TEXT NOT NULL REFERENCES redesign_records(id) ON DELETE CASCADE,
+        origin TEXT NOT NULL CHECK(origin IN ('manual', 'dayone', 'zip', 'migration')),
+        connector_id TEXT,
+        journal_id TEXT,
+        entry_id TEXT,
+        source_version TEXT NOT NULL,
+        content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+        text TEXT,
+        recorded_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(connector_id, journal_id, entry_id, source_version)
+      ) STRICT;
+      INSERT INTO redesign_sources_v12 SELECT * FROM redesign_sources;
+      DROP TABLE redesign_sources;
+      ALTER TABLE redesign_sources_v12 RENAME TO redesign_sources;
+      CREATE INDEX redesign_sources_record_idx ON redesign_sources(record_id, created_at DESC);
+      CREATE INDEX redesign_sources_locator_idx
+        ON redesign_sources(connector_id, journal_id, entry_id, created_at DESC);
+    `
+  },
+  {
+    version: 13,
+    name: "redesign-record-revision-history",
+    sql: `
+      CREATE TABLE redesign_screening_results_v13 (
+        id TEXT PRIMARY KEY,
+        record_id TEXT NOT NULL REFERENCES redesign_records(id) ON DELETE CASCADE,
+        record_revision INTEGER NOT NULL CHECK(record_revision > 0),
+        decision TEXT NOT NULL CHECK(decision = 'include'),
+        categories_json TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        anchors_json TEXT NOT NULL,
+        coverage TEXT NOT NULL CHECK(coverage IN ('complete', 'partial')),
+        policy_version TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(record_id, record_revision)
+      ) STRICT;
+      INSERT INTO redesign_screening_results_v13(
+        id, record_id, record_revision, decision, categories_json, reason,
+        anchors_json, coverage, policy_version, created_at
+      )
+      SELECT record_id || ':1', record_id, 1, decision, categories_json, reason,
+        anchors_json, coverage, policy_version, created_at
+      FROM redesign_screening_results;
+      DROP TABLE redesign_screening_results;
+      ALTER TABLE redesign_screening_results_v13 RENAME TO redesign_screening_results;
+      CREATE INDEX redesign_screening_results_record_idx
+        ON redesign_screening_results(record_id, record_revision DESC);
+
+      CREATE TABLE redesign_record_revisions (
+        id TEXT PRIMARY KEY,
+        record_id TEXT NOT NULL REFERENCES redesign_records(id) ON DELETE CASCADE,
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        snapshot_json TEXT NOT NULL,
+        actor TEXT NOT NULL CHECK(actor IN ('source', 'user')),
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(record_id, revision)
+      ) STRICT;
+      INSERT INTO redesign_record_revisions(id, record_id, revision, snapshot_json, actor, reason, created_at)
+      SELECT id || ':' || revision, id, revision,
+        json_object(
+          'id', id,
+          'origin', origin,
+          'categories', json(categories_json),
+          'title', title,
+          'summary', summary,
+          'revision', revision,
+          'occurredAt', json(occurred_at_json),
+          'recordedAt', recorded_at,
+          'reportState', report_state,
+          'sourceUpdated', CASE source_updated WHEN 1 THEN json('true') ELSE json('false') END,
+          'attachmentCount', (SELECT count(*) FROM redesign_record_assets ra WHERE ra.record_id = redesign_records.id),
+          'createdAt', created_at,
+          'updatedAt', updated_at
+        ),
+        'source', 'Initial redesigned record', created_at
+      FROM redesign_records;
+    `
+  },
+  {
+    version: 14,
+    name: "redesign-legacy-migration-provenance",
+    sql: `
+      CREATE TABLE redesign_migration_map (
+        source_workspace_id TEXT NOT NULL,
+        legacy_entity_id TEXT NOT NULL,
+        record_id TEXT NOT NULL REFERENCES redesign_records(id) ON DELETE CASCADE,
+        revision_count INTEGER NOT NULL CHECK(revision_count >= 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(source_workspace_id, legacy_entity_id)
+      ) STRICT;
+      CREATE INDEX redesign_migration_map_record_idx ON redesign_migration_map(record_id);
+
+      CREATE TABLE redesign_legacy_revisions (
+        id TEXT PRIMARY KEY,
+        record_id TEXT NOT NULL REFERENCES redesign_records(id) ON DELETE CASCADE,
+        source_workspace_id TEXT NOT NULL,
+        legacy_entity_id TEXT NOT NULL,
+        legacy_revision INTEGER NOT NULL CHECK(legacy_revision > 0),
+        snapshot_json TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(source_workspace_id, legacy_entity_id, legacy_revision)
+      ) STRICT;
+      CREATE INDEX redesign_legacy_revisions_record_idx
+        ON redesign_legacy_revisions(record_id, legacy_revision);
+    `
+  },
+  {
+    version: 15,
+    name: "llm-verified-task-capabilities",
+    sql: `
+      ALTER TABLE llm_provider_settings ADD COLUMN capabilities_json TEXT;
+    `
+  },
+  {
+    version: 16,
+    name: "redesign-multimodal-search-index",
+    sql: `
+      CREATE TABLE redesign_search_generations (
+        id TEXT PRIMARY KEY,
+        adapter_identity TEXT NOT NULL,
+        adapter_version INTEGER NOT NULL CHECK(adapter_version > 0),
+        dimensions INTEGER NOT NULL CHECK(dimensions > 0),
+        input_modalities_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('building','active','superseded','failed')),
+        fragment_count INTEGER NOT NULL CHECK(fragment_count >= 0),
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        activated_at TEXT
+      ) STRICT;
+      CREATE INDEX redesign_search_generations_state_idx
+        ON redesign_search_generations(state, created_at DESC);
+
+      CREATE TABLE redesign_search_embeddings (
+        generation_id TEXT NOT NULL REFERENCES redesign_search_generations(id) ON DELETE CASCADE,
+        fragment_id TEXT NOT NULL,
+        record_id TEXT NOT NULL REFERENCES redesign_records(id) ON DELETE CASCADE,
+        record_revision INTEGER NOT NULL CHECK(record_revision > 0),
+        source_version TEXT NOT NULL,
+        modality TEXT NOT NULL CHECK(modality IN ('text','image','audio','video')),
+        content_hash TEXT NOT NULL,
+        text_content TEXT,
+        asset_id TEXT REFERENCES assets(id) ON DELETE CASCADE,
+        anchor_json TEXT NOT NULL,
+        vector BLOB NOT NULL,
+        PRIMARY KEY(generation_id, fragment_id)
+      ) STRICT;
+      CREATE INDEX redesign_search_embeddings_record_idx
+        ON redesign_search_embeddings(generation_id, record_id);
+    `
+  },
+  {
+    version: 17,
+    name: "redesign-search-normalization",
+    sql: `
+      ALTER TABLE redesign_search_generations
+      ADD COLUMN normalization TEXT NOT NULL DEFAULT 'none' CHECK(normalization IN ('none','l2'));
+    `
+  },
+  {
+    version: 18,
+    name: "redesign-source-asset-revisions",
+    sql: `
+      CREATE TABLE redesign_record_assets_v18 (
+        record_id TEXT NOT NULL REFERENCES redesign_records(id) ON DELETE CASCADE,
+        source_id TEXT NOT NULL REFERENCES redesign_sources(id) ON DELETE CASCADE,
+        asset_id TEXT NOT NULL REFERENCES assets(id),
+        PRIMARY KEY(source_id, asset_id)
+      ) STRICT;
+      INSERT INTO redesign_record_assets_v18(record_id, source_id, asset_id)
+      SELECT ra.record_id,
+        (SELECT s.id FROM redesign_sources s WHERE s.record_id = ra.record_id
+          ORDER BY s.created_at DESC, s.rowid DESC LIMIT 1),
+        ra.asset_id
+      FROM redesign_record_assets ra
+      WHERE EXISTS (SELECT 1 FROM redesign_sources s WHERE s.record_id = ra.record_id);
+      DROP TABLE redesign_record_assets;
+      ALTER TABLE redesign_record_assets_v18 RENAME TO redesign_record_assets;
+      CREATE INDEX redesign_record_assets_record_idx ON redesign_record_assets(record_id, source_id);
+    `
+  },
+  {
+    version: 19,
+    name: "redesign-report-idempotency",
+    sql: `
+      DELETE FROM redesign_reports
+      WHERE rowid NOT IN (
+        SELECT max(rowid) FROM redesign_reports
+        GROUP BY record_id, record_revision, input_hash, prompt_version, model_profile
+      );
+      CREATE UNIQUE INDEX redesign_reports_idempotency_idx
+        ON redesign_reports(record_id, record_revision, input_hash, prompt_version, model_profile);
+    `
+  },
+  {
+    version: 20,
+    name: "redesign-unretained-source-review",
+    sql: `
+      ALTER TABLE redesign_records ADD COLUMN source_review_required INTEGER NOT NULL DEFAULT 0
+        CHECK(source_review_required IN (0, 1));
+      UPDATE redesign_records SET source_review_required = 1, source_updated = 1
+      WHERE EXISTS (
+        SELECT 1 FROM redesign_record_revisions skipped
+        WHERE skipped.record_id = redesign_records.id
+          AND skipped.reason = '来源出现未收录的新版本'
+          AND skipped.revision > COALESCE((
+            SELECT MAX(retained.revision) FROM redesign_record_revisions retained
+            WHERE retained.record_id = redesign_records.id
+              AND retained.reason = '来源版本更新并重新收录'
+          ), 0)
+      );
+    `
+  },
+  {
+    version: 21,
+    name: "redesign-sealed-pending-reviews",
+    sql: `
+      ALTER TABLE redesign_pending_reviews ADD COLUMN sealed_payload TEXT;
+      CREATE TABLE redesign_pending_seal_state (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        cleanup_required INTEGER NOT NULL CHECK(cleanup_required IN (0, 1))
+      ) STRICT;
+      INSERT INTO redesign_pending_seal_state(id, cleanup_required) VALUES (1, 0);
+    `
+  },
+  {
+    version: 22,
+    name: "redesign-report-analysis-runs",
+    sql: `
+      ALTER TABLE redesign_reports ADD COLUMN analysis_run_id TEXT;
+      DROP INDEX redesign_reports_idempotency_idx;
+      CREATE UNIQUE INDEX redesign_reports_legacy_idempotency_idx
+        ON redesign_reports(record_id, record_revision, input_hash, prompt_version, model_profile)
+        WHERE analysis_run_id IS NULL;
+      CREATE UNIQUE INDEX redesign_reports_run_id_idx
+        ON redesign_reports(analysis_run_id) WHERE analysis_run_id IS NOT NULL;
+    `
+  },
+  {
+    version: 23,
+    name: "redesign-report-clarifications",
+    sql: `
+      CREATE TABLE redesign_field_overrides_v23 (
+        id TEXT PRIMARY KEY,
+        record_id TEXT NOT NULL REFERENCES redesign_records(id) ON DELETE CASCADE,
+        field_key TEXT NOT NULL CHECK(field_key IN ('title', 'occurredAt', 'location', 'jurisdiction', 'clarifications')),
+        value_json TEXT NOT NULL,
+        actor TEXT NOT NULL CHECK(actor = 'user'),
+        revision INTEGER NOT NULL CHECK(revision > 1),
+        basis TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(record_id, field_key)
+      ) STRICT;
+      INSERT INTO redesign_field_overrides_v23
+        (id, record_id, field_key, value_json, actor, revision, basis, created_at, updated_at)
+      SELECT id, record_id, field_key, value_json, actor, revision, basis, created_at, updated_at
+      FROM redesign_field_overrides;
+      DROP TABLE redesign_field_overrides;
+      ALTER TABLE redesign_field_overrides_v23 RENAME TO redesign_field_overrides;
+    `
+  },
+  {
+    version: 24,
+    name: "redesign-sanitize-failure-diagnostics",
+    sql: `
+      UPDATE redesign_search_generations
+      SET last_error = 'INTERNAL_ERROR' WHERE last_error IS NOT NULL;
+      UPDATE jobs
+      SET last_error = 'INTERNAL_ERROR'
+      WHERE type IN ('record.analyze', 'record.search-index-rebuild') AND last_error IS NOT NULL;
+      UPDATE job_attempts
+      SET error = 'INTERNAL_ERROR'
+      WHERE error IS NOT NULL AND job_id IN (
+        SELECT id FROM jobs WHERE type IN ('record.analyze', 'record.search-index-rebuild')
+      );
+    `
   }
 ];
 
@@ -1045,6 +1496,11 @@ export class SqliteAssetRepository implements AssetRepositoryPort {
     return row ? mapAsset(row) : undefined;
   }
 
+  findBySha256(sha256: string): Asset | undefined {
+    const row = this.database.prepare("SELECT * FROM assets WHERE sha256 = ?").get(sha256) as Record<string, unknown> | undefined;
+    return row ? mapAsset(row) : undefined;
+  }
+
   upsert(asset: Asset): { asset: Asset; deduplicated: boolean } {
     return this.database.transaction(() => {
       const existing = this.database.prepare("SELECT * FROM assets WHERE sha256 = ?").get(asset.sha256) as Record<string, unknown> | undefined;
@@ -1094,15 +1550,18 @@ export class SqliteJobRepository implements JobRepositoryPort {
     return this.getRequired(id);
   }
 
-  claimNext(now: string, leaseUntil: string): Job | undefined {
+  claimNext(now: string, leaseUntil: string, allowedTypes?: readonly string[]): Job | undefined {
+    if (allowedTypes?.length === 0) return undefined;
+    const typeFilter = allowedTypes ? `AND type IN (${allowedTypes.map(() => "?").join(",")})` : "";
     return this.database.transaction(() => {
       const row = this.database.prepare(`
         SELECT * FROM jobs
-        WHERE (state = 'queued' AND available_at <= ?)
-           OR (state = 'running' AND lease_until IS NOT NULL AND lease_until <= ?)
+        WHERE ((state = 'queued' AND available_at <= ?)
+           OR (state = 'running' AND lease_until IS NOT NULL AND lease_until <= ?))
+          ${typeFilter}
         ORDER BY CASE state WHEN 'running' THEN 0 ELSE 1 END, available_at, created_at
         LIMIT 1
-      `).get(now, now) as Record<string, unknown> | undefined;
+      `).get(now, now, ...(allowedTypes ?? [])) as Record<string, unknown> | undefined;
       if (!row) return undefined;
       const id = String(row.id);
       if (row.state === "running") {
@@ -1175,7 +1634,7 @@ export class SqliteJobRepository implements JobRepositoryPort {
       throw new AppError("JOB_NOT_RETRYABLE", "Only failed jobs can be retried.");
     }
     this.database.prepare(`
-      UPDATE jobs SET state = 'queued', progress = 0, max_attempts = attempts + 3,
+      UPDATE jobs SET state = 'queued', progress = 0, max_attempts = attempts + 4,
         available_at = ?, lease_until = NULL, last_error = NULL, updated_at = ?
       WHERE id = ?
     `).run(now, now, id);
@@ -2012,10 +2471,12 @@ export class SqliteMemoryRepository implements MemoryRepositoryPort {
   }
 
   setSetting(key: string, value: unknown, now: string): void {
-    this.database.prepare(`
-      INSERT INTO workspace_settings(key, value_json, updated_at) VALUES (?, ?, ?)
-      ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
-    `).run(key, JSON.stringify(value), now);
+    this.database.transaction(() => {
+      this.database.prepare(`
+        INSERT INTO workspace_settings(key, value_json, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+      `).run(key, JSON.stringify(value), now);
+    })();
   }
 
   listEmbeddingGenerations(): EmbeddingGeneration[] {
@@ -2768,6 +3229,10 @@ export class SqliteAgentRepository implements AgentRepositoryPort {
     `).run(mode, JSON.stringify(envelope), now);
   }
 
+  withLlmConfigurationTransaction(write: () => LlmSettings): LlmSettings {
+    return this.database.transaction(write)();
+  }
+
   getLlmSettings(): LlmSettings | undefined {
     const row = this.database.prepare("SELECT active_provider FROM llm_settings WHERE singleton = 1")
       .get() as { active_provider: string | null } | undefined;
@@ -2782,7 +3247,8 @@ export class SqliteAgentRepository implements AgentRepositoryPort {
         credentialConfigured: Boolean(this.getLlmCredential(provider)),
         ...(config.region ? { region: String(config.region) as NonNullable<LlmProviderConfig["region"]> } : {}),
         ...(config.workspace_id ? { workspaceId: String(config.workspace_id) } : {}),
-        ...(config.last_tested_at ? { lastTestedAt: String(config.last_tested_at) } : {})
+        ...(config.last_tested_at ? { lastTestedAt: String(config.last_tested_at) } : {}),
+        ...(config.capabilities_json ? { capabilities: JSON.parse(String(config.capabilities_json)) as NonNullable<LlmProviderConfig["capabilities"]> } : {})
       };
     }
     return { ...(row.active_provider ? { activeProvider: row.active_provider as LlmProvider } : {}), providers };
@@ -2805,19 +3271,21 @@ export class SqliteAgentRepository implements AgentRepositoryPort {
       credentialConfigured: Boolean(this.getLlmCredential(provider)),
       ...(row.region ? { region: String(row.region) as NonNullable<LlmProviderConfig["region"]> } : {}),
       ...(row.workspace_id ? { workspaceId: String(row.workspace_id) } : {}),
-      ...(row.last_tested_at ? { lastTestedAt: String(row.last_tested_at) } : {})
+      ...(row.last_tested_at ? { lastTestedAt: String(row.last_tested_at) } : {}),
+      ...(row.capabilities_json ? { capabilities: JSON.parse(String(row.capabilities_json)) as NonNullable<LlmProviderConfig["capabilities"]> } : {})
     };
   }
 
   saveLlmProviderConfig(config: LlmProviderConfig, now: string): void {
     this.database.prepare(`
-      INSERT INTO llm_provider_settings(provider, model, region, workspace_id, status, last_tested_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO llm_provider_settings(provider, model, region, workspace_id, status, last_tested_at, capabilities_json, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(provider) DO UPDATE SET model = excluded.model, region = excluded.region,
         workspace_id = excluded.workspace_id, status = excluded.status,
-        last_tested_at = excluded.last_tested_at, updated_at = excluded.updated_at
+        last_tested_at = excluded.last_tested_at, capabilities_json = excluded.capabilities_json,
+        updated_at = excluded.updated_at
     `).run(config.provider, config.model, config.region ?? null, config.workspaceId ?? null,
-      config.status, config.lastTestedAt ?? null, now);
+      config.status, config.lastTestedAt ?? null, config.capabilities ? JSON.stringify(config.capabilities) : null, now);
   }
 
   deleteLlmProviderConfig(provider: LlmProvider): void {
@@ -2850,8 +3318,9 @@ export class SqliteWorkspaceDatabase {
   readonly agents: SqliteAgentRepository;
   readonly phase5: SqlitePhaseFiveRepository;
   readonly phase6: SqlitePhaseSixRepository;
+  readonly records: SqliteRecordRepository;
 
-  constructor(readonly database: Database.Database) {
+  constructor(readonly database: Database.Database, pendingKey: () => VaultKey) {
     this.assets = new SqliteAssetRepository(database);
     this.jobs = new SqliteJobRepository(database);
     this.memory = new SqliteMemoryRepository(database);
@@ -2859,6 +3328,7 @@ export class SqliteWorkspaceDatabase {
     this.agents = new SqliteAgentRepository(database);
     this.phase5 = new SqlitePhaseFiveRepository(database, this.memory);
     this.phase6 = new SqlitePhaseSixRepository(database, this.memory);
+    this.records = new SqliteRecordRepository(database, pendingKey);
   }
 
   ensureWorkspace(workspace: Workspace): void {

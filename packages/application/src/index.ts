@@ -1,7 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { lstat, mkdir, mkdtemp, rename, rm, unlink } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import { lstat, mkdir, mkdtemp, realpath, rename, rm, unlink } from "node:fs/promises";
+import { basename, dirname, extname, isAbsolute, join, relative, sep } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { setImmediate } from "node:timers";
@@ -12,7 +12,7 @@ import type {
   CandidateExtraction, CandidateSummary, Clarification, Conversation, EmbeddingGeneration,
   EmbeddingIndexStatus, Event, EventRelation, EventRevision,
   DerivedArtifactDetail, EventSearchQuery, EvidenceDetail, EvidenceReferenceImpact, ImportIssue, ImportRun, ImportRunDetail, IntegrityScan, Job,
-  LegalVerificationResult, LlmProvider, LlmSettings, BailianRegion, Message, Person, PersonAlias,
+  LegalVerificationResult, LlmProvider, LlmProviderConfig, LlmSettings, BailianRegion, Message, Person, PersonAlias,
   PersonIdentityDetail, PersonMergeRecord, PersonMergeSuggestion, ReviewRun, Source,
   SourceItem, SourceReferenceDetail, SourceVersion, TimelineQuery, TimelineResult,
   RecoveryPackageSummary, UnifiedSearchHit, UnifiedSearchQuery, Workspace, WorkspaceCryptoStatus,
@@ -32,7 +32,9 @@ import {
   DeterministicEventDraftGenerator, parseConservativeTemporalValue, type EventCommitExtras,
   type AgentRepositoryPort, type EventDraftGeneratorPort, type EventDraftProposal, type MemoryRepositoryPort
 } from "./memory";
-import type { DayOneImporterPort, NormalizedDayOneEntry, NormalizedDayOneMedia } from "./dayone";
+import type {
+  DayOneImporterPort, DayOneScreeningImporterPort, NormalizedDayOneEntry, NormalizedDayOneMedia
+} from "./dayone";
 import {
   buildReviewPatterns, buildTimeline, cosineSimilarity, normalizeIdentity, personSuggestionScore,
   reciprocalRankFusion, relationSuggestions, REVIEW_GENERATOR_IDENTITY, REVIEW_GENERATOR_VERSION,
@@ -47,12 +49,21 @@ import {
   isoWeekScheduleKey, latestCompletedMonth, latestCompletedQuarter,
   type MediaPipelinePort, type PhaseSixRepositoryPort
 } from "./phase6";
+import {
+  RedesignService, type InlineImageInput, type LegacyMigrationSourcePort, type RecordEmbeddingPort,
+  type ReportAnalysisPort, type ScreeningPort, type NativeMediaSegmentInput, type NativeImageConversionPort
+} from "./redesign";
+import { needsNativeImageConversion, prepareNativeImage } from "./native-image";
+import { DAYONE_IMPORT_RECEIPT_KEY, normalizeDayOneImportReceipt } from "./dayone-import-receipt";
 
 export * from "./memory";
 export * from "./dayone";
 export * from "./phase3";
 export * from "./phase5";
 export * from "./phase6";
+export * from "./redesign";
+export * from "./native-image";
+export * from "./dayone-import-receipt";
 
 export interface StoredObject {
   sha256: string;
@@ -69,6 +80,15 @@ export interface WorkspaceKeyRing {
 
 export type VaultKey = Buffer | WorkspaceKeyRing;
 
+export interface LlmCapabilityVerificationBasis {
+  workspaceId: string;
+  configuration: LlmProviderConfig;
+  /** The main provider may differ when a configured auxiliary provider checked the media. */
+  activeProvider?: LlmProvider;
+  /** In-memory comparison only; never persist this credential-derived identity. */
+  credentialHash: string;
+}
+
 export interface ObjectVaultPort {
   put(inputPath: string, key: VaultKey): Promise<StoredObject>;
   putStream(input: Readable, key: VaultKey, expectedByteSize?: number, onProgress?: (progress: number) => void): Promise<StoredObject>;
@@ -84,6 +104,7 @@ export interface ObjectVaultPort {
 export interface AssetRepositoryPort {
   list(): Asset[];
   findById(id: string): Asset | undefined;
+  findBySha256(sha256: string): Asset | undefined;
   upsert(asset: Asset): { asset: Asset; deduplicated: boolean };
   setIntegrity(id: string, status: Asset["integrityStatus"], verifiedAt?: string): Asset;
   setVaultFormat?(id: string, vaultFormat: number): Asset;
@@ -92,7 +113,7 @@ export interface AssetRepositoryPort {
 export interface JobRepositoryPort {
   list(): Job[];
   enqueue(type: string, payload: unknown, now: string, maxAttempts?: number): Job;
-  claimNext(now: string, leaseUntil: string): Job | undefined;
+  claimNext(now: string, leaseUntil: string, allowedTypes?: readonly string[]): Job | undefined;
   heartbeat(id: string, leaseUntil: string, now: string): void;
   updateProgress(id: string, progress: number, now: string): void;
   succeed(id: string, now: string): Job;
@@ -113,6 +134,7 @@ export interface WorkspaceSession {
   phase5?: PhaseFiveRepositoryPort;
   phase6?: PhaseSixRepositoryPort;
   dayOne: import("./dayone").DayOneRepositoryPort;
+  records?: import("./redesign").RecordRepositoryPort;
   vault: ObjectVaultPort;
   backupDatabase(destinationPath: string): Promise<void>;
   close(): Promise<void>;
@@ -134,6 +156,8 @@ export interface WorkspaceManagerPort {
   prepareKeyRotation?(): Promise<WorkspaceCryptoStatus>;
   completeKeyRotation?(targetKeyId: string): Promise<WorkspaceCryptoStatus>;
   getCryptoStatus?(): WorkspaceCryptoStatus;
+  createLegacyMigrationSource?(rootPath: string): Promise<import("./redesign").LegacyMigrationSourcePort>;
+  createTransientDirectory?(prefix: string): Promise<string>;
   close(): Promise<void>;
 }
 
@@ -148,6 +172,7 @@ const AGENT_CONSENT_POLICY_VERSION = 1;
 export const LLM_PROVIDER_BASE_URLS = {
   nvidia: "https://integrate.api.nvidia.com/v1",
   openrouter: "https://openrouter.ai/api/v1",
+  minimax: "https://api.minimaxi.com/v1",
   bailian: {
     "cn-beijing": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "ap-southeast-1": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
@@ -156,8 +181,15 @@ export const LLM_PROVIDER_BASE_URLS = {
   }
 } as const;
 
-export function resolveLlmProviderEndpoint(provider: LlmProvider, region?: BailianRegion): string {
-  if (provider === "bailian") return LLM_PROVIDER_BASE_URLS.bailian[region ?? "cn-beijing"];
+export function resolveLlmProviderEndpoint(provider: LlmProvider, region?: BailianRegion, workspaceId?: string): string {
+  if (provider === "bailian") {
+    const workspace = workspaceId?.trim();
+    if (workspace) {
+      if (!/^[A-Za-z0-9-]{1,63}$/.test(workspace)) throw new AppError("INVALID_INPUT", "百炼业务空间 ID 格式无效。");
+      return `https://${workspace}.${region ?? "cn-beijing"}.maas.aliyuncs.com/compatible-mode/v1`;
+    }
+    return LLM_PROVIDER_BASE_URLS.bailian[region ?? "cn-beijing"];
+  }
   return LLM_PROVIDER_BASE_URLS[provider];
 }
 
@@ -170,6 +202,7 @@ function recognizeLegacyLlmEndpoint(baseUrl: string): { provider: LlmProvider; r
   try { hostname = new URL(baseUrl).hostname.toLowerCase(); } catch { return undefined; }
   if (hostname === "integrate.api.nvidia.com") return { provider: "nvidia" };
   if (hostname === "openrouter.ai") return { provider: "openrouter" };
+  if (hostname === "api.minimaxi.com") return { provider: "minimax" };
   if (hostname === "dashscope.aliyuncs.com" || hostname.endsWith(".cn-beijing.maas.aliyuncs.com")) {
     return { provider: "bailian", region: "cn-beijing" };
   }
@@ -277,14 +310,20 @@ function decryptLlmCredential(
 
 export class GrudgeVaultApplication {
   private readonly phaseFive: PhaseFiveService;
+  private readonly redesign: RedesignService;
+  private llmConfigurationEpoch = 0;
+  private readonly activeAssetPreviews = new Set<AbortController>();
 
   constructor(
     private readonly workspaces: WorkspaceManagerPort,
     private readonly draftGenerator: EventDraftGeneratorPort = new DeterministicEventDraftGenerator(),
-    private readonly dayOneImporter?: DayOneImporterPort,
+    private readonly dayOneImporter?: DayOneImporterPort & Partial<DayOneScreeningImporterPort>,
     private readonly embeddingAdapter?: EmbeddingAdapterPort,
     phaseFiveOptions: { pdf?: CaseSummaryPdfPort; legal?: LegalInformationAdapterPort } = {},
-    private readonly mediaPipeline?: MediaPipelinePort
+    private readonly mediaPipeline?: MediaPipelinePort,
+    recordEmbeddingAdapter?: RecordEmbeddingPort,
+    recordMediaQueryDescription?: import("./redesign").RecordMediaQueryDescriptionPort,
+    private readonly nativeImageConversion?: NativeImageConversionPort
   ) {
     this.phaseFive = new PhaseFiveService(() => {
       const session = this.requireSession();
@@ -295,6 +334,213 @@ export class GrudgeVaultApplication {
         assets: session.assets, memory: session.memory, phase5: session.phase5, vault: session.vault
       };
     }, phaseFiveOptions.pdf, phaseFiveOptions.legal);
+    this.redesign = new RedesignService(() => {
+      const session = this.requireSession();
+      if (!session.records) throw new AppError("INTERNAL_ERROR", "The redesigned record store is unavailable.");
+      return { ...session, records: session.records };
+    }, recordEmbeddingAdapter, recordMediaQueryDescription,
+    workspaces.createTransientDirectory?.bind(workspaces), nativeImageConversion, () => this.beginLlmOperation());
+  }
+
+  prepareIntake(input: {
+    requestId?: string; text?: string; paths?: string[]; fileNames?: string[]; inlineMedia?: InlineImageInput[];
+  }): Promise<import("@grudge-vault/domain").PreparedIntake> {
+    return this.redesign.prepareDraft({
+      ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
+      ...(input.text !== undefined ? { text: input.text } : {}),
+      ...(input.paths !== undefined ? { paths: input.paths } : {}),
+      ...(input.fileNames !== undefined ? { fileNames: input.fileNames } : {}),
+      ...(input.inlineMedia !== undefined ? { inlineMedia: input.inlineMedia } : {}),
+      origin: "manual"
+    });
+  }
+
+  abandonIntakePreparation(requestId: string): void { this.redesign.abandonDraftPreparation(requestId); }
+
+  abandonIntake(sessionId: string): void { this.redesign.abandonDraft(sessionId); }
+
+  screenAndSaveIntake(sessionId: string, operationId: string, screening: ScreeningPort, signal?: AbortSignal): Promise<import("@grudge-vault/domain").ScreenAndSaveResult> {
+    return this.redesign.screenManualAndSave(sessionId, operationId, screening, signal);
+  }
+
+  importScreenedDayOneZip(
+    archivePath: string,
+    screening: ScreeningPort,
+    signal?: AbortSignal,
+    onProgress?: (value: import("@grudge-vault/domain").ScreenedZipImportCounters) => void,
+    beforeItem?: (signal: AbortSignal) => Promise<void>
+  ): Promise<import("@grudge-vault/domain").ScreenedZipImportSummary> {
+    if (!this.dayOneImporter?.scanArchive) {
+      throw new AppError("INTERNAL_ERROR", "The screened Day One ZIP importer is unavailable.");
+    }
+    return this.redesign.importDayOneZip(
+      archivePath,
+      this.dayOneImporter as DayOneScreeningImporterPort,
+      screening,
+      signal,
+      onProgress,
+      beforeItem
+    );
+  }
+
+  previewScreenedDayOneZip(
+    archivePath: string,
+    signal: AbortSignal
+  ): Promise<import("./dayone").DayOneImportPreview> {
+    if (!this.dayOneImporter?.previewArchive) {
+      throw new AppError("INTERNAL_ERROR", "The Day One ZIP preview is unavailable.");
+    }
+    return this.dayOneImporter.previewArchive(archivePath, signal);
+  }
+
+  migrateLegacyWorkspace(
+    source: LegacyMigrationSourcePort,
+    screening: ScreeningPort,
+    signal?: AbortSignal
+  ): Promise<import("@grudge-vault/domain").LegacyMigrationSummary> {
+    return this.redesign.migrateLegacyWorkspace(source, screening, signal);
+  }
+
+  listPendingReviews(): import("@grudge-vault/domain").PendingReview[] { return this.redesign.listPending(); }
+
+  resolvePendingReview(id: string, action: "keep" | "ignore", operationId: string): Promise<import("@grudge-vault/domain").ScreenAndSaveResult | null> {
+    return this.redesign.resolvePending(id, action, operationId);
+  }
+
+  rescreenManualPendingReview(
+    id: string, sessionId: string, screening: ScreeningPort, signal?: AbortSignal
+  ): Promise<import("@grudge-vault/domain").ScreenAndSaveResult> {
+    return this.redesign.rescreenPendingFromManual(id, sessionId, screening, signal);
+  }
+
+  resolvePendingReviewFromDayOneZip(
+    id: string, archivePath: string, screening: ScreeningPort, operationId: string, signal?: AbortSignal
+  ): Promise<import("@grudge-vault/domain").ScreenAndSaveResult> {
+    if (!this.dayOneImporter?.scanArchive) {
+      throw new AppError("INTERNAL_ERROR", "Day One ZIP 筛选导入器不可用。");
+    }
+    return this.redesign.resolvePendingFromDayOneZip(
+      id, archivePath, this.dayOneImporter as DayOneScreeningImporterPort, screening, operationId, signal
+    );
+  }
+
+  resolvePendingReviewFromLegacyWorkspace(
+    id: string, source: LegacyMigrationSourcePort, screening: ScreeningPort, operationId: string, signal?: AbortSignal
+  ): Promise<import("@grudge-vault/domain").ScreenAndSaveResult> {
+    return this.redesign.resolvePendingFromLegacyWorkspace(id, source, screening, operationId, signal);
+  }
+
+  listRecordTimeline(filter: import("@grudge-vault/domain").TimelineFilter): import("@grudge-vault/domain").TimelinePage {
+    return this.redesign.listTimeline(filter);
+  }
+
+  getRecordDetail(id: string): import("@grudge-vault/domain").EventRecordDetail { return this.redesign.getRecord(id); }
+
+  patchRecordFields(recordId: string, expectedRevision: number, patch: Partial<Record<import("@grudge-vault/domain").FieldOverride["fieldKey"], unknown>>): Promise<import("@grudge-vault/domain").EventRecordDetail> {
+    return this.redesign.patchFields(recordId, expectedRevision, patch);
+  }
+
+  reanalyzeRecord(recordId: string, expectedRevision: number): string {
+    return this.redesign.reanalyze(recordId, expectedRevision);
+  }
+
+  searchRecords(query: import("@grudge-vault/domain").RecordSearchQuery): import("@grudge-vault/domain").RecordSearchPage {
+    return this.redesign.search(query);
+  }
+
+  prepareRecordSearchQuery(input: { text?: string; paths?: string[]; fileNames?: string[]; requestId?: string }): Promise<import("@grudge-vault/domain").PreparedSearchQuery> {
+    return this.redesign.prepareSearchQuery(input);
+  }
+
+  abandonRecordSearchPreparation(requestId: string): void { this.redesign.abandonSearchPreparation(requestId); }
+
+  abandonRecordSearchQuery(sessionId: string): void { this.redesign.abandonSearchQuery(sessionId); }
+
+  executeRecordSearchQuery(
+    sessionId: string,
+    filters: Omit<import("@grudge-vault/domain").RecordSearchQuery, "text">,
+    onProgress?: (value: import("@grudge-vault/domain").NativeMediaProgress) => void
+  ): Promise<import("@grudge-vault/domain").RecordSearchPage> {
+    return this.redesign.executeSearchQuery(sessionId, filters, onProgress);
+  }
+
+  getRecordSearchIndexStatus(): import("@grudge-vault/domain").RecordSearchIndexStatus {
+    return this.redesign.getSearchIndexStatus();
+  }
+
+  requestRecordSearchIndexRebuild(): import("@grudge-vault/domain").RecordSearchIndexStatus {
+    return this.redesign.requestSearchIndexRebuild();
+  }
+
+  setRecordSearchIndexEnabled(enabled: boolean): {
+    status: import("@grudge-vault/domain").RecordSearchIndexStatus;
+    jobIds: string[];
+  } {
+    return this.redesign.setSearchIndexEnabled(enabled);
+  }
+
+  rebuildRecordSearchIndex(
+    generationId?: string,
+    signal?: AbortSignal
+  ): Promise<import("@grudge-vault/domain").RecordSearchIndexStatus> {
+    return this.redesign.rebuildSearchIndex(generationId, signal);
+  }
+
+  ensureRecordSearchIndex(signal?: AbortSignal, deferOnContention = true): Promise<string | undefined> {
+    return this.redesign.ensureSearchIndexJob(signal, deferOnContention);
+  }
+
+  runRecordAnalysis(
+    recordId: string,
+    expectedRevision: number,
+    analyzer: ReportAnalysisPort,
+    deferFailure = false,
+    analysisRunId?: string,
+    signal?: AbortSignal,
+    onProgress?: (value: import("@grudge-vault/domain").NativeMediaProgress) => void
+  ): Promise<import("@grudge-vault/domain").EventRecordDetail> {
+    return this.redesign.runAnalysis(recordId, expectedRevision, analyzer, deferFailure, analysisRunId, signal, onProgress);
+  }
+
+  failRecordAnalysis(recordId: string, expectedRevision: number, errorCode: string): import("@grudge-vault/domain").EventRecordDetail {
+    return this.redesign.failAnalysis(recordId, expectedRevision, errorCode);
+  }
+
+  getDefaultLegalJurisdiction(): string {
+    return this.requireSession().memory.getSetting<string>("redesign.default-legal-jurisdiction") ?? "中国大陆";
+  }
+
+  getLastDayOneImportReceipt(): import("@grudge-vault/domain").ScreenedZipImportReceipt | null {
+    const session = this.requireSession();
+    try {
+      const value = session.memory.getSetting<unknown>(DAYONE_IMPORT_RECEIPT_KEY);
+      return value === undefined ? null : normalizeDayOneImportReceipt(value);
+    } catch {
+      throw new AppError("SOURCE_UNAVAILABLE", "暂时无法读取上次导入摘要；不会重新开始导入。", true);
+    }
+  }
+
+  /** Internal only: the renderer cannot submit receipts or write across workspace sessions. */
+  saveDayOneImportReceipt(expectedSession: WorkspaceSession, value: unknown): void {
+    const session = this.requireSession();
+    if (session !== expectedSession) throw new AppError("SOURCE_UNAVAILABLE", "工作区会话已变化，未保存导入摘要。", true);
+    const receipt = normalizeDayOneImportReceipt(value);
+    try { session.memory.setSetting(DAYONE_IMPORT_RECEIPT_KEY, receipt, receipt.finishedAt); }
+    catch { throw new AppError("SOURCE_UNAVAILABLE", "未能保存导入摘要；已处理的记录不受影响。", true); }
+  }
+
+  setDefaultLegalJurisdiction(value: string): string {
+    const jurisdiction = value.trim();
+    if (!jurisdiction || Array.from(jurisdiction).length > 200 ||
+      Array.from(jurisdiction).some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) {
+      throw new AppError("INVALID_INPUT", "请输入有效的默认法律地域。");
+    }
+    this.requireSession().memory.setSetting(
+      "redesign.default-legal-jurisdiction",
+      jurisdiction,
+      new Date().toISOString()
+    );
+    return jurisdiction;
   }
 
   getCurrentWorkspace(): Workspace | null {
@@ -307,6 +553,7 @@ export class GrudgeVaultApplication {
 
   lockWorkspace(): Promise<WorkspaceLockState> {
     if (!this.workspaces.lock) throw new AppError("INTERNAL_ERROR", "Workspace locking is unavailable.");
+    this.clearWorkspaceTransientOperations();
     return this.workspaces.lock();
   }
 
@@ -331,6 +578,7 @@ export class GrudgeVaultApplication {
 
   async recoverWorkspace(path: string, passphrase: string): Promise<Workspace> {
     if (!this.workspaces.recover) throw new AppError("INTERNAL_ERROR", "Workspace recovery is unavailable.");
+    this.clearWorkspaceTransientOperations();
     return (await this.workspaces.recover(path, passphrase)).workspace;
   }
 
@@ -429,10 +677,12 @@ export class GrudgeVaultApplication {
   }
 
   async createWorkspace(rootPath: string, name: string): Promise<Workspace> {
+    this.clearWorkspaceTransientOperations();
     return (await this.workspaces.create(rootPath, name)).workspace;
   }
 
   async openWorkspace(rootPath: string): Promise<Workspace> {
+    this.clearWorkspaceTransientOperations();
     return (await this.workspaces.open(rootPath)).workspace;
   }
 
@@ -442,6 +692,7 @@ export class GrudgeVaultApplication {
   }
 
   async restoreBackup(backupPath: string, destinationPath: string): Promise<Workspace> {
+    this.clearWorkspaceTransientOperations();
     return (await this.workspaces.restoreBackup(backupPath, destinationPath)).workspace;
   }
 
@@ -585,34 +836,81 @@ export class GrudgeVaultApplication {
     const stored = repository.getLlmSettings();
     if (stored) return stored;
 
-    const now = new Date().toISOString();
-    const empty: LlmSettings = { providers: {} };
-    repository.saveLlmSettings(empty, now);
-    const legacy = this.getAgentSettings().enhancedEndpoint;
-    const recognized = legacy ? recognizeLegacyLlmEndpoint(legacy.baseUrl) : undefined;
-    if (!legacy || !recognized) return repository.getLlmSettings() ?? empty;
+    return repository.withLlmConfigurationTransaction(() => {
+      const now = new Date().toISOString();
+      const empty: LlmSettings = { providers: {} };
+      repository.saveLlmSettings(empty, now);
+      const legacy = this.getAgentSettings().enhancedEndpoint;
+      const recognized = legacy ? recognizeLegacyLlmEndpoint(legacy.baseUrl) : undefined;
+      if (!legacy || !recognized) return repository.getLlmSettings() ?? empty;
 
-    let credentialConfigured = false;
-    const legacyCredential = this.getAgentCredential("enhanced");
-    if (legacyCredential) {
-      const encryptionKey = session.keyRing?.keys.get(session.keyRing.activeKeyId) ?? session.key;
-      repository.saveLlmCredential(recognized.provider, encryptLlmCredential(
-        legacyCredential, encryptionKey, session.workspace.id, recognized.provider
-      ), now);
-      credentialConfigured = true;
-    }
-    repository.saveLlmProviderConfig({
-      provider: recognized.provider, model: legacy.model,
-      credentialConfigured, status: credentialConfigured ? "ready" : "not_configured",
-      ...(recognized.region ? { region: recognized.region } : {})
-    }, now);
-    repository.saveLlmSettings({
-      providers: {}, ...(credentialConfigured ? { activeProvider: recognized.provider } : {})
-    }, now);
-    return repository.getLlmSettings() ?? empty;
+      let credentialConfigured = false;
+      const legacyCredential = this.getAgentCredential("enhanced");
+      if (legacyCredential) {
+        const encryptionKey = session.keyRing?.keys.get(session.keyRing.activeKeyId) ?? session.key;
+        repository.saveLlmCredential(recognized.provider, encryptLlmCredential(
+          legacyCredential, encryptionKey, session.workspace.id, recognized.provider
+        ), now);
+        credentialConfigured = true;
+      }
+      repository.saveLlmProviderConfig({
+        provider: recognized.provider, model: legacy.model,
+        credentialConfigured, status: credentialConfigured ? "ready" : "not_configured",
+        ...(recognized.region ? { region: recognized.region } : {})
+      }, now);
+      repository.saveLlmSettings({
+        providers: {}, ...(credentialConfigured ? { activeProvider: recognized.provider } : {})
+      }, now);
+      return repository.getLlmSettings() ?? empty;
+    });
   }
 
-  saveLlmConnection(input: LlmConnectInput, testedAt: string): LlmSettings {
+  /** Hold an operation to its original session and configuration, without invalidating concurrent operations. */
+  beginLlmOperation(): () => void {
+    const session = this.requireSession();
+    const epoch = this.llmConfigurationEpoch;
+    return () => {
+      if (this.workspaces.current() !== session || this.llmConfigurationEpoch !== epoch) {
+        throw new AppError("LLM_CONFIGURATION_CHANGED", "工作区或模型配置已变化，原任务已失效，请重新执行。", true);
+      }
+    };
+  }
+
+  /** Hold a connection test to its original live session and unchanged model-selection intent. */
+  beginLlmConfigurationTest(provider: LlmProvider): () => void {
+    const session = this.requireSession();
+    const settings = this.getLlmSettings();
+    const epoch = ++this.llmConfigurationEpoch;
+    const workspaceId = session.workspace.id;
+    const selection = (config: LlmProviderConfig | undefined) => JSON.stringify(config ? [
+      config.provider, config.model, config.region, config.workspaceId, config.status,
+      config.credentialConfigured, config.lastTestedAt
+    ] : null);
+    const expectedSelection = selection(settings.providers[provider]);
+    const expectedCredential = JSON.stringify(session.agents.getLlmCredential(provider));
+    return () => {
+      if (this.workspaces.current() !== session || session.workspace.id !== workspaceId ||
+        this.llmConfigurationEpoch !== epoch ||
+        selection(session.agents.getLlmProviderConfig(provider)) !== expectedSelection ||
+        session.agents.getLlmSettings()?.activeProvider !== settings.activeProvider ||
+        JSON.stringify(session.agents.getLlmCredential(provider)) !== expectedCredential) {
+        throw new AppError("LLM_CONFIGURATION_CHANGED", "连接测试已失效：工作区或模型配置在测试期间改变，请在当前工作区核对后重新测试。", true);
+      }
+    };
+  }
+
+  private commitLlmConfiguration(session: WorkspaceSession, write: () => LlmSettings): LlmSettings {
+    const settings = session.agents.withLlmConfigurationTransaction(write);
+    // A failed write leaves both the stored selection and the in-flight test basis intact.
+    this.llmConfigurationEpoch += 1;
+    return settings;
+  }
+
+  saveLlmConnection(
+    input: LlmConnectInput,
+    testedAt: string,
+    capabilities?: import("@grudge-vault/domain").LlmTaskCapabilities
+  ): LlmSettings {
     const session = this.requireSession();
     const model = input.model.trim();
     if (!model || model.length > 200) throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "A model name is required.");
@@ -630,26 +928,29 @@ export class GrudgeVaultApplication {
       throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "The Bailian Workspace ID is invalid.");
     }
     const now = new Date().toISOString();
-    if (input.apiKey !== undefined) {
-      const apiKey = input.apiKey.trim();
-      if (!apiKey || apiKey.length > 10_000) {
-        throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "The model credential is invalid.");
+    return this.commitLlmConfiguration(session, () => {
+      const current = this.getLlmSettings();
+      if (input.apiKey !== undefined) {
+        const apiKey = input.apiKey.trim();
+        if (!apiKey || apiKey.length > 10_000) {
+          throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "The model credential is invalid.");
+        }
+        const encryptionKey = session.keyRing?.keys.get(session.keyRing.activeKeyId) ?? session.key;
+        session.agents.saveLlmCredential(input.provider, encryptLlmCredential(
+          apiKey, encryptionKey, session.workspace.id, input.provider
+        ), now);
       }
-      const encryptionKey = session.keyRing?.keys.get(session.keyRing.activeKeyId) ?? session.key;
-      session.agents.saveLlmCredential(input.provider, encryptLlmCredential(
-        apiKey, encryptionKey, session.workspace.id, input.provider
-      ), now);
-    }
-    if (!session.agents.getLlmCredential(input.provider)) {
-      throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "Enter an API key before connecting.");
-    }
-    session.agents.saveLlmProviderConfig({
-      provider: input.provider, model, credentialConfigured: true, status: "ready", lastTestedAt: testedAt,
-      ...(input.region ? { region: input.region } : {}), ...(workspaceId ? { workspaceId } : {})
-    }, now);
-    const current = this.getLlmSettings();
-    session.agents.saveLlmSettings({ ...current, activeProvider: input.provider }, now);
-    return session.agents.getLlmSettings()!;
+      if (!session.agents.getLlmCredential(input.provider)) {
+        throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "Enter an API key before connecting.");
+      }
+      session.agents.saveLlmProviderConfig({
+        provider: input.provider, model, credentialConfigured: true, status: "ready", lastTestedAt: testedAt,
+        ...(capabilities ? { capabilities } : {}),
+        ...(input.region ? { region: input.region } : {}), ...(workspaceId ? { workspaceId } : {})
+      }, now);
+      session.agents.saveLlmSettings({ ...current, activeProvider: input.provider }, now);
+      return session.agents.getLlmSettings()!;
+    });
   }
 
   saveLlmProvider(input: LlmConnectInput): LlmSettings {
@@ -670,69 +971,119 @@ export class GrudgeVaultApplication {
       throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "The Bailian Workspace ID is invalid.");
     }
     const now = new Date().toISOString();
-    if (input.apiKey !== undefined) {
-      const apiKey = input.apiKey.trim();
-      if (!apiKey || apiKey.length > 10_000) {
-        throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "The model credential is invalid.");
+    return this.commitLlmConfiguration(session, () => {
+      const current = this.getLlmSettings();
+      if (input.apiKey !== undefined) {
+        const apiKey = input.apiKey.trim();
+        if (!apiKey || apiKey.length > 10_000) {
+          throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "The model credential is invalid.");
+        }
+        const encryptionKey = session.keyRing?.keys.get(session.keyRing.activeKeyId) ?? session.key;
+        session.agents.saveLlmCredential(input.provider, encryptLlmCredential(
+          apiKey, encryptionKey, session.workspace.id, input.provider
+        ), now);
       }
-      const encryptionKey = session.keyRing?.keys.get(session.keyRing.activeKeyId) ?? session.key;
-      session.agents.saveLlmCredential(input.provider, encryptLlmCredential(
-        apiKey, encryptionKey, session.workspace.id, input.provider
-      ), now);
-    }
-    const credentialConfigured = Boolean(session.agents.getLlmCredential(input.provider));
-    const existing = session.agents.getLlmProviderConfig(input.provider);
-    const unchanged = Boolean(existing && existing.model === model && existing.region === input.region &&
-      existing.workspaceId === workspaceId && input.apiKey === undefined);
-    session.agents.saveLlmProviderConfig({
-      provider: input.provider, model, credentialConfigured,
-      status: unchanged ? existing!.status : credentialConfigured ? "needs_attention" : "not_configured",
-      ...(unchanged && existing?.lastTestedAt ? { lastTestedAt: existing.lastTestedAt } : {}),
-      ...(input.region ? { region: input.region } : {}), ...(workspaceId ? { workspaceId } : {})
-    }, now);
-    const current = this.getLlmSettings();
-    const keepActiveProvider = current.activeProvider && (current.activeProvider !== input.provider || unchanged)
-      ? current.activeProvider : undefined;
-    session.agents.saveLlmSettings({
-      providers: current.providers, ...(keepActiveProvider ? { activeProvider: keepActiveProvider } : {})
-    }, now);
-    return session.agents.getLlmSettings()!;
+      const credentialConfigured = Boolean(session.agents.getLlmCredential(input.provider));
+      const existing = session.agents.getLlmProviderConfig(input.provider);
+      const unchanged = Boolean(existing && existing.model === model && existing.region === input.region &&
+        existing.workspaceId === workspaceId && input.apiKey === undefined);
+      session.agents.saveLlmProviderConfig({
+        provider: input.provider, model, credentialConfigured,
+        status: unchanged ? existing!.status : credentialConfigured ? "needs_attention" : "not_configured",
+        ...(unchanged && existing?.lastTestedAt ? { lastTestedAt: existing.lastTestedAt } : {}),
+        ...(unchanged && existing?.capabilities ? { capabilities: existing.capabilities } : {}),
+        ...(input.region ? { region: input.region } : {}), ...(workspaceId ? { workspaceId } : {})
+      }, now);
+      const keepActiveProvider = current.activeProvider && (current.activeProvider !== input.provider || unchanged)
+        ? current.activeProvider : undefined;
+      session.agents.saveLlmSettings({
+        providers: current.providers, ...(keepActiveProvider ? { activeProvider: keepActiveProvider } : {})
+      }, now);
+      return session.agents.getLlmSettings()!;
+    });
   }
 
   activateLlmProvider(provider: LlmProvider, testedAt: string): LlmSettings {
     const session = this.requireSession();
-    const config = session.agents.getLlmProviderConfig(provider);
-    if (!config || !session.agents.getLlmCredential(provider)) {
-      throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "Connect this model service before enabling it.");
-    }
     const now = new Date().toISOString();
-    session.agents.saveLlmProviderConfig({
-      ...config, credentialConfigured: true, status: "ready", lastTestedAt: testedAt
-    }, now);
-    const current = this.getLlmSettings();
-    session.agents.saveLlmSettings({ ...current, activeProvider: provider }, now);
-    return session.agents.getLlmSettings()!;
+    return this.commitLlmConfiguration(session, () => {
+      const current = this.getLlmSettings();
+      const config = session.agents.getLlmProviderConfig(provider);
+      if (!config || !session.agents.getLlmCredential(provider)) {
+        throw new AppError("AGENT_MODEL_CONFIGURATION_INVALID", "Connect this model service before enabling it.");
+      }
+      session.agents.saveLlmProviderConfig({
+        ...config, credentialConfigured: true, status: "ready", lastTestedAt: testedAt
+      }, now);
+      session.agents.saveLlmSettings({ ...current, activeProvider: provider }, now);
+      return session.agents.getLlmSettings()!;
+    });
+  }
+
+  pauseLlmProviders(): LlmSettings {
+    const session = this.requireSession();
+    return this.commitLlmConfiguration(session, () => {
+      const current = this.getLlmSettings();
+      session.agents.saveLlmSettings({ providers: current.providers }, new Date().toISOString());
+      return session.agents.getLlmSettings()!;
+    });
   }
 
   disconnectLlmProvider(provider: LlmProvider): LlmSettings {
     const session = this.requireSession();
     const now = new Date().toISOString();
-    session.agents.saveLlmCredential(provider, undefined, now);
-    session.agents.deleteLlmProviderConfig(provider);
-    const current = this.getLlmSettings();
-    session.agents.saveLlmSettings({
-      providers: current.providers,
-      ...(current.activeProvider && current.activeProvider !== provider ? { activeProvider: current.activeProvider } : {})
-    }, now);
-    return session.agents.getLlmSettings()!;
+    return this.commitLlmConfiguration(session, () => {
+      const current = this.getLlmSettings();
+      session.agents.saveLlmCredential(provider, undefined, now);
+      session.agents.deleteLlmProviderConfig(provider);
+      session.agents.saveLlmSettings({
+        providers: current.providers,
+        ...(current.activeProvider && current.activeProvider !== provider ? { activeProvider: current.activeProvider } : {})
+      }, now);
+      return session.agents.getLlmSettings()!;
+    });
   }
 
   markLlmProviderNeedsAttention(provider: LlmProvider): LlmSettings {
     const session = this.requireSession();
     const config = session.agents.getLlmProviderConfig(provider);
     if (!config) return this.getLlmSettings();
-    session.agents.saveLlmProviderConfig({ ...config, status: "needs_attention" }, new Date().toISOString());
-    return session.agents.getLlmSettings()!;
+    return this.commitLlmConfiguration(session, () => {
+      session.agents.saveLlmProviderConfig({ ...config, status: "needs_attention" }, new Date().toISOString());
+      return session.agents.getLlmSettings()!;
+    });
+  }
+
+  markLlmModalityVerified(
+    provider: LlmProvider,
+    modality: import("@grudge-vault/domain").LlmModelModality,
+    verifiedAt: string,
+    basis: LlmCapabilityVerificationBasis
+  ): void {
+    const session = this.workspaces.current();
+    if (!session || session.workspace.id !== basis.workspaceId) return;
+    const config = session.agents.getLlmProviderConfig(provider);
+    const expected = basis.configuration;
+    const expectedActive = basis.activeProvider ?? provider;
+    if (provider !== expectedActive && !(provider === "bailian" && expectedActive === "minimax")) return;
+    if (!config || config.status !== "ready" || expected.provider !== provider ||
+      config.model !== expected.model || config.region !== expected.region || config.workspaceId !== expected.workspaceId ||
+      config.lastTestedAt !== expected.lastTestedAt || session.agents.getLlmSettings()?.activeProvider !== expectedActive) return;
+    const apiKey = this.getLlmCredential(provider);
+    if (!apiKey || createHash("sha256").update(apiKey).digest("hex") !== basis.credentialHash) return;
+    const previous = config.capabilities ?? {
+      inputModalities: ["text" as const], outputModalities: ["text" as const], structuredOutput: true,
+      verifiedTasks: ["connection" as const, "structured_output" as const], lastVerifiedAt: verifiedAt
+    };
+    session.agents.saveLlmProviderConfig({
+      ...config,
+      capabilities: {
+        ...previous,
+        inputModalities: [...new Set([...previous.inputModalities, modality])],
+        verifiedTasks: [...new Set([...previous.verifiedTasks, "screening" as const])],
+        lastVerifiedAt: verifiedAt
+      }
+    }, verifiedAt);
   }
 
   getLlmCredential(provider: LlmProvider): string | undefined {
@@ -1105,8 +1456,26 @@ export class GrudgeVaultApplication {
     if (!queryVector || queryVector.length !== this.embeddingAdapter.dimensions) {
       return keyword.slice(0, limit).map((hit, index) => ({ ...hit, combinedScore: 0.7 / (61 + index) }));
     }
-    const eligible = new Map(memory.searchUnifiedKeyword({ ...query, text: "", semantic: false, limit: 200 })
-      .map((hit) => [`${hit.kind}:${hit.id}`, hit]));
+    const identityPersonIds = query.personId ? new Set(memory.listIdentityPersonIds(query.personId)) : undefined;
+    const eligible = new Map(memory.listSearchDocuments().flatMap((document): Array<[string, UnifiedSearchHit]> => {
+      if (query.kinds && !query.kinds.includes(document.kind)) return [];
+      if (query.from && (!document.occurredAt || document.occurredAt.slice(0, 10) < query.from)) return [];
+      if (query.to && (!document.occurredAt || document.occurredAt.slice(0, 10) > query.to)) return [];
+      const eventId = document.eventId ?? (document.kind === "event" ? document.id : undefined);
+      const event = eventId ? memory.getEvent(eventId) : undefined;
+      if (query.status && event?.status !== query.status) return [];
+      if (identityPersonIds && (!event || !event.participants.some(({ personId }) => identityPersonIds.has(personId)))) return [];
+      const hit: UnifiedSearchHit = {
+        kind: document.kind, id: document.id, title: document.title,
+        excerpt: document.content.slice(0, 500), sourceRefs: document.sourceRefs, combinedScore: 0,
+        ...(document.occurredAt ? { occurredAt: document.occurredAt } : {}),
+        ...(document.eventId ? { eventId: document.eventId } : {}),
+        ...(document.sourceItemId ? { sourceItemId: document.sourceItemId } : {}),
+        ...(document.derivedArtifactId ? { derivedArtifactId: document.derivedArtifactId } : {}),
+        ...(document.sourceAssetId ? { sourceAssetId: document.sourceAssetId } : {})
+      };
+      return [[`${document.kind}:${document.id}`, hit]];
+    }));
     const semantic = memory.listEmbeddings(active.id).flatMap(({ document, vector }) => {
       const base = eligible.get(`${document.kind}:${document.id}`);
       if (!base) return [];
@@ -1352,7 +1721,7 @@ export class GrudgeVaultApplication {
           const stored: ImportIssue = { id: randomUUID(), importRunId: run.id, ...issue, createdAt: now };
           repository.addImportIssue(stored);
           if (issue.severity === "error") bump("errorCount");
-          if (issue.code === "DAYONE_MEDIA_MISSING") bump("mediaMissing");
+          if (issue.code === "DAYONE_MEDIA_MISSING" || issue.code === "DAYONE_MEDIA_AMBIGUOUS") bump("mediaMissing");
         },
         onProgress: (progress) => {
           run = repository.updateImportRun({ ...run, progress, updatedAt: new Date().toISOString() });
@@ -1540,43 +1909,138 @@ export class GrudgeVaultApplication {
     return this.requireSession().assets.list();
   }
 
-  async previewAsset(assetId: string): Promise<AssetPreview> {
+  async previewAsset(assetId: string, signal?: AbortSignal): Promise<AssetPreview> {
     const session = this.requireSession();
     const asset = session.assets.findById(assetId);
     if (!asset) throw new AppError("ASSET_NOT_FOUND", "The asset no longer exists.");
-    if (asset.byteSize > 64 * 1024 * 1024 || !PREVIEW_MIME_TYPES.has(asset.mimeType)) {
+    const maxPreviewBytes = needsNativeImageConversion(asset.mimeType) ? 20 * 1024 * 1024 : 64 * 1024 * 1024;
+    if (asset.byteSize > maxPreviewBytes || !PREVIEW_MIME_TYPES.has(asset.mimeType)) {
       throw new AppError("ASSET_PREVIEW_UNAVAILABLE", "This file must be exported before it can be viewed.");
     }
+    const controller = new AbortController();
+    const operationSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    this.activeAssetPreviews.add(controller);
+    let stream: Readable | undefined;
+    const abortStream = () => stream?.destroy(operationSignal.reason instanceof Error ? operationSignal.reason : undefined);
+    operationSignal.addEventListener("abort", abortStream, { once: true });
+    const assertCurrent = () => {
+      operationSignal.throwIfAborted();
+      if (this.workspaces.current() !== session) throw new AppError("SOURCE_UNAVAILABLE", "工作区已变化，原预览任务已失效。", true);
+    };
     try {
+      assertCurrent();
       const chunks: Buffer[] = [];
       let byteSize = 0;
-      for await (const chunk of await session.vault.open(asset.sha256, session.keyRing ?? session.key)) {
+      stream = await session.vault.open(asset.sha256, session.keyRing ?? session.key);
+      assertCurrent();
+      for await (const chunk of stream) {
+        assertCurrent();
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         byteSize += buffer.length;
-        if (byteSize > 64 * 1024 * 1024) {
+        if (byteSize > maxPreviewBytes) {
           throw new AppError("ASSET_PREVIEW_UNAVAILABLE", "This file is too large for an in-app preview.");
         }
         chunks.push(buffer);
       }
       if (byteSize !== asset.byteSize) throw new AppError("ASSET_CORRUPT", "The decrypted object size does not match its metadata.");
+      const bytes = Buffer.concat(chunks);
+      if (needsNativeImageConversion(asset.mimeType) && createHash("sha256").update(bytes).digest("hex") !== asset.sha256) {
+        throw new AppError("ASSET_CORRUPT", "HEIC 原件摘要与附件信息不一致。", false);
+      }
+      const representation = await prepareNativeImage({ mimeType: asset.mimeType, bytes }, this.nativeImageConversion, operationSignal);
+      assertCurrent();
       return {
-        assetId, fileName: asset.originalFileName, mimeType: asset.mimeType,
-        bytes: new Uint8Array(Buffer.concat(chunks))
+        assetId, fileName: asset.originalFileName, mimeType: representation.mimeType,
+        bytes: new Uint8Array(representation.bytes), ...(representation.converted ? { representation: "converted-image" as const } : {})
       };
     } catch (error) {
+      operationSignal.throwIfAborted();
+      if (error instanceof AppError && error.code === "MODALITY_UNAVAILABLE") {
+        throw new AppError("ASSET_PREVIEW_UNAVAILABLE", "这个 HEIC 原件超出当前单张 SDR 转换能力，请保存原始副本后核对。", true);
+      }
       if (error instanceof AppError) throw error;
       throw new AppError("ASSET_CORRUPT", "The encrypted object could not be authenticated.", false, { cause: error });
+    } finally {
+      operationSignal.removeEventListener("abort", abortStream);
+      stream?.destroy();
+      this.activeAssetPreviews.delete(controller);
     }
+  }
+
+  private clearWorkspaceTransientOperations(): void {
+    for (const controller of this.activeAssetPreviews) controller.abort(new AppError("SOURCE_UNAVAILABLE", "工作区已变化，原预览任务已停止。", true));
+    this.redesign.clearTransientSessions();
+  }
+
+  /** Internal model-only source. Full authentication and digest validation precede any clip upload. */
+  async openMediaSourceForAnalysis(assetId: string): Promise<NativeMediaSegmentInput> {
+    const session = this.requireSession();
+    const asset = session.assets.findById(assetId);
+    if (!asset) throw new AppError("ASSET_NOT_FOUND", "所选媒体附件已不存在。", true);
+    const kind = asset.mimeType.startsWith("audio/") ? "audio" : asset.mimeType.startsWith("video/") ? "video" : undefined;
+    if (!kind || asset.byteSize <= 0 || asset.byteSize > 500 * 1024 * 1024) {
+      throw new AppError("MODALITY_UNAVAILABLE", "当前媒体不能以流式来源参与分析。", true);
+    }
+    const assertCurrent = (signal?: AbortSignal) => {
+      signal?.throwIfAborted();
+      if (this.workspaces.current() !== session) throw new AppError("WORKSPACE_LOCKED", "工作区会话已变化，媒体分析已停止。", true);
+    };
+    return {
+      kind, mimeType: asset.mimeType, byteSize: asset.byteSize, sha256: asset.sha256,
+      async open(signal) {
+        assertCurrent(signal);
+        return (async function* () {
+          assertCurrent(signal);
+          const stream = await session.vault.open(asset.sha256, session.keyRing ?? session.key);
+          const abort = () => stream.destroy(new AppError("MEDIA_PROCESSING_FAILED", "媒体读取已取消。", true));
+          signal?.addEventListener("abort", abort, { once: true });
+          if (signal?.aborted) abort();
+          try {
+            assertCurrent(signal);
+            for await (const chunk of stream) { assertCurrent(signal); yield Buffer.from(chunk); }
+            assertCurrent(signal);
+          } catch (cause) {
+            assertCurrent(signal);
+            throw cause;
+          } finally { signal?.removeEventListener("abort", abort); stream.destroy(); }
+        })();
+      }
+    };
+  }
+
+  /** Internal playback source; the desktop must authenticate a complete private copy before serving any bytes. */
+  async openMediaSourceForPreview(assetId: string): Promise<import("./redesign").OriginalMediaPreviewSource> {
+    const session = this.requireSession();
+    const source = await this.openMediaSourceForAnalysis(assetId);
+    return { ...source, assertCurrent: () => {
+      if (this.workspaces.current() !== session) throw new AppError("WORKSPACE_LOCKED", "工作区会话已变化，原件预览已停止。", true);
+    } };
   }
 
   async exportAsset(assetId: string, outputPath: string): Promise<string> {
     const session = this.requireSession();
     const asset = session.assets.findById(assetId);
     if (!asset) throw new AppError("ASSET_NOT_FOUND", "The asset no longer exists.");
-    const temporary = `${outputPath}.${randomUUID()}.tmp`;
+    if (!isAbsolute(outputPath)) throw new AppError("INVALID_INPUT", "导出位置必须是本机绝对路径。");
+    let workspaceRoot: string;
+    let outputDirectory: string;
+    try {
+      [workspaceRoot, outputDirectory] = await Promise.all([
+        realpath(session.workspace.rootPath), realpath(dirname(outputPath))
+      ]);
+    } catch (cause) {
+      throw new AppError("ASSET_EXPORT_FAILED", "无法核对导出位置。", true, { cause });
+    }
+    const destinationPath = join(outputDirectory, basename(outputPath));
+    const withinWorkspace = relative(workspaceRoot, destinationPath);
+    if (withinWorkspace === "" || withinWorkspace !== ".." &&
+      !withinWorkspace.startsWith(`..${sep}`) && !isAbsolute(withinWorkspace)) {
+      throw new AppError("INVALID_INPUT", "不能将解密副本保存到加密工作区内部；请选择其他文件夹。");
+    }
+    const temporary = `${destinationPath}.${randomUUID()}.tmp`;
     try {
       await pipeline(await session.vault.open(asset.sha256, session.keyRing ?? session.key), createWriteStream(temporary, { flags: "wx", mode: 0o600 }));
-      await rename(temporary, outputPath);
+      await rename(temporary, destinationPath);
       return outputPath;
     } catch (error) {
       await unlink(temporary).catch(() => undefined);
@@ -1880,7 +2344,7 @@ export class GrudgeVaultApplication {
         session.agents.saveCredential(mode, encryptAgentCredential(plaintext, target, session.workspace.id, mode), new Date().toISOString());
       }
     }
-    for (const provider of ["nvidia", "openrouter", "bailian"] as const) {
+    for (const provider of ["nvidia", "openrouter", "bailian", "minimax"] as const) {
       const plaintext = this.getLlmCredential(provider);
       if (plaintext !== undefined) {
         session.agents.saveLlmCredential(provider, encryptLlmCredential(
@@ -2120,9 +2584,9 @@ function completenessFor(fields: Pick<EventWriteFields, "title" | "occurredAt">,
 }
 
 const PREVIEW_MIME_TYPES = new Set([
-  "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif",
+  "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/heic", "image/heif",
   "audio/mpeg", "audio/mp4", "audio/wav", "audio/ogg", "audio/webm",
-  "video/mp4", "video/webm", "application/pdf", "application/json",
+  "video/mp4", "video/quicktime", "video/webm", "application/pdf", "application/json",
   "text/plain", "text/csv", "text/markdown"
 ]);
 
@@ -2140,19 +2604,30 @@ export interface JobRunnerOptions {
   leaseMs?: number;
   heartbeatMs?: number;
   pollMs?: number;
+  concurrency?: number;
   now?: () => Date;
   onChanged?: () => void;
+}
+
+export function jobRetryDelayMs(attempts: number): number | undefined {
+  return [2_000, 8_000, 30_000][(attempts - 1) % 4];
+}
+
+export function jobRetryDelayForError(error: unknown, attempts: number): number | undefined {
+  if (error instanceof AppError && !error.retryable) return undefined;
+  return jobRetryDelayMs(attempts);
 }
 
 export class JobRunner {
   private readonly leaseMs: number;
   private readonly heartbeatMs: number;
   private readonly pollMs: number;
+  private readonly concurrency: number;
+  private readonly claimableTypes: readonly string[];
   private readonly now: () => Date;
   private readonly onChanged: () => void;
   private pollTimer: NodeJS.Timeout | undefined;
-  private runningAbort: AbortController | undefined;
-  private runningJobId: string | undefined;
+  private readonly running = new Map<string, { abort: AbortController; promise: Promise<void> }>();
   private draining = false;
   private stopped = true;
   private drainPromise: Promise<void> | undefined;
@@ -2165,6 +2640,8 @@ export class JobRunner {
     this.leaseMs = options.leaseMs ?? 30_000;
     this.heartbeatMs = options.heartbeatMs ?? 10_000;
     this.pollMs = options.pollMs ?? 1_000;
+    this.concurrency = Math.max(1, Math.min(options.concurrency ?? 1, 16));
+    this.claimableTypes = Object.keys(handlers);
     this.now = options.now ?? (() => new Date());
     this.onChanged = options.onChanged ?? (() => undefined);
   }
@@ -2180,16 +2657,18 @@ export class JobRunner {
     if (!this.stopped) this.triggerDrain();
   }
 
+  canRun(type: string): boolean { return this.claimableTypes.includes(type); }
+
   stop(): void {
     this.stopped = true;
     if (this.pollTimer) clearInterval(this.pollTimer);
     this.pollTimer = undefined;
-    this.runningAbort?.abort();
+    for (const { abort } of this.running.values()) abort.abort();
   }
 
   cancel(jobId: string): Job {
     const job = this.repository.cancel(jobId, this.now().toISOString());
-    if (this.runningJobId === jobId) this.runningAbort?.abort();
+    this.running.get(jobId)?.abort.abort();
     this.onChanged();
     return job;
   }
@@ -2209,22 +2688,30 @@ export class JobRunner {
     this.draining = true;
     try {
       while (!this.stopped) {
-        const now = this.now();
-        const job = this.repository.claimNext(now.toISOString(), new Date(now.getTime() + this.leaseMs).toISOString());
-        if (!job) break;
-        this.onChanged();
-        await this.run(job);
+        while (!this.stopped && this.running.size < this.concurrency) {
+          const now = this.now();
+          const job = this.repository.claimNext(
+            now.toISOString(), new Date(now.getTime() + this.leaseMs).toISOString(), this.claimableTypes
+          );
+          if (!job) break;
+          this.onChanged();
+          const abort = new AbortController();
+          const promise = this.run(job, abort).finally(() => { this.running.delete(job.id); });
+          this.running.set(job.id, { abort, promise });
+        }
+        if (this.running.size === 0) break;
+        await Promise.race([...this.running.values()].map(({ promise }) => promise));
+      }
+      if (this.stopped && this.running.size > 0) {
+        await Promise.allSettled([...this.running.values()].map(({ promise }) => promise));
       }
     } finally {
       this.draining = false;
     }
   }
 
-  private async run(job: Job): Promise<void> {
+  private async run(job: Job, abort: AbortController): Promise<void> {
     const handler = this.handlers[job.type];
-    const abort = new AbortController();
-    this.runningAbort = abort;
-    this.runningJobId = job.id;
     const heartbeat = setInterval(() => {
       const now = this.now();
       this.repository.heartbeat(job.id, new Date(now.getTime() + this.leaseMs).toISOString(), now.toISOString());
@@ -2247,16 +2734,12 @@ export class JobRunner {
         this.repository.interrupt(job.id, "Interrupted while locking workspace", this.now().toISOString());
       } else if (!this.stopped || abort.signal.aborted) {
         const now = this.now();
-        const retryDelays = [1_000, 5_000];
-        const attemptWithinCycle = (job.attempts - 1) % 3;
-        const delay = abort.signal.aborted ? 0 : retryDelays[attemptWithinCycle];
+        const delay = abort.signal.aborted ? 0 : jobRetryDelayForError(error, job.attempts);
         const retryAt = delay === undefined ? undefined : new Date(now.getTime() + delay).toISOString();
-        this.repository.fail(job.id, abort.signal.aborted ? "Interrupted while locking workspace" : error instanceof Error ? error.message : "Job failed", now.toISOString(), retryAt);
+        this.repository.fail(job.id, abort.signal.aborted ? "JOB_INTERRUPTED" : error instanceof AppError ? error.code : "INTERNAL_ERROR", now.toISOString(), retryAt);
       }
     } finally {
       clearInterval(heartbeat);
-      this.runningAbort = undefined;
-      this.runningJobId = undefined;
       this.onChanged();
     }
   }

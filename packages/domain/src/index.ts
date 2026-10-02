@@ -545,7 +545,7 @@ export interface Job {
 
 export type AgentIntent = "record" | "retrieve" | "review" | "clarify" | "strategy" | "evidence";
 export type AgentExecutionMode = "private" | "enhanced";
-export type LlmProvider = "nvidia" | "openrouter" | "bailian";
+export type LlmProvider = "nvidia" | "openrouter" | "bailian" | "minimax";
 export type BailianRegion = "cn-beijing" | "ap-southeast-1" | "us-east-1" | "cn-hongkong";
 export type LlmConnectionStatus = "not_configured" | "ready" | "needs_attention";
 
@@ -557,6 +557,7 @@ export interface LlmProviderConfig {
   credentialConfigured: boolean;
   status: LlmConnectionStatus;
   lastTestedAt?: IsoDateTime;
+  capabilities?: LlmTaskCapabilities;
 }
 
 export interface LlmSettings {
@@ -567,6 +568,15 @@ export interface LlmSettings {
 export type LlmModelModality = "text" | "image" | "audio" | "video" | "embedding" | "other" | "unknown";
 export type LlmModelModalitySource = "provider" | "conservative" | "unknown";
 export type LlmModelCompatibility = "compatible" | "incompatible" | "unknown";
+export interface LlmTaskCapabilities {
+  inputModalities: LlmModelModality[];
+  outputModalities: LlmModelModality[];
+  structuredOutput: boolean;
+  streaming?: boolean;
+  maxInput?: number;
+  verifiedTasks: Array<"connection" | "structured_output" | "screening" | "report" | "legal_research" | "embedding">;
+  lastVerifiedAt: IsoDateTime;
+}
 export type LlmModelCompatibilityReason =
   | "no_text_input"
   | "no_text_output"
@@ -1120,3 +1130,5 @@ export interface CaseBinderExportResult {
   byteSize: number;
   generatedAt: IsoDateTime;
 }
+
+export * from "./redesign";

@@ -1,10 +1,16 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
 import type { IpcRendererEvent } from "electron";
 import { AppError, toSerializedError, type GrudgeVaultApi, type IpcResult } from "@grudge-vault/shared";
+import { readPastedImage } from "./pasted-image";
+import { subscribeMediaProgress } from "./media-progress";
 
 const invoke = <T>(channel: string, input?: unknown) => ipcRenderer.invoke(channel, input) as Promise<IpcResult<T>>;
+const pendingIntakePreparations = new Map<string, AbortController>();
 
 const api: GrudgeVaultApi = {
+  external: {
+    open: (url) => invoke("external:open", url)
+  },
   workspace: {
     current: () => invoke("workspace:current"),
     status: () => invoke("workspace:status"),
@@ -48,7 +54,103 @@ const api: GrudgeVaultApi = {
     save: (input) => invoke("llm:save", input),
     connect: (input) => invoke("llm:connect", input),
     activate: (provider) => invoke("llm:activate", provider),
+    pause: () => invoke("llm:pause"),
     disconnect: (provider) => invoke("llm:disconnect", provider)
+  },
+  intake: {
+    onMediaProgress: (callback) => subscribeMediaProgress(ipcRenderer, "intake:media-progress", callback),
+    prepare: async ({ requestId, text, files }) => {
+      if (pendingIntakePreparations.has(requestId)) {
+        return { ok: false, error: toSerializedError(new AppError("INVALID_INPUT", "这份输入正在准备中。", true)) };
+      }
+      const controller = new AbortController();
+      pendingIntakePreparations.set(requestId, controller);
+      try {
+        const paths: string[] = [];
+        const fileNames: string[] = [];
+        const inlineMedia: Array<{ fileName: string; mimeType: string; bytes: Uint8Array }> = [];
+        let inlineByteSize = 0;
+        const imageExtensions: Record<string, string> = {
+          "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/heic": ".heic"
+        };
+        for (const [index, file] of files.entries()) {
+          if (controller.signal.aborted) throw controller.signal.reason;
+          let path = "";
+          try { path = webUtils.getPathForFile(file); } catch { /* Clipboard Files do not have a local path. */ }
+          if (path) {
+            paths.push(path);
+            fileNames.push(file.name || path.split(/[\\/]/).at(-1) || "attachment");
+            continue;
+          }
+          const extension = imageExtensions[file.type];
+          if (!extension || file.size === 0 || file.size > 20 * 1024 * 1024) {
+            throw new AppError("INVALID_INPUT", "直接粘贴只支持单张不超过 20 MB 的图片；其他媒体请从本机选择文件。", true);
+          }
+          inlineByteSize += file.size;
+          if (inlineByteSize > 64 * 1024 * 1024) {
+            throw new AppError("INVALID_INPUT", "粘贴图片合计不能超过 64 MB，请改用文件选择。", true);
+          }
+          const fileName = file.name || `pasted-image-${index + 1}${extension}`;
+          inlineMedia.push({ fileName, mimeType: file.type, bytes: await readPastedImage(file, controller.signal) });
+        }
+        if (controller.signal.aborted) throw controller.signal.reason;
+        return await invoke("intake:prepare", { requestId, text, paths, fileNames, inlineMedia });
+      } catch (error) {
+        return { ok: false, error: toSerializedError(error) };
+      } finally {
+        if (pendingIntakePreparations.get(requestId) === controller) pendingIntakePreparations.delete(requestId);
+      }
+    },
+    abandonPreparation: (requestId) => {
+      pendingIntakePreparations.get(requestId)?.abort(
+        new AppError("SOURCE_UNAVAILABLE", "输入准备已取消，未建立正式记录。", true)
+      );
+      return invoke("intake:abandon-prepare", requestId);
+    },
+    abandon: (sessionId) => invoke("intake:abandon", sessionId),
+    screenAndSave: (sessionId, operationId) => invoke("intake:screen-and-save", { sessionId, operationId }),
+    chooseDayOneZip: () => invoke("intake:choose-dayone-zip"),
+    dayOneImportProgress: () => invoke("intake:dayone-import-progress"),
+    lastDayOneImportReceipt: () => invoke("intake:last-dayone-import-receipt"),
+    pauseDayOneZip: (operationId) => invoke("intake:pause-dayone-zip", operationId),
+    resumeDayOneZip: (operationId) => invoke("intake:resume-dayone-zip", operationId),
+    cancelDayOneZip: () => invoke("intake:cancel-dayone-zip"),
+    chooseLegacyWorkspace: () => invoke("intake:choose-legacy-workspace"),
+    cancelLegacyWorkspace: () => invoke("intake:cancel-legacy-workspace")
+  },
+  records: {
+    onSearchMediaProgress: (callback) => subscribeMediaProgress(ipcRenderer, "records:search-media-progress", callback),
+    timeline: (filter) => invoke("records:timeline", filter),
+    get: (id) => invoke("records:get", id),
+    patchFields: (input) => invoke("records:patch-fields", input),
+    reanalyze: (id, expectedRevision) => invoke("records:reanalyze", { id, expectedRevision }),
+    search: (query) => invoke("records:search", query),
+    prepareSearch: async ({ requestId, text, files }) => {
+      try {
+        const paths = files.map((file) => webUtils.getPathForFile(file));
+        if (paths.some((path) => !path)) throw new AppError("FILE_NOT_REGULAR", "Only local files selected by the system can be used.");
+        return await invoke("records:search-prepare", { requestId, text, paths, fileNames: files.map(({ name }) => name) });
+      } catch (error) {
+        return { ok: false, error: toSerializedError(error) };
+      }
+    },
+    abandonSearchPreparation: (requestId) => invoke("records:search-abandon-prepare", requestId),
+    executeSearch: (sessionId, filters) => invoke("records:search-execute", { sessionId, filters }),
+    abandonSearch: (sessionId) => invoke("records:search-abandon", sessionId),
+    searchIndexStatus: () => invoke("records:search-index-status"),
+    rebuildSearchIndex: () => invoke("records:search-index-rebuild"),
+    setSearchIndexEnabled: (enabled) => invoke("records:search-index-enabled", enabled)
+  },
+  pending: {
+    list: () => invoke("pending:list"),
+    resolve: (id, action, operationId) => invoke("pending:resolve", { id, action, operationId }),
+    rescreenManual: (id, sessionId) => invoke("pending:rescreen-manual", { id, sessionId }),
+    chooseDayOneZip: (id, operationId) => invoke("pending:choose-dayone-zip", { id, operationId }),
+    chooseLegacyWorkspace: (id, operationId) => invoke("pending:choose-legacy-workspace", { id, operationId })
+  },
+  legal: {
+    getDefaultJurisdiction: () => invoke("legal:default-jurisdiction"),
+    setDefaultJurisdiction: (jurisdiction) => invoke("legal:set-default-jurisdiction", jurisdiction)
   },
   events: {
     search: (query) => invoke("events:search", query),
@@ -142,6 +244,8 @@ const api: GrudgeVaultApi = {
     list: () => invoke("assets:list"),
     verify: (assetId) => invoke("assets:verify", assetId),
     preview: (assetId) => invoke("assets:preview", assetId),
+    openMediaPreview: (input) => invoke("assets:open-media-preview", input),
+    closeMediaPreview: (requestId) => invoke("assets:close-media-preview", requestId),
     exportCopy: (assetId) => invoke("assets:export", assetId)
   },
   evidence: {

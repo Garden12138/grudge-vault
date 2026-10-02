@@ -14,7 +14,11 @@ extraMetadata:
 asarUnpack:
   - node_modules/better-sqlite3/**/*.node
 mac:
+  extraResources:
+    - from: apps/desktop/build/native/grudge-vault-media
+      to: bin/grudge-vault-media
   category: public.app-category.productivity
+  icon: apps/desktop/build/icon.icns
   target:
     - dmg
     - zip

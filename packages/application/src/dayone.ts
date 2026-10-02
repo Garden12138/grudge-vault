@@ -78,12 +78,47 @@ export interface DayOneImportReport {
   missingMedia: number;
 }
 
+export interface DayOneImportPreview {
+  totalEntries: number;
+  validEntries: number;
+  invalidEntries: number;
+  mediaReferences: number;
+  matchedMediaFiles: number;
+  mediaBytes: number;
+  missingOrUnsupportedMedia: number;
+}
+
 export interface DayOneImporterPort {
   importArchive(
     archivePath: string,
     consumer: DayOneImportConsumer,
     signal: AbortSignal,
     limits?: DayOneImportLimits
+  ): Promise<DayOneImportReport>;
+}
+
+export interface TransientDayOneMedia {
+  path: string;
+  fileName: string;
+  kind: DayOneMediaKind;
+  byteSize: number;
+}
+
+export interface DayOneScreeningConsumer {
+  onEntry(entry: NormalizedDayOneEntry, media: TransientDayOneMedia[], incompleteMedia: boolean): Promise<void>;
+  onIssue(issue: Omit<ImportIssue, "id" | "importRunId" | "createdAt">): Promise<void>;
+  onProgress(progress: number): void;
+}
+
+export interface DayOneScreeningImporterPort {
+  previewArchive?(archivePath: string, signal: AbortSignal, limits?: DayOneImportLimits): Promise<DayOneImportPreview>;
+  scanArchive(
+    archivePath: string,
+    temporaryRoot: string,
+    consumer: DayOneScreeningConsumer,
+    signal: AbortSignal,
+    limits?: DayOneImportLimits,
+    filterEntry?: (entry: NormalizedDayOneEntry) => boolean
   ): Promise<DayOneImportReport>;
 }
 

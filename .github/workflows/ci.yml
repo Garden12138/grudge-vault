@@ -1,8 +1,9 @@
-name: Phase 6 CI
+name: CI and cross-platform packaging
 
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 permissions:
@@ -29,6 +30,12 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
+      - run: pnpm test:packaging
+      - run: pnpm test:live-smoke-budget
+      - run: pnpm test:screening-kit
+      - name: Native media fixtures (macOS)
+        if: runner.os == 'macOS'
+        run: pnpm test:mac-media
       - run: pnpm build
       - name: Electron E2E (Linux)
         if: runner.os == 'Linux'
@@ -68,9 +75,13 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
-      - run: pnpm exec electron-builder --config electron-builder.yml ${{ matrix.args }}
+      - run: node scripts/prepare-package-assets.mjs
+      - run: pnpm exec electron-builder --config electron-builder.yml ${{ matrix.args }} --publish never
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      - name: Smoke-test packaged Mac app
+        if: runner.os == 'macOS'
+        run: node scripts/verify-mac-package.mjs release --installers --source-match
       - uses: actions/upload-artifact@v4
         with:
           name: grudge-vault-${{ matrix.name }}

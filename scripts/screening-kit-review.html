@@ -1,0 +1,52 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self'; media-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>虚构用例独立复核</title><style>
+*{box-sizing:border-box}body{margin:0;background:#f5f7fb;color:#182333;font:17px/1.65 system-ui,sans-serif}main{max-width:960px;margin:32px auto;padding:24px;background:white;border:1px solid #d9e1ef;border-radius:18px}
+h1{font-size:27px;margin:0 0 14px}p{margin:12px 0}.note{color:#58677e}.case{padding:20px;border:1px solid #d9e1ef;border-radius:12px;margin:20px 0;white-space:pre-wrap;overflow-wrap:anywhere}
+img,video{display:block;width:100%;max-height:530px;object-fit:contain;background:#fafafa}audio{width:100%}button,select{font:inherit;padding:10px 15px;border-radius:9px;border:1px solid #bdc9db;background:white;color:#182333;cursor:pointer}button:disabled{opacity:.45;cursor:default}button[aria-pressed=true]{background:#245ce4;color:white}
+button:focus-visible,select:focus-visible{outline:3px solid #8cacff;outline-offset:3px}.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:18px 0}.warning{color:#8b4c00}fieldset{border:0;padding:0;margin:0}legend{margin-bottom:10px}@media(max-width:600px){main{margin:12px;padding:16px}h1{font-size:23px}}
+</style></head><body><main><h1>虚构用例独立复核</h1>
+<p class="note">这批素材均为虚构，不是你的日记。请只根据当前文字及媒体判断：是否与陈述者的冲突、权益或安全有关。新闻、电影、梦境和否定语境不应仅凭关键词收录。生成标签和模型预测不会在此显示。</p>
+<p class="note">建议两位复核者分别从空白页面开始，独立导出，再核对分歧。标签仅存在本页内存；刷新或关闭会丢失。这里不会联网、调用模型或自动保存。</p>
+<div class="actions"><label>复核者 <select id="reviewer"><option value="a">甲</option><option value="b">乙</option></select></label><label>跳到用例 <select id="jump"></select></label><span id="progress" role="status"></span></div>
+<h2 id="heading"></h2><div class="case"><p id="text"></p><div id="media"></div><p id="media-error" class="warning" role="alert"></p></div>
+<fieldset><legend>你的判断（不是模型结果）</legend><div class="actions" id="decisions"><button data-decision="include" aria-pressed="false">相关事件，收录</button><button data-decision="skip" aria-pressed="false">普通日常或非本人经历，跳过</button><button data-decision="review" aria-pressed="false">信息不足，待确认</button></div></fieldset>
+<label>相关类别 <select id="category"><option value="">未选／不适用</option value="grudge">冲突／受辱失信</option><option value="rights">权益可能受损</option><option value="danger">危险／安全风险</option></select></label>
+<div class="actions"><button id="previous">上一条</button><button id="next">下一条</button><button id="export" disabled>导出本人的标签</button></div><p id="summary" role="status"></p>
+<p class="note">全部填写后才可导出。计划目标为80条相关、80条日常、40条待确认，至少20条明确危险、60条媒体用例。若独立判断后比例不符，应补充或替换用例，不要为凑数改标签。两份标签、实际模型预测及媒体完整性均未核对前，不能当作G2通过。</p>
+</main><script>
+const inputs = /* SCREENING_KIT_DATA */ null;
+const labels = inputs.cases.map(({id}) => ({id, expected:null, category:""}));
+let index = 0;
+const $ = id => document.getElementById(id);
+const complete = item => item.expected && (item.expected !== "include" || item.category);
+inputs.cases.forEach(({id}, i) => { const option=document.createElement("option");option.value=String(i);option.textContent=id;$("jump").append(option); });
+function status() {
+ const done=labels.filter(complete).length;$("progress").textContent=`已完成 ${done}／${labels.length} 条`;
+ $("export").disabled=done!==labels.length;
+ $("summary").textContent=`收录 ${labels.filter(x=>x.expected==="include").length}；跳过 ${labels.filter(x=>x.expected==="skip").length}；待确认 ${labels.filter(x=>x.expected==="review").length}；标注为危险 ${labels.filter(x=>x.expected==="include"&&x.category==="danger").length}。`;
+}
+function show() {
+ $("media").querySelectorAll("audio,video").forEach(element=>{element.pause();element.removeAttribute("src");element.load();});
+ const value=inputs.cases[index], label=labels[index];$("heading").textContent=value.id;
+ $("text").textContent=value.text||"无文字输入，请检查媒体。";$("media").replaceChildren();$("media-error").textContent="";
+ for(const asset of value.media){
+  if(!/^assets\/case-\d{3}\.(png|wav|mp4)$/.test(asset.file)) throw Error("Invalid synthetic asset path");
+  const element=document.createElement(asset.kind==="image"?"img":asset.kind==="audio"?"audio":"video");
+  if(asset.kind==="image")element.alt="待复核的虚构图片";else{element.controls=true;element.preload="metadata";}
+  element.src=asset.file;element.addEventListener("error",()=>{if(element.isConnected&&inputs.cases[index].id===value.id)$("media-error").textContent="媒体未能加载。请先核对素材，不要把无法检查标成日常。";});$("media").append(element);
+ }
+ $("decisions").querySelectorAll("button").forEach(button=>button.setAttribute("aria-pressed",String(button.dataset.decision===label.expected)));
+ $("category").value=label.category;$("category").disabled=label.expected==="skip";$("previous").disabled=index===0;$("next").disabled=index===labels.length-1;$("jump").value=String(index);status();
+}
+$("decisions").addEventListener("click", event=>{const decision=event.target.dataset.decision;if(!["include","skip","review"].includes(decision))return;labels[index].expected=decision;if(decision==="skip")labels[index].category="";show();});
+$("category").addEventListener("change",()=>{labels[index].category=$("category").value;status();});
+$("previous").addEventListener("click",()=>{if(index>0){index--;show();}});$("next").addEventListener("click",()=>{if(index<labels.length-1){index++;show();}});$("jump").addEventListener("change",()=>{index=Number($("jump").value);show();});
+$("export").addEventListener("click",()=>{
+ if(!labels.every(complete))return;
+ const output=labels.map(({id,expected,category})=>({id,expected,...(category?{category}:{})}));
+ const url=URL.createObjectURL(new Blob([JSON.stringify(output,null,2)],{type:"application/json"}));
+ const link=document.createElement("a");link.href=url;link.download=`labels-review-${$("reviewer").value}.json`;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+});
+show();
+</script></body></html>

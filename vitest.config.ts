@@ -11,7 +11,8 @@ export default defineConfig({
       "@grudge-vault/application": fromRoot("./packages/application/src/index.ts"),
       "@grudge-vault/importer-dayone": fromRoot("./packages/importer-dayone/src/index.ts"),
       "@grudge-vault/persistence-sqlite": fromRoot("./packages/persistence-sqlite/src/index.ts"),
-      "@grudge-vault/object-vault": fromRoot("./packages/object-vault/src/index.ts")
+      "@grudge-vault/object-vault": fromRoot("./packages/object-vault/src/index.ts"),
+      "@grudge-vault/media-pipeline": fromRoot("./packages/media-pipeline/src/index.ts")
     }
   },
   test: {

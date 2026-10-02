@@ -1,0 +1,8 @@
+extends: ./electron-builder.yml
+appId: com.grudgevault.desktop.preview
+productName: Grudge Vault 测试版
+directories:
+  output: release-preview
+extraMetadata:
+  name: grudge-vault-redesign-preview
+  productName: Grudge Vault 测试版

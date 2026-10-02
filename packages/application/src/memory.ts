@@ -110,6 +110,8 @@ export interface AgentRepositoryPort {
   saveSettings(settings: AgentModelSettings, now: string): AgentModelSettings;
   getCredential(mode: AgentExecutionMode): AgentCredentialEnvelope | undefined;
   saveCredential(mode: AgentExecutionMode, envelope: AgentCredentialEnvelope | undefined, now: string): void;
+  /** Run synchronous model configuration reads/writes atomically, including lazy initialization. */
+  withLlmConfigurationTransaction(write: () => LlmSettings): LlmSettings;
   getLlmSettings(): LlmSettings | undefined;
   saveLlmSettings(settings: LlmSettings, now: string): LlmSettings;
   getLlmProviderConfig(provider: LlmProvider): LlmProviderConfig | undefined;

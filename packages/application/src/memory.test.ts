@@ -1,8 +1,12 @@
 import { Readable } from "node:stream";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import Database from "better-sqlite3";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  GrudgeVaultApplication, parseConservativeTemporalValue,
+  DAYONE_IMPORT_RECEIPT_KEY, GrudgeVaultApplication, JobRunner, jobRetryDelayForError, jobRetryDelayMs, parseConservativeTemporalValue,
+  resolveLlmProviderEndpoint,
   type EmbeddingAdapterPort, type EventDraftGeneratorPort, type NormalizedDayOneEntry, type ObjectVaultPort,
   type WorkspaceManagerPort, type WorkspaceSession
 } from "./index";
@@ -12,8 +16,103 @@ import {
 } from "@grudge-vault/persistence-sqlite";
 import { AppError } from "@grudge-vault/shared";
 
-function testContext(generator?: EventDraftGeneratorPort, embeddingAdapter?: EmbeddingAdapterPort) {
-  const database = new Database(":memory:");
+describe("background retry policy", () => {
+  it("uses a validated Bailian workspace endpoint when one is configured", () => {
+    expect(resolveLlmProviderEndpoint("bailian", "cn-beijing", "ws-123"))
+      .toBe("https://ws-123.cn-beijing.maas.aliyuncs.com/compatible-mode/v1");
+    expect(resolveLlmProviderEndpoint("bailian", "cn-beijing"))
+      .toBe("https://dashscope.aliyuncs.com/compatible-mode/v1");
+    expect(() => resolveLlmProviderEndpoint("bailian", "cn-beijing", "unsafe.example/../../"))
+      .toThrowError(AppError);
+  });
+  it("uses the specified 2, 8 and 30 second backoff for each four-attempt cycle", () => {
+    expect([1, 2, 3, 4, 5].map(jobRetryDelayMs)).toEqual([2_000, 8_000, 30_000, undefined, 2_000]);
+  });
+
+  it("does not retry an error explicitly marked non-retryable", () => {
+    expect(jobRetryDelayForError(new AppError("INVALID_INPUT", "invalid", false), 1)).toBeUndefined();
+    expect(jobRetryDelayForError(new AppError("SCREENING_FAILED", "temporary", true), 1)).toBe(2_000);
+    expect(jobRetryDelayForError(new Error("unknown transport failure"), 2)).toBe(8_000);
+  });
+
+  it("runs at the configured bounded concurrency without claiming a third job early", async () => {
+    const database = new Database(":memory:");
+    database.pragma("foreign_keys = ON");
+    runMigrations(database);
+    const jobs = new SqliteJobRepository(database);
+    const now = new Date().toISOString();
+    for (let index = 0; index < 3; index += 1) jobs.enqueue("test.parallel", { index }, now, 1);
+    const releases: Array<() => void> = [];
+    const started: string[] = [];
+    let active = 0;
+    let peak = 0;
+    const runner = new JobRunner(jobs, {
+      "test.parallel": async (job) => {
+        started.push(job.id); active += 1; peak = Math.max(peak, active);
+        await new Promise<void>((resolve) => releases.push(resolve));
+        active -= 1;
+      }
+    }, { concurrency: 2, pollMs: 1_000 });
+    try {
+      runner.start();
+      await vi.waitFor(() => expect(started).toHaveLength(2));
+      expect(active).toBe(2);
+      releases.shift()!();
+      await vi.waitFor(() => expect(started).toHaveLength(3));
+      expect(peak).toBe(2);
+      for (const release of releases.splice(0)) release();
+      await vi.waitFor(() => expect(jobs.list().every(({ state }) => state === "succeeded")).toBe(true));
+    } finally {
+      await runner.stopAndWait();
+      database.close();
+    }
+  });
+
+  it("does not claim a queued job without a handler in this app version", async () => {
+    const database = new Database(":memory:");
+    runMigrations(database);
+    const jobs = new SqliteJobRepository(database);
+    const now = new Date().toISOString();
+    const legacy = jobs.enqueue("dayone.import", {}, now, 1);
+    const current = jobs.enqueue("record.analyze", {}, now, 1);
+    const runner = new JobRunner(jobs, { "record.analyze": async () => undefined }, { pollMs: 10 });
+    try {
+      runner.start();
+      await vi.waitFor(() => expect(jobs.list().find(({ id }) => id === current.id)?.state).toBe("succeeded"));
+      expect(jobs.list().find(({ id }) => id === legacy.id)).toMatchObject({ state: "queued", attempts: 0 });
+    } finally {
+      await runner.stopAndWait();
+      database.close();
+    }
+  });
+
+  it("stores only failure codes when a background handler includes private content in its error", async () => {
+    const database = new Database(":memory:");
+    runMigrations(database);
+    const jobs = new SqliteJobRepository(database);
+    const now = new Date().toISOString();
+    const privateMarker = "private-diary-and-filename-job-error-marker";
+    const known = jobs.enqueue("test.known-error", {}, now, 1);
+    const unknown = jobs.enqueue("test.unknown-error", {}, now, 1);
+    const runner = new JobRunner(jobs, {
+      "test.known-error": async () => { throw new AppError("SCREENING_FAILED", privateMarker, false); },
+      "test.unknown-error": async () => { throw new Error(privateMarker); }
+    }, { pollMs: 10 });
+    try {
+      runner.start();
+      await vi.waitFor(() => expect(jobs.list().filter(({ state }) => state === "failed")).toHaveLength(2));
+      expect(jobs.list().find(({ id }) => id === known.id)?.lastError).toBe("SCREENING_FAILED");
+      expect(jobs.list().find(({ id }) => id === unknown.id)?.lastError).toBe("INTERNAL_ERROR");
+      expect(database.serialize().includes(Buffer.from(privateMarker))).toBe(false);
+    } finally {
+      await runner.stopAndWait();
+      database.close();
+    }
+  });
+});
+
+function testContext(generator?: EventDraftGeneratorPort, embeddingAdapter?: EmbeddingAdapterPort, databasePath = ":memory:") {
+  const database = new Database(databasePath);
   database.pragma("foreign_keys = ON");
   runMigrations(database);
   const vault: ObjectVaultPort = {
@@ -42,8 +141,295 @@ function testContext(generator?: EventDraftGeneratorPort, embeddingAdapter?: Emb
     async createBackup() { throw new Error("unused"); }, async restoreBackup() { return session; },
     async close() {}
   };
-  return { database, session, application: new GrudgeVaultApplication(manager, generator, undefined, embeddingAdapter) };
+  return { database, session, manager, application: new GrudgeVaultApplication(manager, generator, undefined, embeddingAdapter) };
 }
+
+describe("workspace terminal import receipts", () => {
+  const databases: Database.Database[] = [];
+  afterEach(() => { vi.restoreAllMocks(); for (const database of databases.splice(0)) if (database.open) database.close(); });
+  const receipt = { finishedAt: "2026-09-29T08:30:00.000Z", outcome: "completed", totalEntries: 3,
+    included: 0, skipped: 3, review: 0, failed: 0, issueCount: 0, mediaEntries: 0, missingMedia: 0 };
+  it("stores only one projected aggregate without ordinary-entry records or source identifiers", () => {
+    const context = testContext(); databases.push(context.database);
+    expect(context.application.getLastDayOneImportReceipt()).toBeNull();
+    context.application.saveDayOneImportReceipt(context.session, { ...receipt,
+      body: "synthetic-private-receipt-marker", sourceId: "synthetic-private-source", filename: "synthetic-private.zip" });
+    expect(context.application.getLastDayOneImportReceipt()).toEqual(receipt);
+    const stored = context.database.prepare("SELECT value_json, updated_at FROM workspace_settings WHERE key = ?")
+      .get(DAYONE_IMPORT_RECEIPT_KEY) as { value_json: string; updated_at: string };
+    expect(JSON.parse(stored.value_json)).toEqual(receipt); expect(stored.updated_at).toBe(receipt.finishedAt);
+    expect(context.database.serialize().includes(Buffer.from("synthetic-private"))).toBe(false);
+    for (const table of ["source_items", "journal_entries", "assets", "redesign_records", "redesign_pending_reviews"])
+      expect(context.database.prepare(`SELECT count(*) FROM ${table}`).pluck().get()).toBe(0);
+  });
+  it("survives a real database close and reopen, replacing only the latest batch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "grudge-vault-receipt-test-"));
+    try {
+      const first = testContext(undefined, undefined, join(root, "synthetic.sqlite3")); databases.push(first.database);
+      first.application.saveDayOneImportReceipt(first.session, receipt);
+      const latest = { ...receipt, outcome: "cancelled", skipped: 1, finishedAt: "2026-09-29T08:35:00.000Z" };
+      first.application.saveDayOneImportReceipt(first.session, latest); first.database.close();
+      const reopened = testContext(undefined, undefined, join(root, "synthetic.sqlite3")); databases.push(reopened.database);
+      expect(reopened.application.getLastDayOneImportReceipt()).toEqual(latest);
+      expect(reopened.database.prepare("SELECT count(*) FROM workspace_settings WHERE key = ?").pluck().get(DAYONE_IMPORT_RECEIPT_KEY)).toBe(1);
+      reopened.database.close();
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+  it("rejects a closed or replacement session even with the same workspace id", () => {
+    const context = testContext(); databases.push(context.database);
+    const current = vi.spyOn(context.manager, "current");
+    current.mockReturnValue(undefined);
+    expect(() => context.application.saveDayOneImportReceipt(context.session, receipt)).toThrowError(AppError);
+    current.mockReturnValue({ ...context.session });
+    expect(() => context.application.saveDayOneImportReceipt(context.session, receipt)).toThrowError(AppError);
+    current.mockRestore(); expect(context.application.getLastDayOneImportReceipt()).toBeNull();
+  });
+  it("rolls back a post-write failure without deleting the preceding summary or leaking the SQL error", () => {
+    const context = testContext(); databases.push(context.database);
+    context.application.saveDayOneImportReceipt(context.session, receipt);
+    context.database.exec(`CREATE TEMP TRIGGER reject_receipt AFTER UPDATE ON workspace_settings
+      WHEN NEW.key = 'redesign.last-dayone-import-v1'
+      BEGIN SELECT RAISE(FAIL, 'synthetic-private-receipt-write-error'); END;`);
+    expect(() => context.application.saveDayOneImportReceipt(context.session, { ...receipt, skipped: 2 }))
+      .toThrow("未能保存导入摘要；已处理的记录不受影响。");
+    expect(context.application.getLastDayOneImportReceipt()).toEqual(receipt);
+  });
+  it("reports corrupt metadata as unavailable rather than absent and never echoes stored content", () => {
+    const context = testContext(); databases.push(context.database);
+    context.database.prepare("INSERT INTO workspace_settings(key, value_json, updated_at) VALUES (?, ?, ?)")
+      .run(DAYONE_IMPORT_RECEIPT_KEY, "synthetic-private-invalid-json", receipt.finishedAt);
+    expect(() => context.application.getLastDayOneImportReceipt()).toThrow("暂时无法读取上次导入摘要；不会重新开始导入。");
+    context.session.memory.setSetting(DAYONE_IMPORT_RECEIPT_KEY, { ...receipt, privateBody: "synthetic-private" }, receipt.finishedAt);
+    expect(context.application.getLastDayOneImportReceipt()).toEqual(receipt);
+    context.session.memory.setSetting(DAYONE_IMPORT_RECEIPT_KEY, null, receipt.finishedAt);
+    expect(() => context.application.getLastDayOneImportReceipt()).toThrowError(AppError);
+  });
+});
+
+describe("model configuration storage transactions", () => {
+  const databases: Database.Database[] = [];
+  afterEach(() => {
+    vi.restoreAllMocks();
+    for (const database of databases.splice(0)) if (database.open) database.close();
+  });
+  const testedAt = "2026-09-28T00:00:00.000Z";
+  const nextTestedAt = "2026-09-28T00:01:00.000Z";
+  const newInput = {
+    provider: "bailian" as const, model: "qwen-new", region: "cn-beijing" as const,
+    workspaceId: "ws-new", apiKey: "synthetic-new-key"
+  };
+  const snapshot = (database: Database.Database) => ({
+    settings: database.prepare("SELECT * FROM llm_settings ORDER BY singleton").all(),
+    providers: database.prepare("SELECT * FROM llm_provider_settings ORDER BY provider").all(),
+    credentials: database.prepare("SELECT * FROM llm_provider_credentials ORDER BY provider").all(),
+    legacySettings: database.prepare("SELECT * FROM agent_model_settings ORDER BY singleton").all(),
+    legacyCredentials: database.prepare("SELECT * FROM agent_credentials ORDER BY mode").all()
+  });
+  const rejectWrite = (database: Database.Database, table: string, action: "INSERT" | "UPDATE" | "DELETE") => {
+    // FAIL deliberately leaves a completed row change in its statement, so only the
+    // surrounding transaction can restore the entire configuration.
+    database.exec(`CREATE TEMP TRIGGER reject_llm_write AFTER ${action} ON ${table}
+      BEGIN SELECT RAISE(FAIL, 'synthetic-model-write-failure'); END;`);
+  };
+  const change = (application: GrudgeVaultApplication, operation: string) => {
+    if (operation === "connect") return application.saveLlmConnection(newInput, nextTestedAt);
+    if (operation === "save") return application.saveLlmProvider(newInput);
+    if (operation === "activate") return application.activateLlmProvider("minimax", nextTestedAt);
+    if (operation === "disconnect") return application.disconnectLlmProvider("bailian");
+    if (operation === "pause") return application.pauseLlmProviders();
+    return application.markLlmProviderNeedsAttention("bailian");
+  };
+  const seededCases = [
+    ["connect", "llm_provider_credentials", "UPDATE"],
+    ["connect", "llm_provider_settings", "UPDATE"],
+    ["connect", "llm_settings", "UPDATE"],
+    ["save", "llm_provider_credentials", "UPDATE"],
+    ["save", "llm_provider_settings", "UPDATE"],
+    ["save", "llm_settings", "UPDATE"],
+    ["activate", "llm_provider_settings", "UPDATE"],
+    ["activate", "llm_settings", "UPDATE"],
+    ["disconnect", "llm_provider_credentials", "DELETE"],
+    ["disconnect", "llm_provider_settings", "DELETE"],
+    ["disconnect", "llm_settings", "UPDATE"],
+    ["pause", "llm_settings", "UPDATE"],
+    ["attention", "llm_provider_settings", "UPDATE"]
+  ] as const;
+
+  it.each(seededCases)("rolls back %s when %s %s fails after writing", (operation, table, action) => {
+    const { database, application } = testContext();
+    databases.push(database);
+    application.saveLlmConnection({ provider: "minimax", model: "MiniMax-M3", apiKey: "synthetic-minimax-key" }, testedAt);
+    application.saveLlmConnection({
+      provider: "bailian", model: "qwen-old", region: "cn-beijing", workspaceId: "ws-old", apiKey: "synthetic-old-key"
+    }, testedAt, {
+      inputModalities: ["text", "image"], outputModalities: ["text"], structuredOutput: true,
+      verifiedTasks: ["connection", "structured_output", "screening"], lastVerifiedAt: testedAt
+    });
+    const before = snapshot(database);
+    const assertCurrent = application.beginLlmConfigurationTest("bailian");
+    rejectWrite(database, table, action);
+    expect(() => change(application, operation)).toThrow("synthetic-model-write-failure");
+    expect(snapshot(database)).toEqual(before);
+    expect(() => assertCurrent()).not.toThrow();
+    expect(application.getLlmCredential("bailian")).toBe("synthetic-old-key");
+    expect(application.getLlmCredential("minimax")).toBe("synthetic-minimax-key");
+
+    database.exec("DROP TRIGGER reject_llm_write");
+    const result = change(application, operation);
+    expect(() => assertCurrent()).toThrowError(AppError);
+    if (operation === "connect" || operation === "save") {
+      expect(result.providers.bailian).toMatchObject({
+        model: "qwen-new", workspaceId: "ws-new", credentialConfigured: true,
+        status: operation === "connect" ? "ready" : "needs_attention"
+      });
+      expect(application.getLlmCredential("bailian")).toBe("synthetic-new-key");
+      expect(result.activeProvider).toBe(operation === "connect" ? "bailian" : undefined);
+    } else if (operation === "activate") {
+      expect(result.activeProvider).toBe("minimax");
+      expect(result.providers.minimax?.lastTestedAt).toBe(nextTestedAt);
+    } else if (operation === "disconnect") {
+      expect(result.providers.bailian).toBeUndefined();
+      expect(application.getLlmCredential("bailian")).toBeUndefined();
+      expect(result.activeProvider).toBeUndefined();
+    } else if (operation === "pause") expect(result.activeProvider).toBeUndefined();
+    else expect(result.providers.bailian?.status).toBe("needs_attention");
+  });
+
+  const firstWriteCases = (["connect", "save"] as const).flatMap((operation) => [
+    [operation, "llm_provider_credentials", "INSERT"], [operation, "llm_provider_settings", "INSERT"],
+    [operation, "llm_settings", "INSERT"], [operation, "llm_settings", "UPDATE"]
+  ] as const);
+  it.each(firstWriteCases)("leaves no first-time configuration after %s fails at %s %s", (operation, table, action) => {
+    const { database, application } = testContext();
+    databases.push(database);
+    const before = snapshot(database);
+    rejectWrite(database, table, action);
+    expect(() => change(application, operation)).toThrow("synthetic-model-write-failure");
+    expect(snapshot(database)).toEqual(before);
+    database.exec("DROP TRIGGER reject_llm_write");
+    expect(change(application, operation).providers.bailian?.model).toBe("qwen-new");
+    expect(application.getLlmCredential("bailian")).toBe("synthetic-new-key");
+  });
+
+  it.each(["llm_provider_credentials", "llm_provider_settings", "llm_settings"])(
+    "rolls back legacy configuration migration when %s fails and permits retry", (table) => {
+      const { database, application } = testContext();
+      databases.push(database);
+      application.updateAgentSettings({
+        mode: "enhanced", enhancedEndpoint: {
+          baseUrl: "https://openrouter.ai/api/v1", model: "synthetic-legacy-model", apiKey: "synthetic-legacy-key"
+        }
+      });
+      const before = snapshot(database);
+      rejectWrite(database, table, "INSERT");
+      expect(() => application.getLlmSettings()).toThrow("synthetic-model-write-failure");
+      expect(snapshot(database)).toEqual(before);
+      database.exec("DROP TRIGGER reject_llm_write");
+      expect(application.getLlmSettings()).toMatchObject({
+        activeProvider: "openrouter", providers: { openrouter: { model: "synthetic-legacy-model", status: "ready" } }
+      });
+      expect(application.getLlmCredential("openrouter")).toBe("synthetic-legacy-key");
+      expect(snapshot(database).legacySettings).toEqual(before.legacySettings);
+      expect(snapshot(database).legacyCredentials).toEqual(before.legacyCredentials);
+    }
+  );
+
+  it("leaves no initialized settings marker when its write fails", () => {
+    const { database, application } = testContext();
+    databases.push(database);
+    const before = snapshot(database);
+    rejectWrite(database, "llm_settings", "INSERT");
+    expect(() => application.getLlmSettings()).toThrow("synthetic-model-write-failure");
+    expect(snapshot(database)).toEqual(before);
+    database.exec("DROP TRIGGER reject_llm_write");
+    expect(application.getLlmSettings()).toEqual({ providers: {} });
+  });
+
+  it.each(["connect", "save"])("keeps the explicit %s choice when legacy settings initialize in the same call", (operation) => {
+    const { database, application } = testContext();
+    databases.push(database);
+    application.updateAgentSettings({
+      mode: "enhanced", enhancedEndpoint: {
+        baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "synthetic-legacy-model", apiKey: "synthetic-legacy-key"
+      }
+    });
+    const legacy = snapshot(database);
+    const result = change(application, operation);
+    expect(result.providers.bailian).toMatchObject({
+      model: "qwen-new", workspaceId: "ws-new", status: operation === "connect" ? "ready" : "needs_attention"
+    });
+    expect(result.activeProvider).toBe(operation === "connect" ? "bailian" : undefined);
+    expect(application.getLlmCredential("bailian")).toBe("synthetic-new-key");
+    expect(snapshot(database).legacySettings).toEqual(legacy.legacySettings);
+    expect(snapshot(database).legacyCredentials).toEqual(legacy.legacyCredentials);
+  });
+
+  it("does not recreate a disconnected provider while initializing legacy settings", () => {
+    const { database, application } = testContext();
+    databases.push(database);
+    application.updateAgentSettings({
+      mode: "enhanced", enhancedEndpoint: {
+        baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "synthetic-legacy-model", apiKey: "synthetic-legacy-key"
+      }
+    });
+    const legacy = snapshot(database);
+    expect(application.disconnectLlmProvider("bailian")).toEqual({ providers: {} });
+    expect(application.getLlmCredential("bailian")).toBeUndefined();
+    expect(snapshot(database).legacySettings).toEqual(legacy.legacySettings);
+    expect(snapshot(database).legacyCredentials).toEqual(legacy.legacyCredentials);
+  });
+
+  it.each(["connect", "save"])("rolls back nested legacy initialization when the outer %s update fails", (operation) => {
+    const { database, application } = testContext();
+    databases.push(database);
+    application.updateAgentSettings({
+      mode: "enhanced", enhancedEndpoint: {
+        baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "synthetic-legacy-model", apiKey: "synthetic-legacy-key"
+      }
+    });
+    const before = snapshot(database);
+    rejectWrite(database, "llm_provider_settings", "UPDATE");
+    expect(() => change(application, operation)).toThrow("synthetic-model-write-failure");
+    expect(snapshot(database)).toEqual(before);
+    database.exec("DROP TRIGGER reject_llm_write");
+    expect(change(application, operation).providers.bailian?.model).toBe("qwen-new");
+    expect(application.getLlmCredential("bailian")).toBe("synthetic-new-key");
+  });
+
+  it.each(["connect", "disconnect"])("keeps a failed %s unchanged after closing and reopening a WAL database", async (operation) => {
+    const root = await mkdtemp(join(tmpdir(), "grudge-vault-model-transaction-"));
+    const databasePath = join(root, "synthetic-model.sqlite3");
+    const context = testContext(undefined, undefined, databasePath);
+    databases.push(context.database);
+    try {
+      context.database.pragma("journal_mode = WAL");
+      context.application.saveLlmConnection({
+        provider: "bailian", model: "qwen-old", region: "cn-beijing", apiKey: "synthetic-old-key"
+      }, testedAt);
+      const before = snapshot(context.database);
+      rejectWrite(context.database, "llm_settings", "UPDATE");
+      expect(() => change(context.application, operation)).toThrow("synthetic-model-write-failure");
+      context.database.close();
+
+      const reopened = testContext(undefined, undefined, databasePath);
+      databases.push(reopened.database);
+      expect(snapshot(reopened.database)).toEqual(before);
+      expect(reopened.application.getLlmCredential("bailian")).toBe("synthetic-old-key");
+      const committed = change(reopened.application, operation);
+      reopened.database.close();
+
+      const verified = testContext(undefined, undefined, databasePath);
+      databases.push(verified.database);
+      expect(verified.application.getLlmSettings()).toEqual(committed);
+      expect(verified.application.getLlmCredential("bailian"))
+        .toBe(operation === "connect" ? "synthetic-new-key" : undefined);
+      verified.database.close();
+    } finally {
+      for (const database of databases) if (database.open) database.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("Phase 1 event recording application", () => {
   let contexts: Array<{ database: Database.Database }>;
@@ -58,6 +444,16 @@ describe("Phase 1 event recording application", () => {
     expect(parseConservativeTemporalValue("发生于 2026年9月12日")).toEqual({ kind: "date", value: "2026-09-12" });
     expect(parseConservativeTemporalValue("错误日期 2026年99月99日")).toEqual({ kind: "unknown" });
     expect(parseConservativeTemporalValue("没有时间信息")).toEqual({ kind: "unknown" });
+  });
+
+  it("persists a real workspace default legal jurisdiction", () => {
+    const context = testContext();
+    contexts.push(context);
+    expect(context.application.getDefaultLegalJurisdiction()).toBe("中国大陆");
+    expect(context.application.setDefaultLegalJurisdiction(" 新加坡 ")).toBe("新加坡");
+    expect(context.application.getDefaultLegalJurisdiction()).toBe("新加坡");
+    expect(() => context.application.setDefaultLegalJurisdiction("\u0000invalid"))
+      .toThrowError(AppError);
   });
 
   it("keeps the raw message when record generation fails", async () => {
@@ -491,6 +887,13 @@ describe("Phase 3 relations, retrieval, and review application", () => {
       }
     };
     const context = testContext(undefined, adapter);
+    for (let index = 0; index < 205; index += 1) {
+      context.application.createEvent({
+        title: `Other semantic memory ${index}`, status: "confirmed",
+        occurredAt: { kind: "date", value: "2026-01-01" }, narrative: "An other semantic document",
+        facts: [], interpretations: [], emotions: [], interests: [], participants: [], sourceRefs: [], assetRefs: [], reason: "test"
+      });
+    }
     const event = context.application.createEvent({
       title: "Unique semantic memory", status: "confirmed", occurredAt: { kind: "date", value: "2026-01-01" },
       narrative: "A semantic document", facts: [], interpretations: [], emotions: [], interests: [],

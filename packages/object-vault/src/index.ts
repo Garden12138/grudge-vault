@@ -1,6 +1,6 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { access, chmod, mkdir, open as openFile, readdir, rename, rm, stat } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, open as openFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -59,16 +59,27 @@ interface TemporaryObject {
 export class EncryptedObjectVault implements ObjectVaultPort {
   private readonly objectsRoot: string;
   private readonly tempRoot: string;
+  private initialization: Promise<void> | undefined;
 
   constructor(private readonly vaultRoot: string) {
     this.objectsRoot = join(vaultRoot, "objects", "sha256");
     this.tempRoot = join(vaultRoot, "tmp");
   }
 
-  async initialize(): Promise<void> {
-    await mkdir(this.objectsRoot, { recursive: true, mode: 0o700 });
-    await mkdir(this.tempRoot, { recursive: true, mode: 0o700 });
-    await this.cleanupTempFiles();
+  initialize(): Promise<void> {
+    this.initialization ??= (async () => {
+      await mkdir(this.objectsRoot, { recursive: true, mode: 0o700 });
+      await mkdir(this.tempRoot, { recursive: true, mode: 0o700 });
+      for (const path of [this.vaultRoot, join(this.vaultRoot, "objects"), this.objectsRoot, this.tempRoot]) {
+        const metadata = await lstat(path);
+        if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("Vault directory contains an unsafe link.");
+      }
+      await this.cleanupTempFiles();
+    })().catch((error: unknown) => {
+      this.initialization = undefined;
+      throw error;
+    });
+    return this.initialization;
   }
 
   async put(inputPath: string, key: VaultKey): Promise<StoredObject> {
@@ -128,6 +139,9 @@ export class EncryptedObjectVault implements ObjectVaultPort {
           ? Readable.from([])
           : createReadStream(objectPath, { start: V1_HEADER_SIZE, end: objectStat.size - TAG_SIZE - 1 });
         encrypted.on("error", (error: Error) => decipher.destroy(error));
+        // pipe() propagates source errors, not consumer cancellation. Releasing
+        // the plaintext stream must also close the encrypted file descriptor.
+        decipher.once("close", () => encrypted.destroy());
         encrypted.pipe(decipher);
         return decipher;
       }
@@ -158,6 +172,7 @@ export class EncryptedObjectVault implements ObjectVaultPort {
         ? Readable.from([])
         : createReadStream(objectPath, { start: V2_HEADER_SIZE, end: objectStat.size - TAG_SIZE - 1 });
       encrypted.on("error", (error: Error) => decipher.destroy(error));
+      decipher.once("close", () => encrypted.destroy());
       encrypted.pipe(decipher);
       return decipher;
     } finally {
@@ -212,8 +227,43 @@ export class EncryptedObjectVault implements ObjectVaultPort {
   async cleanupTempFiles(): Promise<void> {
     await mkdir(this.tempRoot, { recursive: true, mode: 0o700 });
     const entries = await readdir(this.tempRoot, { withFileTypes: true });
-    await Promise.all(entries.filter((entry) => entry.isFile() && entry.name.endsWith(".partial"))
-      .map((entry) => rm(join(this.tempRoot, entry.name), { force: true })));
+    const partials = entries.filter((entry) => entry.name.endsWith(".partial"));
+    if (partials.some((entry) => !entry.isFile() || entry.isSymbolicLink())) {
+      throw new Error("Vault temporary directory contains an unsafe partial object.");
+    }
+    await Promise.all(partials.map((entry) => rm(join(this.tempRoot, entry.name), { force: true })));
+  }
+
+  async pruneUnreferencedObjects(referencedHashes: ReadonlySet<string>): Promise<number> {
+    await this.initialize();
+    let removed = 0;
+    const firstBuckets = await readdir(this.objectsRoot, { withFileTypes: true });
+    for (const first of firstBuckets) {
+      if (first.isSymbolicLink()) throw new Error("Vault object tree contains an unsafe link.");
+      if (!first.isDirectory() || !/^[a-f0-9]{2}$/.test(first.name)) continue;
+      const firstPath = join(this.objectsRoot, first.name);
+      const firstMetadata = await lstat(firstPath);
+      if (!firstMetadata.isDirectory() || firstMetadata.isSymbolicLink()) throw new Error("Vault object tree changed during recovery scan.");
+      for (const second of await readdir(firstPath, { withFileTypes: true })) {
+        if (second.isSymbolicLink()) throw new Error("Vault object tree contains an unsafe link.");
+        if (!second.isDirectory() || !/^[a-f0-9]{2}$/.test(second.name)) continue;
+        const secondPath = join(firstPath, second.name);
+        const secondMetadata = await lstat(secondPath);
+        if (!secondMetadata.isDirectory() || secondMetadata.isSymbolicLink()) throw new Error("Vault object tree changed during recovery scan.");
+        for (const entry of await readdir(secondPath, { withFileTypes: true })) {
+          if (entry.isSymbolicLink()) throw new Error("Vault object tree contains an unsafe link.");
+          if (!entry.isFile() || !/^[a-f0-9]{64}\.gvobj$/.test(entry.name)) continue;
+          const sha256 = entry.name.slice(0, 64);
+          if (sha256.slice(0, 2) !== first.name || sha256.slice(2, 4) !== second.name || referencedHashes.has(sha256)) continue;
+          const path = join(secondPath, entry.name);
+          const metadata = await lstat(path);
+          if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("Vault object changed during recovery scan.");
+          await rm(path);
+          removed += 1;
+        }
+      }
+    }
+    return removed;
   }
 
   objectPath(sha256: string): string {
