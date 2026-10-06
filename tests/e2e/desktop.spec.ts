@@ -302,6 +302,9 @@ test("runs the screened record, review, report and search flow", async () => {
   });
   try {
     const page = await application.firstWindow();
+    // Subscription enables native chooser interception asynchronously. Keep it
+    // active throughout this journey, before any real keyboard activation.
+    page.on("filechooser", () => undefined);
     const startupDatabase = new Database(join(workspace, "db", "grudge-vault.sqlite3"), { readonly: true });
     try {
       expect(startupDatabase.prepare("SELECT count(*) FROM automation_runs").pluck().get()).toBe(0);
@@ -712,14 +715,14 @@ test("runs the screened record, review, report and search flow", async () => {
     await expect(unsupportedEditor.getByLabel("添加图片、音频或视频")).toBeFocused();
     expect(await unsupportedEditor.locator(".file-drop").evaluate((element) => globalThis.getComputedStyle(element).outlineStyle)).toBe("solid");
     const [keyboardChooser] = await Promise.all([
-      page.waitForEvent("filechooser"), page.keyboard.press("Enter")
+      page.waitForEvent("filechooser"), unsupportedEditor.getByLabel("添加图片、音频或视频").press("Enter")
     ]);
     await keyboardChooser.setFiles(keyboardPng);
     await expect(unsupportedEditor.locator(".file-list")).toContainText("keyboard.png");
     await unsupportedEditor.getByRole("button", { name: "移除 keyboard.png" }).click();
     await unsupportedEditor.getByLabel("添加图片、音频或视频").focus();
     const [spaceChooser] = await Promise.all([
-      page.waitForEvent("filechooser"), page.keyboard.press("Space")
+      page.waitForEvent("filechooser"), unsupportedEditor.getByLabel("添加图片、音频或视频").press("Space")
     ]);
     await spaceChooser.setFiles(keyboardPng);
     await expect(unsupportedEditor.locator(".file-list")).toContainText("keyboard.png");

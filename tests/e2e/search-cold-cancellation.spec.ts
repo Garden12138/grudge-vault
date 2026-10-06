@@ -3,7 +3,7 @@ import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import Database from "better-sqlite3";
-import { _electron as electron, expect, test, type Page } from "@playwright/test";
+import { _electron as electron, expect, test, type JSHandle, type Page } from "@playwright/test";
 import { RedesignService, type ObjectVaultPort } from "../../packages/application/src/index";
 import { SqliteAssetRepository, SqliteJobRepository, SqliteRecordRepository } from "../../packages/persistence-sqlite/src/index";
 import { LocalWorkspaceManager } from "../../apps/desktop/src/main/workspace-manager";
@@ -19,21 +19,37 @@ const fullIndexWriteTimeout = process.platform === "win32" ? 240_000 : 45_000;
 const freshObservation = (): ColdSearchObservation => ({ armed: true, detailBatches: 0, details: 0, keyBatches: 0,
   keys: 0, embeddingCalls: 0, embeddingInputs: 0, started: 0, completed: 0, outcomes: [] });
 type Desktop = Awaited<ReturnType<typeof electron.launch>>;
-const observationReadRetries = new WeakMap<Desktop, number>();
-async function readColdObservation(desktop: Desktop): Promise<ColdSearchObservation> {
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return await desktop.evaluate(() => (globalThis as typeof globalThis & {
-        __gvE2eColdSearch?: ColdSearchObservation;
-      }).__gvE2eColdSearch!);
-    } catch (cause) {
-      // Retry only a transient inspector read, never the product operation, model or test assertion.
-      if (attempt === 0 && cause instanceof Error && cause.message.includes("Resulting promise was garbage collected.")) {
-        observationReadRetries.set(desktop, (observationReadRetries.get(desktop) ?? 0) + 1); continue;
-      }
-      throw cause;
-    }
+const observationHandles = new WeakMap<Desktop, JSHandle<ColdSearchObservation>>();
+async function armColdObservation(desktop: Desktop): Promise<void> {
+  await observationHandles.get(desktop)?.dispose();
+  observationHandles.set(desktop, await desktop.evaluateHandle((_, value) => {
+    (globalThis as typeof globalThis & { __gvE2eColdSearch?: ColdSearchObservation }).__gvE2eColdSearch = value;
+    return value;
+  }, freshObservation()));
+}
+
+async function readObservedProperties(handle: JSHandle<unknown>, array = false): Promise<unknown> {
+  // Runtime.getProperties reads data descriptors without invoking JavaScript
+  // or creating inspector promises while native index writes are in progress.
+  const properties = await handle.getProperties();
+  // These are the only array fields in the aggregate schema. An empty array
+  // has no enumerable descriptors, just like a primitive value.
+  if (properties.size === 0) return array ? [] : handle.jsonValue();
+  try {
+    const entries = await Promise.all([...properties].map(async ([name, value]) =>
+      [name, await readObservedProperties(value, name === "outcomes" || name === "detailPasses")] as const));
+    return array
+      ? entries.sort(([a], [b]) => Number(a) - Number(b)).map(([, value]) => value)
+      : Object.fromEntries(entries);
+  } finally {
+    await Promise.all([...properties.values()].map(value => value.dispose()));
   }
+}
+
+async function readColdObservation(desktop: Desktop): Promise<ColdSearchObservation> {
+  const handle = observationHandles.get(desktop);
+  if (!handle) throw new Error("Cold observation must be armed before reading.");
+  return await readObservedProperties(handle) as ColdSearchObservation;
 }
 
 async function waitForSearchStartup(page: Page): Promise<void> {
@@ -152,9 +168,7 @@ test("cancels a real cold 10k-record search from the UI before embedding and can
     const before = formalSnapshot(workspace);
     const beforeDatabase = databaseSnapshot(workspace);
     const read = () => readColdObservation(desktop);
-    await desktop.evaluate((_, value) => { (globalThis as typeof globalThis & {
-      __gvE2eColdSearch?: ColdSearchObservation;
-    }).__gvE2eColdSearch = value; }, freshObservation());
+    await armColdObservation(desktop);
     await focusDesktop(desktop, page);
     await armSearchFeedback(page, "gv-search-first-feedback");
     const firstTraceSession = await beginFeedbackTrace(page);
@@ -189,9 +203,7 @@ test("cancels a real cold 10k-record search from the UI before embedding and can
     await page.screenshot({ path: testInfo.outputPath("cold-search-cancelled.png") });
 
     // Cancellation must not publish a partial projection cache. The next UI query scans all records and keys.
-    await desktop.evaluate((_, value) => { (globalThis as typeof globalThis & {
-      __gvE2eColdSearch?: ColdSearchObservation;
-    }).__gvE2eColdSearch = value; }, freshObservation());
+    await armColdObservation(desktop);
     await page.locator("#global-search-input").fill("下一次完整合成语义查询");
     await focusDesktop(desktop, page);
     await armSearchFeedback(page, "gv-search-next-feedback");
@@ -228,7 +240,7 @@ test("cancels a real cold 10k-record search from the UI before embedding and can
       cancelled, completed, paged, formalTablesUnchanged: true, completeDatabaseUnchanged: true,
       feedback: { firstFeedback, nextFeedback, firstFeedbackTrace, nextFeedbackTrace },
       databaseByteLength: beforeDatabase.byteLength, objectFiles: 0, inferenceCalls: 0, unexpectedNetwork: 0,
-      observationReadRetries: observationReadRetries.get(desktop) ?? 0,
+      observationReadProtocol: "data properties without JavaScript evaluation",
       limits: "Synthetic embedding; no injected delays. Not a <=200ms UI benchmark, real model quality, or target-device certification." }, null, 2),
     contentType: "application/json" });
   } finally {
@@ -269,9 +281,7 @@ test("pauses a real 10k-record scheduling check from settings and verifies full 
         .run(new Date().toISOString());
     } finally { external.close(); }
     const read = () => readColdObservation(desktop);
-    const arm = () => desktop.evaluate((_, value) => { (globalThis as typeof globalThis & {
-      __gvE2eColdSearch?: ColdSearchObservation;
-    }).__gvE2eColdSearch = value; }, freshObservation());
+    const arm = () => armColdObservation(desktop);
     await arm();
     // Public IPC owns the async check; the settings pause below is the real UI action.
     await page.evaluate(() => {
@@ -339,7 +349,7 @@ test("pauses a real 10k-record scheduling check from settings and verifies full 
     await testInfo.attach("aggregate-index-scheduling-observation", { body: JSON.stringify({ recordCount, fragmentCount, dimensions: 1024,
       cancelled, completed, formalTablesAndVectorBytesUnchanged: true, activeGenerationUnchanged: true,
       newBuildJobs: 0, objectFiles: 0, inferenceCalls: 0, unexpectedNetwork: 0,
-      observationReadRetries: observationReadRetries.get(desktop) ?? 0,
+      observationReadProtocol: "data properties without JavaScript evaluation",
       limits: "Owned synthetic corpus; passive aggregate observer and real settings pause, no delays or changed batch sizes. Not real model quality or all-path/device performance." }),
     contentType: "application/json" });
   } finally {
@@ -371,9 +381,7 @@ test("pauses a real 10k-record index build before embedding, resumes it and inte
     const retained = (snapshot: ReturnType<typeof formalSnapshot>) => Object.fromEntries(Object.entries(snapshot)
       .filter(([table]) => table !== "workspace_settings" && table !== "redesign_search_generations"));
     const read = () => readColdObservation(desktop);
-    const arm = () => desktop.evaluate((_, value) => { (globalThis as typeof globalThis & {
-      __gvE2eColdSearch?: ColdSearchObservation;
-    }).__gvE2eColdSearch = value; }, freshObservation());
+    const arm = () => armColdObservation(desktop);
     await page.locator("nav").getByRole("button", { name: "设置", exact: true }).click();
     const card = page.locator(".settings-card").filter({ has: page.getByRole("heading", { name: "多模态搜索索引", exact: true }) });
     const pause = card.getByRole("button", { name: "暂停语义查询与自动更新", exact: true });
@@ -464,7 +472,7 @@ test("pauses a real 10k-record index build before embedding, resumes it and inte
       cancelled, completed, rechecked, originalFormalTablesAndVectorBytesUnchanged: true, originalGenerationRetained: true,
       recoveredGenerationRetainedDuringRecheck: true,
       newGenerationComplete: true, objectFiles: 0, inferenceCalls: 0, unexpectedNetwork: 0,
-      observationReadRetries: observationReadRetries.get(desktop) ?? 0,
+      observationReadProtocol: "data properties without JavaScript evaluation",
       limits: "Owned synthetic inputs and embedding; no injected delays or smaller batches. Not real model quality, peak-memory or target-device certification." }),
     contentType: "application/json" });
   } catch (cause) {
@@ -475,7 +483,7 @@ test("pauses a real 10k-record index build before embedding, resumes it and inte
         }).__gvE2eColdSearch);
         process.stderr.write(`Synthetic index counters after failure: ${JSON.stringify(observed)}\n`);
         await testInfo.attach("aggregate-index-build-failure", { body: JSON.stringify({ observed,
-          observationReadRetries: observationReadRetries.get(application) ?? 0,
+          observationReadProtocol: "data properties without JavaScript evaluation",
           limits: "Passive synthetic counters sampled after the failed assertion, before closing the owned app; not an exact deadline snapshot." }),
         contentType: "application/json" });
       } catch { /* Preserve the original failure if diagnostic collection is unavailable. */ }

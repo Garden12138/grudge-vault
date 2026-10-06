@@ -19,7 +19,9 @@ export default defineConfig({
   test: {
     include: ["packages/**/*.test.ts", "apps/**/*.test.ts"],
     // Keep native SQLite, crypto and filesystem tests within Windows runner resources.
-    ...(process.env.CI && process.platform === "win32" ? { maxWorkers: 2 } : {}),
+    // Several integration fixtures create/migrate multiple real SQLite files.
+    // Give Windows CI an I/O budget; UI latency stays covered by the E2E limits.
+    ...(process.env.CI && process.platform === "win32" ? { maxWorkers: 2, testTimeout: 15_000 } : {}),
     coverage: { reporter: ["text", "html"] }
   }
 });

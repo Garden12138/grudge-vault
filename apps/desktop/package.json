@@ -1,6 +1,6 @@
 {
   "name": "@grudge-vault/desktop",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Grudge Vault local-first desktop application.",
   "author": "Grudge Vault contributors",
   "private": true,
