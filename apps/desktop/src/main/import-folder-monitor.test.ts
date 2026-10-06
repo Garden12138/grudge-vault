@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -49,7 +49,10 @@ describe("Day One import folder monitor", () => {
       expect(ingested).not.toContain("nested.zip");
       // Windows reports synthesized mode bits; this assertion applies to POSIX permissions.
       if (process.platform !== "win32") expect((await stat(statePath)).mode & 0o777).toBe(0o600);
-      expect(await readFile(statePath, "utf8")).toContain(folder);
+      const saved = JSON.parse(await readFile(statePath, "utf8")) as {
+        importFolders: Record<string, { path: string }>;
+      };
+      expect(saved.importFolders[`workspace-1:${workspace}`]?.path).toBe(await realpath(folder));
       await expect(monitor.choose(workspace)).rejects.toBeInstanceOf(AppError);
     } finally {
       monitor.stop();

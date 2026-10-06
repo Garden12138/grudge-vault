@@ -278,7 +278,7 @@ test("pauses a real 10k-record scheduling check from settings and verifies full 
     await expect(card.locator(".status")).toHaveText("检查中");
     await expect(card.getByRole("button", { name: "正在检查现有索引…", exact: true })).toBeDisabled();
     await expect(card.getByText("正在只读核对索引覆盖；确认需要更新后才会请求向量模型，可以随时暂停。", { exact: true })).toBeVisible();
-    await card.screenshot({ path: testInfo.outputPath("index-schedule-checking.png") });
+    // Pause before capturing screenshots, which can outlast the real read-only check.
     await card.getByRole("button", { name: "暂停语义查询与自动更新", exact: true }).click();
     await expect(card.locator(".status")).toHaveText("已暂停");
     await expect.poll(async () => (await read()).indexSchedule?.completed ?? 0).toBe(1);
@@ -307,6 +307,7 @@ test("pauses a real 10k-record scheduling check from settings and verifies full 
     await expect.poll(async () => (await read()).details, { intervals: [10, 20, 50] }).toBeGreaterThan(0);
     await page.locator("nav").getByRole("button", { name: "设置", exact: true }).click();
     await expect(card.locator(".status")).toHaveText("检查中");
+    await card.screenshot({ path: testInfo.outputPath("index-schedule-checking.png") });
     // A successful read-only decision creates no job event; the same mounted view must still settle.
     await expect(card.locator(".status")).toHaveText("已就绪", { timeout: 20_000 });
     await expect.poll(() => page.evaluate(() => (globalThis as typeof globalThis & {
