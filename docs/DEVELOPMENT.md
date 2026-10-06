@@ -141,7 +141,7 @@ Release sign-off uses Node 24.10+ and pnpm 11.23 for `lint`, `typecheck`, all un
 
 Keep the root and workspace package versions identical, then commit the reviewed changes and push an annotated `vX.Y.Z` tag matching `apps/desktop/package.json`. Published tags are immutable; use a new patch version for release fixes.
 
-The tag workflow verifies Windows, Linux, Apple Silicon Mac and Intel Mac before building installers on their native runners. Mac packages are additionally checked for the native media helper, SQLite loading, runtime identity and matching renderer source. Only installer files are uploaded as packaging artifacts.
+Each tag matrix job verifies and then packages one platform on its native runner: Windows, Linux, Apple Silicon Mac or Intel Mac. Mac packages are additionally checked for the native media helper, SQLite loading, runtime identity and matching renderer source. Only installer files are uploaded as packaging artifacts; the release job waits for every platform to succeed. Successful platforms retain their installer artifacts when another platform needs a rerun.
 
 The release job combines those artifacts and runs `scripts/prepare-release.mjs`. It requires the six versioned installers (Windows EXE, Linux AppImage, and DMG/ZIP for both Mac architectures), rejects missing or unexpected files, and produces `SHA256SUMS`. The job creates a draft GitHub Release, uploads the verified installers and checksums, then publishes it. A failed verification or packaging job prevents publication. A failed upload leaves the new release in draft; rerun the job after resolving the failure.
 

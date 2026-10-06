@@ -707,6 +707,13 @@ test("runs the screened record, review, report and search flow", async () => {
     await keyboardChooser.setFiles(keyboardPng);
     await expect(unsupportedEditor.locator(".file-list")).toContainText("keyboard.png");
     await unsupportedEditor.getByRole("button", { name: "移除 keyboard.png" }).click();
+    await unsupportedEditor.getByLabel("添加图片、音频或视频").focus();
+    const [spaceChooser] = await Promise.all([
+      page.waitForEvent("filechooser"), page.keyboard.press("Space")
+    ]);
+    await spaceChooser.setFiles(keyboardPng);
+    await expect(unsupportedEditor.locator(".file-list")).toContainText("keyboard.png");
+    await unsupportedEditor.getByRole("button", { name: "移除 keyboard.png" }).click();
     await unsupportedEditor.locator(".file-drop").evaluate((element) => {
       const encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lV8AAAAASUVORK5CYII=";
       const bytes = Uint8Array.from(globalThis.atob(encoded), (character) => character.charCodeAt(0));

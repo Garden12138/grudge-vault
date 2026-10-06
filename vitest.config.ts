@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import process from "node:process";
 import { defineConfig } from "vitest/config";
 
 const fromRoot = (path: string) => fileURLToPath(new URL(path, import.meta.url));
@@ -17,6 +18,8 @@ export default defineConfig({
   },
   test: {
     include: ["packages/**/*.test.ts", "apps/**/*.test.ts"],
+    // Keep native SQLite, crypto and filesystem tests within Windows runner resources.
+    ...(process.env.CI && process.platform === "win32" ? { maxWorkers: 2 } : {}),
     coverage: { reporter: ["text", "html"] }
   }
 });
