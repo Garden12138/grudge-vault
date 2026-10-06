@@ -136,6 +136,7 @@ test("cancels a real cold 10k-record search from the UI before embedding and can
     expect(await page.evaluate(() => window.grudgeVault.llm.getSettings())).toMatchObject({ ok: true });
     await waitForSearchStartup(page);
     await page.locator("nav").getByRole("button", { name: "搜索", exact: true }).click();
+    await expect(page.locator(".search-mode")).toHaveText("关键词＋语义检索", { timeout: 20000 });
     await page.locator("#global-search-input").fill("仅用于冷校验取消的合成查询");
     // An unrelated external commit naturally invalidates any cache warmed by the startup scheduler.
     // This is performed before the measured queries, only in the owned synthetic database.
@@ -190,8 +191,8 @@ test("cancels a real cold 10k-record search from the UI before embedding and can
     const nextTraceSession = await beginFeedbackTrace(page);
     await page.locator(".search-input button").click();
     await expect(page.locator(".search-results article")).toHaveCount(30, { timeout: 20_000 });
-    await expect(page.locator(".search-capabilities .ready")).toHaveText(["语义索引"]);
-    await expect(page.locator(".search-capabilities .unavailable")).toHaveText(["媒体查询"]);
+    await expect(page.locator(".search-capabilities .ready")).toHaveText(["语义索引 · 可用"]);
+    await expect(page.locator(".search-capabilities .unavailable")).toHaveText(["媒体查询 · 不可用"]);
     const completed = await read();
     const nextFeedback = await page.evaluate(() => (window as typeof window & { __gvFeedback?: FeedbackObservation }).__gvFeedback!);
     expect(nextFeedback).toMatchObject({ trustedSubmission: true, phaseVisible: true, falseEmpty: false,

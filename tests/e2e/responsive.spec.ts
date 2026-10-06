@@ -1,3 +1,4 @@
+import { openDisclosure } from "./ui-helpers";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -43,15 +44,12 @@ test("invalidates previous screening feedback only when the input changes and al
     await page.locator(".new-record-button").click();
     const editor = page.getByRole("dialog", { name: "新建记录" });
     const text = editor.getByLabel("发生了什么？");
-    const save = editor.getByRole("button", { name: "保存", exact: true });
-    const original = "合成测试：承诺的工资仍未支付。";
-    await text.fill(original); await save.click();
-    await expect(editor.getByRole("alert")).toContainText("请先在设置中连接并启用");
-    await expect.poll(() => text.inputValue().then((value) => value === original)).toBe(true);
-    await text.fill(`${original}补充了新的事实。`);
-    await expect(editor.locator(".banner")).toHaveCount(0);
-    await expect(save).toBeEnabled();
+    const save = editor.getByRole("button", { name: "判断并收录", exact: true });
+    await expect(editor.getByRole("heading", { name: "先连接模型，再开始记录" })).toBeVisible();
+    await expect(text).toHaveCount(0);
+    await expect(editor.getByRole("button", { name: "测试连接并保存" })).toBeVisible();
     await connectSyntheticModel(page);
+    await page.reload(); await page.locator(".new-record-button").click();
     const ordinary = "午饭后散步，下午工作顺利。";
     await text.fill(ordinary); await save.click();
     await expect(editor.locator(".banner.neutral")).toContainText("不属于收录范围");
@@ -76,13 +74,11 @@ test("invalidates previous screening feedback only when the input changes and al
     await expect(editor.locator(".file-list li")).toHaveCount(1);
     await expect(editor.locator(".banner.neutral")).toContainText("不属于收录范围");
     await text.fill("他又这样说了，我有些不安"); await save.click();
-    const pending = page.getByRole("dialog", { name: "待确认", exact: true });
-    await expect(pending).toBeVisible(); await page.keyboard.press("Escape");
-    await expect(pending).toHaveCount(0);
-    await expect(editor.locator(".banner.notice")).toContainText("已加入待确认");
+    await expect(editor.getByLabel("当前记录待确认")).toBeVisible();
+    await expect(page.getByRole("dialog")).toHaveCount(1);
+    await expect(editor.locator(".banner.neutral")).toContainText("需要你确认");
     await text.fill("合成编辑后补充的完整说明。旧提示不应代表这份新输入。");
     await expect(editor.locator(".banner")).toHaveCount(0);
-    await expect(editor.getByRole("button", { name: "查看待确认", exact: true })).toHaveCount(0);
     const beforeIgnore = await page.evaluate(() => window.grudgeVault.pending.list());
     expect(beforeIgnore.ok && beforeIgnore.data.length).toBe(1);
     const ignored = await page.evaluate(async () => {
@@ -173,7 +169,7 @@ test("uses Unicode character limits consistently for manual input and both searc
     });
     await expect.poll(inputShape).toEqual({ characters: 50_000, intact: true });
     await expect(editor.locator("small")).toHaveText("50,000 / 50,000 字");
-    const save = editor.getByRole("button", { name: "保存", exact: true });
+    const save = editor.getByRole("button", { name: "判断并收录", exact: true });
     await expect(save).toBeEnabled();
     await page.keyboard.insertText("𠮷");
     await expect.poll(inputShape).toEqual({ characters: 50_001, intact: false });
@@ -234,6 +230,7 @@ test("keeps keyboard focus in the top dialog, protects the editor and restores t
   try {
     const opener = page.locator(".new-record-button");
     await expect(opener).toBeVisible();
+    await connectSyntheticModel(page);
     await opener.focus(); await page.keyboard.press("Enter");
     const editor = page.getByRole("dialog", { name: "新建记录" });
     await expect(editor.getByLabel("发生了什么？")).toBeFocused();
@@ -250,19 +247,11 @@ test("keeps keyboard focus in the top dialog, protects the editor and restores t
     await connectSyntheticModel(page);
     await opener.click();
     await editor.getByLabel("发生了什么？").fill("他又这样说了，我有些不安");
-    await editor.getByRole("button", { name: "保存", exact: true }).click();
-    const drawer = page.getByRole("dialog", { name: "待确认", exact: true });
-    await expect(drawer).toBeVisible();
-    await expect(drawer.getByRole("button", { name: "关闭", exact: true })).toBeFocused();
-    await drawer.getByRole("button", { name: "确认保留", exact: true }).focus();
-    await page.keyboard.press("Tab");
-    await expect(drawer.getByRole("button", { name: "关闭", exact: true })).toBeFocused();
-    await page.keyboard.press("Escape");
-    await expect(drawer).toHaveCount(0);
-    await expect(editor).toBeVisible();
+    await editor.getByRole("button", { name: "判断并收录", exact: true }).click();
+    await expect(editor.getByLabel("当前记录待确认")).toBeVisible();
+    await expect(page.getByRole("dialog")).toHaveCount(1);
     await expect(editor.getByLabel("发生了什么？")).toHaveValue("他又这样说了，我有些不安");
-    await expect.poll(() => editor.evaluate((dialog) => dialog.contains(document.activeElement))).toBe(true);
-    await editor.getByRole("button", { name: "保存", exact: true }).focus();
+    await editor.getByRole("button", { name: "取消", exact: true }).focus();
     await page.keyboard.press("Tab");
     await expect(editor.getByRole("button", { name: "关闭", exact: true })).toBeFocused();
     page.once("dialog", (dialog) => dialog.dismiss());
@@ -300,7 +289,7 @@ test("fits the complete record, original, editing, review, search and settings p
     }, retained), { timeout: 15_000 }).toBe(true);
     // Remount the shell so the intentionally API-created synthetic rows are refreshed.
     await page.reload();
-    for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 800 }, { width: 840, height: 760 }, { width: 390, height: 760 }]) {
+    for (const viewport of [{ width: 1180, height: 760 }, { width: 1024, height: 800 }, { width: 840, height: 760 }, { width: 390, height: 760 }]) {
       await page.setViewportSize(viewport);
       await page.getByRole("button", { name: "时间线", exact: true }).click();
       await expect(page.locator(".record-card")).toHaveCount(1);
@@ -336,7 +325,7 @@ test("fits the complete record, original, editing, review, search and settings p
         buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lV8AAAAASUVORK5CYII=", "base64")
       });
       await expectLayout(page, `new input with long filename ${viewport.width}`);
-      await editor.getByRole("button", { name: "保存", exact: true }).click();
+      await editor.getByRole("button", { name: "判断并收录", exact: true }).click();
       await expect(editor.getByRole("status")).toContainText("不属于收录范围");
       await expectLayout(page, `skipped input ${viewport.width}`);
       if (viewport.width === 840) await page.screenshot({ path: testInfo.outputPath("editor-840.png") });
@@ -345,6 +334,16 @@ test("fits the complete record, original, editing, review, search and settings p
 
       await page.getByRole("button", { name: "搜索", exact: true }).click();
       await page.getByPlaceholder("描述你记得的内容…").fill("奖金");
+      if (viewport.width === 1180) {
+        await openDisclosure(page, "筛选");
+        await page.locator(".search-filters").getByLabel("类别").selectOption("rights");
+        await page.locator(".search-filters").getByLabel("来源").selectOption("manual");
+        await page.locator(".search-box summary").click();
+        await expect(page.getByRole("button", { name: "移除类别筛选：权益" })).toBeVisible();
+        await page.getByRole("button", { name: "移除类别筛选：权益" }).click();
+        await page.getByRole("button", { name: "移除来源筛选：手动记录" }).click();
+        await expect(page.getByLabel("已选筛选条件").locator("button")).toHaveCount(0);
+      }
       await page.getByLabel("使用百炼语义检索").uncheck();
       await page.locator(".search-input").getByRole("button", { name: "搜索", exact: true }).click();
       await expect(page.getByText("找到 1 条记录", { exact: true })).toBeVisible();
@@ -355,6 +354,8 @@ test("fits the complete record, original, editing, review, search and settings p
       await page.getByRole("button", { name: /返回搜索结果/ }).click();
       await page.getByRole("button", { name: "设置", exact: true }).click();
       await expect(page.getByRole("heading", { name: "模型服务", exact: true })).toBeVisible();
+      await expectLayout(page, `model settings ${viewport.width}`);
+      await page.getByRole("button", { name: "导入", exact: true }).click();
       await expect(page.getByRole("heading", { name: "Day One", exact: true })).toBeVisible();
       await expectLayout(page, `model and import settings ${viewport.width}`);
       if (viewport.width === 390) await page.screenshot({ path: testInfo.outputPath("settings-390.png"), fullPage: true });

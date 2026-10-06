@@ -745,7 +745,7 @@ export interface AgentModelSettings {
 
 export type WorkspaceLockState =
   | { status: "closed" }
-  | { status: "locked"; workspaceId: EntityId; workspaceName: string }
+  | { status: "locked"; workspaceId: EntityId; workspaceName: string; passwordConfigured?: boolean }
   | { status: "open"; workspace: Workspace };
 
 export interface WorkspaceSecuritySettings {

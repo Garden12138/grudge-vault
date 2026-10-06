@@ -41,7 +41,7 @@ async function fixture(initial: WorkspaceLockState = opened) {
     await act(async () => root?.render(createElement(App)));
   };
   const revoke = async () => { state = locked; await act(async () => listeners.forEach((listener) => listener())); };
-  const unlock = async () => { await act(async () => button("解锁工作区").click()); };
+  const unlock = async () => { await act(async () => button("暂时打开账本").click()); };
   return { api, status, list, mount, revoke, unlock, setState(value: WorkspaceLockState) { state = value; } };
 }
 function button(text: string): globalThis.HTMLButtonElement {
@@ -64,10 +64,10 @@ it("keeps lock-state verification visibly pending instead of claiming the worksp
   const test = await fixture(); await test.mount(); const next = deferred<IpcResult<WorkspaceLockState>>();
   test.status.mockReturnValueOnce(next.promise); await test.revoke();
   expect(document.querySelector(".app-shell")).toBeNull();
-  expect(document.body.textContent).toContain("正在读取工作区状态");
-  expect(document.body.textContent).not.toContain("创建新工作区");
+  expect(document.body.textContent).toContain("正在打开你的账本");
+  expect(document.body.textContent).not.toContain("创建账本");
   await act(async () => next.resolve(success(locked)));
-  expect(document.body.textContent).toContain("解锁工作区");
+  expect(document.body.textContent).toContain("暂时打开账本");
 });
 
 it.each(["success", "failure"] as const)("discards an old pending %s reply after locking and reopening the same workspace", async (outcome) => {
@@ -94,10 +94,10 @@ it("does not queue a hidden new-record shortcut while locked and replay it on un
 it("shows a failed workspace-state read as unavailable and retries only the read", async () => {
   const test = await fixture({ status: "closed" }); test.status.mockResolvedValueOnce(unavailable);
   await test.mount();
-  expect(document.body.textContent).toContain("暂时无法读取工作区状态");
+  expect(document.body.textContent).toContain("暂时无法读取账本");
   expect(document.querySelector(".app-shell")).toBeNull();
   await act(async () => button("重新读取状态").click());
-  expect(document.body.textContent).toContain("创建新工作区");
+  expect(document.body.textContent).toContain("创建账本");
   expect(test.status).toHaveBeenCalledTimes(2); expect(test.api.workspace.unlock).not.toHaveBeenCalled();
   expect(test.list).not.toHaveBeenCalled();
 });

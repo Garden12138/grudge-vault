@@ -24,7 +24,7 @@ test("edits occurrence precision from the UI, protects it through reanalysis and
     const original = "E2E时间线报告日期：合成奖金争议，月份和实际发生时间仍需本人补充。";
     await page.locator(".new-record-button").click();
     const editor = page.getByRole("dialog", { name: "新建记录" });
-    await editor.getByLabel("发生了什么？").fill(original); await editor.getByRole("button", { name: "保存", exact: true }).click();
+    await editor.getByLabel("发生了什么？").fill(original); await editor.getByRole("button", { name: "判断并收录", exact: true }).click();
     await expect(page.locator(".report-summary")).toBeVisible();
     const initial = await page.evaluate(async () => {
       const timeline = await window.grudgeVault.records.timeline({});

@@ -1765,6 +1765,29 @@ describe("Phase 4 Agent Harness", () => {
     expect(events.filter(({ kind }) => kind === "response-received")).toHaveLength(3);
   });
 
+  it("gives text-only screening exact Unicode bounds and actionable repair fields without relaxing provenance", async () => {
+    const context = createContext(); databases.push(context.database);
+    context.application.saveLlmConnection({ provider: "bailian", model: "qwen3.8-omni-flash", region: "cn-beijing",
+      apiKey: "synthetic-key" }, "2026-10-01T00:00:00Z");
+    const text = "公司拖欠😀奖金", length = Array.from(text).length;
+    const systems: string[] = [];
+    const modelAdapter: AgentModelAdapterPort = { identity: "synthetic.text-bounds", version: 1, async run(input) {
+      systems.push(input.system);
+      expect(input.system).toContain(`本次正文共 ${length} 个 Unicode 码点`);
+      expect(input.system).toContain("可以返回 anchors=[]");
+      expect(JSON.stringify(input.tools[0]!.jsonSchema)).toContain(`"maximum":${length}`);
+      await input.executeTool("submit_screening", { decision: "include", categories: ["rights"], reason: "本人奖金未支付",
+        anchors: systems.length === 1 ? [{ textRange: [0, 999] }] : [{ textRange: [0, length] }],
+        coverage: "complete", policyVersion: "screening-v1" }, "synthetic-call");
+      return { model: "synthetic-text-bounds" };
+    } };
+    const result = await new AgentHarness(context.application, { modelAdapter }).screen({ text, media: [], origin: "zip", sourceVersion: "synthetic-bound-source" });
+    expect(systems).toHaveLength(2);
+    expect(systems[1]).toContain("anchors.0.textRange.1（too_big）");
+    expect(systems[1]).not.toContain("999");
+    expect(result.anchors).toEqual([{ sourceVersion: "synthetic-bound-source", textRange: [0, length] }]);
+  });
+
   it("allows exactly one schema-only repair for an invalid structured result", async () => {
     const context = createContext();
     databases.push(context.database);

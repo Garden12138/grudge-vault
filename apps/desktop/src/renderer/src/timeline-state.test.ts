@@ -2,7 +2,7 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import type { EventRecord, TimelinePage } from "@grudge-vault/domain";
+import type { EventRecord, TimelinePage, TimelineFilter } from "@grudge-vault/domain";
 import type { GrudgeVaultApi, IpcResult } from "@grudge-vault/shared";
 import { TimelineView } from "./App";
 
@@ -22,7 +22,7 @@ async function fixture() {
   const listeners = new Set<() => void>();
   const read = vi.fn(async () => success([]));
   const onNew = vi.fn(), onSettings = vi.fn();
-  window.grudgeVault = { records: { timeline: read }, jobs: { onChanged(listener: () => void) {
+  window.grudgeVault = { records: { timeline: (filter: TimelineFilter) => filter.limit === 1 ? Promise.resolve(success([])) : read() }, jobs: { onChanged(listener: () => void) {
     listeners.add(listener); return () => listeners.delete(listener);
   } } } as unknown as GrudgeVaultApi;
   return { read, onNew, onSettings, async mount() {

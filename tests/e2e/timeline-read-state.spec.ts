@@ -36,7 +36,7 @@ test("does not show a failed timeline read as empty or a stale list under a new 
       model: "qwen3.8-omni-flash", apiKey: "synthetic-timeline-state-key" }))).toMatchObject({ ok: true });
     await page.locator(".new-record-button").click();
     await page.getByLabel("发生了什么？").fill("合成时间线回归：项目奖金仍未支付，需要核对约定与处理步骤。");
-    await page.getByRole("dialog", { name: "新建记录" }).getByRole("button", { name: "保存", exact: true }).click();
+    await page.getByRole("dialog", { name: "新建记录" }).getByRole("button", { name: "判断并收录", exact: true }).click();
     await expect(page.locator(".report-summary")).toBeVisible();
     await expect.poll(() => page.evaluate(async () => { const jobs = await window.grudgeVault.jobs.list();
       return jobs.ok && !jobs.data.some(({ state }) => state === "queued" || state === "running"); })).toBe(true);

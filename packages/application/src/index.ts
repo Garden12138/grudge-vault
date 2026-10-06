@@ -23,7 +23,7 @@ import {
   AppError, toSerializedError, type AssetImportResult, type AssetPreview,
   type BackupSummary, type ClarificationAnswerInput, type CreateEventInput,
   type AgentSettingsUpdateInput, type CandidateMergeInput, type CandidateMergeResult, type CreateRelationInput, type EventWriteFields,
-  type LlmConnectInput,
+  type LlmConnectInput, type WorkspaceUnlockInput, type WorkspacePasswordInput,
   type CaseWriteFields, type CreateCaseInput, type UpdateCaseInput,
   type PersonAliasInput, type PersonMergeInput, type ReviewGenerateInput, type SendMessageInput,
   type SendMessageResult, type StartBackfillInput, type UpdateEventInput
@@ -148,7 +148,9 @@ export interface WorkspaceManagerPort {
   restoreBackup(backupPath: string, destinationPath: string): Promise<WorkspaceSession>;
   status?(): WorkspaceLockState;
   lock?(): Promise<WorkspaceLockState>;
-  unlock?(): Promise<WorkspaceSession>;
+  unlock?(input?: WorkspaceUnlockInput): Promise<WorkspaceSession>;
+  passwordStatus?(): { configured: boolean };
+  setPassword?(input: WorkspacePasswordInput): Promise<{ configured: boolean }>;
   getSecuritySettings?(): WorkspaceSecuritySettings;
   updateSecuritySettings?(settings: WorkspaceSecuritySettings): Promise<WorkspaceSecuritySettings>;
   exportRecovery?(path: string, passphrase: string): Promise<RecoveryPackageSummary>;
@@ -557,9 +559,19 @@ export class GrudgeVaultApplication {
     return this.workspaces.lock();
   }
 
-  async unlockWorkspace(): Promise<Workspace> {
+  async unlockWorkspace(input?: WorkspaceUnlockInput): Promise<Workspace> {
     if (!this.workspaces.unlock) throw new AppError("INTERNAL_ERROR", "Workspace unlocking is unavailable.");
-    return (await this.workspaces.unlock()).workspace;
+    return (await this.workspaces.unlock(input)).workspace;
+  }
+
+  getWorkspacePasswordStatus(): { configured: boolean } {
+    return this.workspaces.passwordStatus?.() ?? { configured: false };
+  }
+
+  setWorkspacePassword(input: WorkspacePasswordInput): Promise<{ configured: boolean }> {
+    this.requireSession();
+    if (!this.workspaces.setPassword) throw new AppError("INTERNAL_ERROR", "账本密码暂不可用。");
+    return this.workspaces.setPassword(input);
   }
 
   getWorkspaceSecuritySettings(): WorkspaceSecuritySettings {

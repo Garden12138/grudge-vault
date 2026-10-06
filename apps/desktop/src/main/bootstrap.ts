@@ -97,8 +97,10 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<void> {
   if (options.initialWorkspacePath) {
     try {
       await workspaces.open(options.initialWorkspacePath);
-    } catch {
-      await workspaces.create(options.initialWorkspacePath, options.initialWorkspaceName ?? "E2E Workspace");
+    } catch (error) {
+      if (!(error instanceof AppError && error.code === "WORKSPACE_PASSWORD_REQUIRED")) {
+        await workspaces.create(options.initialWorkspacePath, options.initialWorkspaceName ?? "E2E Workspace");
+      }
     }
   } else {
     try {

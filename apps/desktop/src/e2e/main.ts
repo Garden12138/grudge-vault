@@ -25,6 +25,7 @@ class E2eAgentModelAdapter implements AgentModelAdapterPort {
 
   async testConnection(input: Parameters<NonNullable<AgentModelAdapterPort["testConnection"]>>[0]) {
     if (!input.apiKey) throw new Error("E2E API key missing");
+    if (input.model === "e2e-connection-failure") throw new Error("Synthetic connection failure");
     if (input.model === "e2e-delayed-connection") {
       const state = globalThis as typeof globalThis & { __gvE2eReleaseConnection?: () => void };
       await new Promise<void>((resolve) => { state.__gvE2eReleaseConnection = resolve; });

@@ -1,3 +1,4 @@
+import { settingsGroup } from "./ui-helpers";
 import { createHash, randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
@@ -88,6 +89,7 @@ test("cleans abandoned ZIP media after an abrupt process exit without inventing 
       (globalThis as typeof globalThis & { __gvE2eZipProgressHold?: boolean }).__gvE2eZipProgressHold = true;
     }, archive);
     await page.getByRole("button", { name: "设置", exact: true }).click();
+    await settingsGroup(page, "导入");
     await page.getByRole("button", { name: "选择 Day One 导出 ZIP", exact: true }).click();
     await expect.poll(() => application!.evaluate(() => (globalThis as typeof globalThis & {
       __gvE2eZipProgressStarted?: boolean
@@ -127,6 +129,7 @@ test("cleans abandoned ZIP media after an abrupt process exit without inventing 
     expect(await page.evaluate(() => window.grudgeVault.intake.dayOneImportProgress())).toEqual({ ok: true, data: null });
     expect(await page.evaluate(() => window.grudgeVault.intake.lastDayOneImportReceipt())).toEqual({ ok: true, data: null });
     await page.getByRole("button", { name: "设置", exact: true }).click();
+    await settingsGroup(page, "导入");
     await expect(page.getByRole("button", { name: "选择 Day One 导出 ZIP", exact: true })).toBeEnabled();
     await expect(page.getByText("尚无已保存的批次摘要；旧版导入不会自动补记。这里不代表 Day One 全部历史已检查。", { exact: true })).toBeVisible();
     expect(counts()).toEqual([1, 1, 0, 0, 1]);

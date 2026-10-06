@@ -15,7 +15,8 @@ import { EncryptedObjectVault } from "@grudge-vault/object-vault";
 import {
   inspectWorkspaceSnapshot, openDatabase, prepareRestoredSnapshot, SqliteWorkspaceDatabase
 } from "@grudge-vault/persistence-sqlite";
-import { AppError, type BackupSummary } from "@grudge-vault/shared";
+import { AppError, type BackupSummary, type WorkspaceUnlockInput, type WorkspacePasswordInput } from "@grudge-vault/shared";
+import { createWorkspacePassword, verifyWorkspacePassword, workspacePasswordSchema } from "./workspace-password";
 
 const WORKSPACE_FORMAT_VERSION = 3;
 const TRANSIENT_DIRECTORY_NAME = ".grudge-vault-redesign-transient-v1";
@@ -59,7 +60,7 @@ const configV2Schema = z.object({
     integrityScanIntervalDays: z.number().int().min(1).max(365)
   })
 });
-const configV3Schema = configV2Schema.extend({ formatVersion: z.literal(WORKSPACE_FORMAT_VERSION) });
+const configV3Schema = configV2Schema.extend({ formatVersion: z.literal(WORKSPACE_FORMAT_VERSION), password: workspacePasswordSchema.optional() });
 const configSchema = z.union([legacyConfigSchema, configV2Schema, configV3Schema]);
 type WorkspaceConfig = z.infer<typeof configV3Schema>;
 
@@ -230,6 +231,7 @@ export class LocalWorkspaceManager implements WorkspaceManagerPort {
   private configMutationTail: Promise<void> = Promise.resolve();
   private sessionTransitionTail: Promise<void> = Promise.resolve();
   private workspaceSelectionEpoch = 0;
+  private passwordFailures = new Map<string, { count: number; blockedUntil: number }>();
 
   constructor(
     private readonly keyProtector: KeyProtectorPort,
@@ -353,7 +355,7 @@ export class LocalWorkspaceManager implements WorkspaceManagerPort {
     return this.openConfig(rootPath, config, assertStillCurrent);
   }
 
-  async open(rootPath: string, assertStillCurrent = this.beginWorkspaceSelection()): Promise<WorkspaceSession> {
+  async open(rootPath: string, assertStillCurrent = this.beginWorkspaceSelection(), password?: string, newPassword?: string): Promise<WorkspaceSession> {
     if (!isAbsolute(rootPath)) throw new AppError("WORKSPACE_INVALID", "Workspace paths must be absolute.");
     let parsed: z.infer<typeof configSchema>;
     try {
@@ -367,7 +369,35 @@ export class LocalWorkspaceManager implements WorkspaceManagerPort {
         "这是旧版工作区。请创建独立的新版工作区并从设置中执行筛选迁移；原工作区尚未被修改。"
       );
     }
-    const config = parsed;
+    let config = parsed;
+    if (config.password && !password) {
+      await this.withSessionTransition(async () => {
+        assertStillCurrent();
+        const outgoing = this.session;
+        this.session = undefined;
+        this.locked = { rootPath, workspaceId: config.id, workspaceName: config.name };
+        this.currentConfig = config;
+        await outgoing?.close();
+        await atomicWriteJson(this.recentStatePath, { recentWorkspacePath: rootPath });
+      });
+      throw new AppError("WORKSPACE_PASSWORD_REQUIRED", "请输入账本密码，继续查看你的记录。", true);
+    }
+    if (config.password) {
+      await this.withConfigMutation(async () => { assertStillCurrent(); await this.assertPassword(config, password); assertStillCurrent(); });
+      if (newPassword) throw new AppError("VALIDATION_FAILED", "请先打开账本，再修改密码。");
+    } else if (newPassword) {
+      const candidate = { ...config, password: await createWorkspacePassword(newPassword), updatedAt: new Date().toISOString() };
+      await this.withConfigMutation(async () => {
+        assertStillCurrent();
+        const latest = configV3Schema.parse(JSON.parse(await readFile(join(rootPath, "workspace.json"), "utf8")));
+        if (latest.id !== config.id || latest.password || JSON.stringify(latest.crypto) !== JSON.stringify(config.crypto)) {
+          throw new AppError("WORKSPACE_LOCKED", "账本设置已变化，请重新打开。", true);
+        }
+        config = { ...latest, password: candidate.password, updatedAt: candidate.updatedAt };
+        await atomicWriteJson(join(rootPath, "workspace.json"), config);
+        this.currentConfig = config;
+      });
+    }
     try {
       return await this.openConfig(rootPath, config, assertStillCurrent);
     } catch (error) {
@@ -399,7 +429,8 @@ export class LocalWorkspaceManager implements WorkspaceManagerPort {
 
   status(): WorkspaceLockState {
     if (this.session) return { status: "open", workspace: this.session.workspace };
-    if (this.locked) return { status: "locked", workspaceId: this.locked.workspaceId, workspaceName: this.locked.workspaceName };
+    if (this.locked) return { status: "locked", workspaceId: this.locked.workspaceId, workspaceName: this.locked.workspaceName,
+      ...(this.currentConfig?.password ? { passwordConfigured: true } : {}) };
     return { status: "closed" };
   }
 
@@ -415,9 +446,50 @@ export class LocalWorkspaceManager implements WorkspaceManagerPort {
     });
   }
 
-  async unlock(): Promise<WorkspaceSession> {
+  async unlock(input?: WorkspaceUnlockInput): Promise<WorkspaceSession> {
     if (!this.locked) throw new AppError("WORKSPACE_LOCKED", "No locked workspace is available to unlock.");
-    return this.open(this.locked.rootPath);
+    return this.open(this.locked.rootPath, this.beginWorkspaceSelection(), input?.password, input?.newPassword);
+  }
+
+  passwordStatus(): { configured: boolean } {
+    return { configured: Boolean(this.currentConfig?.password) };
+  }
+
+  private async assertPassword(config: WorkspaceConfig, password?: string): Promise<void> {
+    if (!config.password) return;
+    const failure = this.passwordFailures.get(config.id);
+    if (failure && failure.blockedUntil > Date.now()) {
+      throw new AppError("WORKSPACE_PASSWORD_THROTTLED", "尝试次数较多，请 30 秒后再试。", true);
+    }
+    if (!await verifyWorkspacePassword(config.password, password)) {
+      const count = failure && failure.blockedUntil === 0 ? failure.count + 1 : 1;
+      this.passwordFailures.set(config.id, { count, blockedUntil: count >= 5 ? Date.now() + 30_000 : 0 });
+      throw new AppError("WORKSPACE_PASSWORD_INCORRECT", "密码不正确，请再试一次。", true);
+    }
+    this.passwordFailures.delete(config.id);
+  }
+
+  async setPassword(input: WorkspacePasswordInput): Promise<{ configured: boolean }> {
+    const target = this.session;
+    if (!target) throw new AppError("WORKSPACE_LOCKED", "请先打开账本，再设置密码。", true);
+    return this.withConfigMutation(async () => {
+      const config = this.currentConfig;
+      if (!config || this.session !== target) throw new AppError("WORKSPACE_LOCKED", "账本已锁定，请重新打开。", true);
+      await this.assertPassword(config, input.currentPassword);
+      const password = await createWorkspacePassword(input.newPassword);
+      if (this.session !== target || this.currentConfig !== config) throw new AppError("WORKSPACE_LOCKED", "账本已锁定或切换，密码尚未修改。", true);
+      const latest = configV3Schema.parse(JSON.parse(await readFile(join(target.workspace.rootPath, "workspace.json"), "utf8")));
+      if (latest.id !== config.id || JSON.stringify(latest.password) !== JSON.stringify(config.password)) {
+        throw new AppError("WORKSPACE_LOCKED", "账本密码设置已变化，请重新打开。", true);
+      }
+      await this.withSessionTransition(async () => {
+        if (this.session !== target || this.currentConfig !== config) throw new AppError("WORKSPACE_LOCKED", "账本已锁定或切换，密码尚未修改。", true);
+        const updated = { ...config, password, updatedAt: new Date().toISOString() };
+        await atomicWriteJson(join(target.workspace.rootPath, "workspace.json"), updated);
+        this.currentConfig = updated;
+      });
+      return { configured: true };
+    });
   }
 
   getSecuritySettings(): WorkspaceSecuritySettings {
@@ -549,6 +621,8 @@ export class LocalWorkspaceManager implements WorkspaceManagerPort {
             throw new AppError("WORKSPACE_LOCKED", "工作区已变化，请重新选择恢复包。", true);
           }
           const updated: WorkspaceConfig = { ...config, updatedAt: now, crypto: { ...config.crypto, keys } };
+          // A verified recovery package is the independent way to regain access after forgetting a password.
+          delete updated.password;
           await atomicWriteJson(join(rootPath, "workspace.json"), updated);
           this.currentConfig = updated;
           return { rootPath, updated };
@@ -1153,7 +1227,8 @@ export class LocalWorkspaceManager implements WorkspaceManagerPort {
       const preflightState = join(dirname(resolvedDestinationPath), `.${randomUUID()}.restore-check.json`);
       const preflight = new LocalWorkspaceManager(this.keyProtector, preflightState);
       try {
-        const candidate = await preflight.open(staging);
+        // Internal object verification never publishes a user session. The final open still requires its password.
+        const candidate = await preflight.openConfig(staging, config);
         const candidateSnapshot = inspectWorkspaceSnapshot(join(staging, "db", "grudge-vault.sqlite3"));
         for (const sha256 of candidateSnapshot.assetHashes) {
           if (!(await candidate.vault.verify(sha256, candidate.keyRing ?? candidate.key))) {
@@ -1286,7 +1361,7 @@ export class LocalWorkspaceManager implements WorkspaceManagerPort {
           throw new AppError("WORKSPACE_INVALID", "The workspace configuration changed while opening.", true, { cause });
         }
         if (latest.id !== config.id || latest.formatVersion !== config.formatVersion ||
-          JSON.stringify(latest.crypto) !== JSON.stringify(config.crypto)) {
+          JSON.stringify(latest.crypto) !== JSON.stringify(config.crypto) || JSON.stringify(latest.password) !== JSON.stringify(config.password)) {
           throw new AppError("WORKSPACE_LOCKED", "工作区密钥配置已变化，请重新打开。", true);
         }
         const committedConfig = refreshed.some((slot, index) => slot.envelope !== config.crypto.keys[index]?.envelope)

@@ -75,6 +75,7 @@ export { projectRecordOccurrence } from "./record-occurrence";
 export type { RecordOccurrenceProjection } from "./record-occurrence";
 
 export const APP_ERROR_CODES = [
+  "WORKSPACE_PASSWORD_REQUIRED", "WORKSPACE_PASSWORD_INCORRECT", "WORKSPACE_PASSWORD_THROTTLED",
   "NO_ACTIVE_WORKSPACE",
   "WORKSPACE_INVALID",
   "WORKSPACE_EXISTS",
@@ -341,6 +342,9 @@ export interface RecoveryImportInput {
   passphrase: string;
 }
 
+export interface WorkspaceUnlockInput { password?: string | undefined; newPassword?: string | undefined; }
+export interface WorkspacePasswordInput { currentPassword?: string | undefined; newPassword: string; }
+
 export interface PrepareIntakeInput {
   requestId: string;
   text: string;
@@ -373,7 +377,9 @@ export interface GrudgeVaultApi {
     create(name: string): Promise<IpcResult<Workspace | null>>;
     open(): Promise<IpcResult<Workspace | null>>;
     lock(): Promise<IpcResult<WorkspaceLockState>>;
-    unlock(): Promise<IpcResult<Workspace | null>>;
+    unlock(input?: WorkspaceUnlockInput): Promise<IpcResult<Workspace | null>>;
+    passwordStatus(): Promise<IpcResult<{ configured: boolean }>>;
+    setPassword(input: WorkspacePasswordInput): Promise<IpcResult<{ configured: boolean }>>;
     getSecuritySettings(): Promise<IpcResult<WorkspaceSecuritySettings>>;
     updateSecuritySettings(settings: WorkspaceSecuritySettings): Promise<IpcResult<WorkspaceSecuritySettings>>;
     exportRecovery(input: RecoveryExportInput): Promise<IpcResult<RecoveryPackageSummary | null>>;

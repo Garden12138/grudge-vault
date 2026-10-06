@@ -326,11 +326,14 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     return workspace;
   });
   add("workspace:lock", emptySchema, () => dependencies.lockWorkspace());
-  add("workspace:unlock", emptySchema, async () => {
-    const workspace = await dependencies.application.unlockWorkspace();
+  add("workspace:unlock", z.object({ password: z.string().max(128).optional(), newPassword: z.string().min(8).max(128).optional() }).strict().optional(), async (input) => {
+    const workspace = await dependencies.application.unlockWorkspace(input);
     dependencies.restartRunner();
     return workspace;
   });
+  add("workspace:password-status", emptySchema, () => dependencies.application.getWorkspacePasswordStatus());
+  add("workspace:set-password", z.object({ currentPassword: z.string().max(128).optional(), newPassword: z.string().min(8).max(128) }).strict(),
+    (input) => dependencies.application.setWorkspacePassword(input));
   add("workspace:security-settings", emptySchema, () => dependencies.application.getWorkspaceSecuritySettings());
   add("workspace:update-security-settings", securitySettingsSchema, (settings) =>
     dependencies.application.updateWorkspaceSecuritySettings(settings));

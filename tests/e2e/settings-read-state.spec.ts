@@ -29,10 +29,13 @@ test("shows settings read failures as unknown and retries each source without mo
     await expect(card.getByRole("alert")).toContainText("暂时无法读取索引状态");
     await expect(card.locator(".status")).toHaveText("状态未知");
     await expect(card).not.toContainText("未建立"); await expect(card).not.toContainText("请先连接百炼");
+    await page.getByRole("button", { name: "隐私与安全", exact: true }).click();
     await expect(page.getByRole("button", { name: "保存默认地域", exact: true })).toBeDisabled();
     await expect(page.getByLabel("默认地域", { exact: true })).toHaveValue("");
+    await page.getByRole("button", { name: "导入", exact: true }).click();
     await expect(page.getByRole("button", { name: "选择 Day One 导出 ZIP", exact: true })).toBeDisabled();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1)).toBe(true);
+    await page.getByRole("button", { name: "模型服务", exact: true }).click();
     await page.screenshot({ path: testInfo.outputPath("settings-model-read-unavailable.png") });
     await card.screenshot({ path: testInfo.outputPath("settings-index-read-unavailable.png") });
     await page.getByRole("button", { name: "重新读取模型设置", exact: true }).focus();
@@ -41,8 +44,11 @@ test("shows settings read failures as unknown and retries each source without mo
     await page.keyboard.press("Enter");
     await expect(page.getByRole("button", { name: "重新读取模型设置", exact: true })).toHaveCount(0);
     await page.getByRole("button", { name: "重新读取索引状态", exact: true }).click();
+    await page.getByRole("button", { name: "隐私与安全", exact: true }).click();
     await page.getByRole("button", { name: "重新读取默认地域", exact: true }).click();
+    await page.getByRole("button", { name: "模型服务", exact: true }).click();
     await expect(card.locator(".status")).toHaveText("未建立"); await expect(card).toContainText("请先连接百炼");
+    await page.getByRole("button", { name: "隐私与安全", exact: true }).click();
     await expect(page.getByLabel("默认地域", { exact: true })).toHaveValue("中国大陆");
     const after = await page.evaluate(async () => ({ model: await window.grudgeVault.llm.getSettings(),
       index: await window.grudgeVault.records.searchIndexStatus(), legal: await window.grudgeVault.legal.getDefaultJurisdiction(),

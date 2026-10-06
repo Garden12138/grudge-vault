@@ -779,6 +779,54 @@ describe("redesigned intake boundary", () => {
     expect(database.serialize().includes(Buffer.from(marker))).toBe(false);
   });
 
+  it.each(["zip", "dayone"] as const)("lets an expired %s review be supplemented without restoring an archive or using its excerpt as source", async origin => {
+    const { service, path } = await context();
+    const original = await service.prepareDraft({ text: "原日记里他又这样说了，我有些不安", origin,
+      sourceLocator: { connectorId: "synthetic-import", journalId: "journal", entryId: "entry" }, sourceVersion: "original-v1" });
+    const review = await service.screenAndSave(original.sessionId, randomUUID(), screening({
+      decision: "review", categories: ["danger"], reason: "需核对具体行为及与本人的关系", anchors: [],
+      coverage: "partial", policyVersion: "test-v1"
+    }));
+    if (review.kind !== "needs_review") throw new Error("expected review");
+    service.abandonDraft(original.sessionId);
+    const text = "补充核对：同事在公司门口直接威胁我，附件是我收到的消息";
+    const replacement = await service.prepareDraft({ text, paths: [path] });
+    const failed = await service.rescreenPendingFromManual(review.pendingId, replacement.sessionId, {
+      async screen() { throw new Error("synthetic connection failure"); }
+    });
+    expect(failed.kind).toBe("failed");
+    expect(service.listPending().map(item => item.id)).toEqual([review.pendingId]);
+    const screen = vi.fn(async () => ({ decision: "include" as const, categories: ["danger" as const],
+      reason: "补充明确本人遭遇的威胁", anchors: [], coverage: "complete" as const, policyVersion: "test-v2" }));
+    const saved = await service.rescreenPendingFromManual(review.pendingId, replacement.sessionId, { screen });
+    expect(screen).toHaveBeenCalledWith(expect.objectContaining({ text, origin: "manual" }), undefined);
+    expect(saved.kind).toBe("saved");
+    expect(service.listPending()).toHaveLength(0);
+    const record = service.listTimeline({ limit: 10 }).records[0]!;
+    expect(record).toMatchObject({ origin: "manual", attachmentCount: 1 });
+    expect(service.getRecord(record.id).source.text).toBe(text);
+    expect(await service.rescreenPendingFromManual(review.pendingId, replacement.sessionId, { screen })).toEqual(saved);
+    expect(screen).toHaveBeenCalledOnce();
+  });
+
+  it.each(["skip", "review"] as const)("replaces an expired ZIP review with its supplemented %s outcome", async decision => {
+    const { service } = await context();
+    const original = await service.prepareDraft({ text: "原日记含糊描述", origin: "zip" });
+    const old = await service.screenAndSave(original.sessionId, randomUUID(), screening({
+      decision: "review", categories: [], reason: "需补充本人关系", anchors: [], coverage: "complete", policyVersion: "test-v1"
+    }));
+    if (old.kind !== "needs_review") throw new Error("expected review");
+    service.abandonDraft(original.sessionId);
+    const replacement = await service.prepareDraft({ text: "这是我补充的具体经过" });
+    const result = await service.rescreenPendingFromManual(old.pendingId, replacement.sessionId, screening({
+      decision, categories: [], reason: "补充后的判断", anchors: [], coverage: "complete", policyVersion: "test-v2"
+    }));
+    expect(result.kind).toBe(decision === "skip" ? "skipped" : "needs_review");
+    expect(service.listPending().some(item => item.id === old.pendingId)).toBe(false);
+    expect(service.listPending()).toHaveLength(decision === "skip" ? 0 : 1);
+    expect(service.listTimeline({ limit: 10 }).records).toHaveLength(0);
+  });
+
   it("lets an expired migration review be re-provided as a clearly manual record", async () => {
     const { service } = await context();
     const migrated = await service.migrateLegacyWorkspace({

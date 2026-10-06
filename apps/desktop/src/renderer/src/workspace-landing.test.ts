@@ -26,11 +26,11 @@ it("refreshes a failed opening's locked recovery state even without a pushed eve
   } });
   root = createRoot(document.body.appendChild(document.createElement("div")));
   await act(async () => root?.render(createElement(App)));
-  const button = Array.from(document.querySelectorAll("button")).find(({ textContent }) => textContent === "打开已有工作区")!;
+  const button = Array.from(document.querySelectorAll("button")).find(({ textContent }) => textContent === "打开已有账本")!;
   await act(async () => button.click());
   expect(status).toHaveBeenCalledTimes(2);
   expect(document.body.textContent).toContain("合成待恢复工作区");
-  expect(document.body.textContent).toContain("解锁工作区");
+  expect(document.body.textContent).toContain("暂时打开账本");
   expect(document.querySelector('[role="alert"]')?.textContent).toBe("合成系统密钥暂不可用。");
-  expect(document.body.textContent).not.toContain("创建新工作区");
+  expect(document.body.textContent).not.toContain("创建账本");
 });

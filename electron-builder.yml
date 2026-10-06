@@ -3,6 +3,10 @@ productName: Grudge Vault
 copyright: Copyright © 2026 Grudge Vault contributors
 asar: true
 npmRebuild: true
+# Nested app dependency installation must not re-run this workspace's postinstall.
+# electron-builder explicitly rebuilds native modules after that installation.
+npmArgs:
+  - --ignore-scripts
 directories:
   app: apps/desktop
   output: release

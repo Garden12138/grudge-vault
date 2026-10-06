@@ -1923,7 +1923,7 @@ export class RedesignService {
         return previousResult;
       }
       const pending = workspace.records.getPending(id);
-      if (!pending || (pending.origin !== "manual" && pending.origin !== "migration")) {
+      if (!pending || !["manual", "migration", "zip", "dayone"].includes(pending.origin)) {
         throw new AppError("ENTITY_NOT_FOUND", "请选择一条可重新提供完整内容的待确认项。");
       }
       const session = this.requireSession(sessionId);
