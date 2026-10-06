@@ -1,4 +1,16 @@
-import { expect, type Page } from "@playwright/test";
+import { expect, type ElectronApplication, type Page } from "@playwright/test";
+
+export async function focusDesktop(application: ElectronApplication, page: Page) {
+  await application.evaluate(({ app, BrowserWindow }) => {
+    const window = BrowserWindow.getAllWindows()[0]!;
+    app.focus({ steal: true });
+    window.show();
+    window.focus();
+    window.webContents.focus();
+  });
+  await page.bringToFront();
+  await expect.poll(() => page.evaluate(() => document.hasFocus())).toBe(true);
+}
 export async function openDisclosure(page: Page, title: string) {
   const details = page.locator("details").filter({ has: page.locator("summary", { hasText: title }) }).first();
   await expect(details).toBeVisible();

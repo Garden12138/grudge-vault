@@ -31,7 +31,10 @@ win:
   target:
     - nsis
 linux:
+  executableName: grudge-vault
   category: Utility
   target:
     - AppImage
 artifactName: "${productName}-${version}-${os}-${arch}.${ext}"
+appImage:
+  artifactName: "${productName}-${version}-linux-x64.${ext}"

@@ -1,4 +1,4 @@
-import { openDisclosure, settingsGroup } from "./ui-helpers";
+import { focusDesktop, openDisclosure, settingsGroup } from "./ui-helpers";
 import { createReadStream, createWriteStream } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, open, readFile, readdir, rm, writeFile } from "node:fs/promises";
@@ -569,6 +569,8 @@ test("runs the screened record, review, report and search flow", async () => {
     await expect(page.locator(".query-files li")).toContainText("keyboard.png");
 
     await application.evaluate(({ dialog }, selectedZip) => {
+      (globalThis as typeof globalThis & { __gvPreviousOpenDialog?: typeof dialog.showOpenDialog })
+        .__gvPreviousOpenDialog = dialog.showOpenDialog;
       dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [selectedZip] });
       const testState = globalThis as typeof globalThis & {
         __gvZipConfirmResponse?: number;
@@ -697,6 +699,14 @@ test("runs the screened record, review, report and search flow", async () => {
       .toBe("restored");
     await page.locator(".new-record-button").click();
     const unsupportedEditor = page.getByRole("dialog", { name: "新建记录" });
+    // ZIP selection used a native-dialog stub. Restore it before exercising the
+    // real file chooser; Electron also uses this API for HTML file inputs.
+    await application.evaluate(({ dialog }) => {
+      const state = globalThis as typeof globalThis & { __gvPreviousOpenDialog?: typeof dialog.showOpenDialog };
+      dialog.showOpenDialog = state.__gvPreviousOpenDialog!;
+      delete state.__gvPreviousOpenDialog;
+    });
+    await focusDesktop(application, page);
     await unsupportedEditor.getByLabel("发生了什么？").fill("合成图片中的工资凭证需要核对");
     await page.keyboard.press("Tab");
     await expect(unsupportedEditor.getByLabel("添加图片、音频或视频")).toBeFocused();

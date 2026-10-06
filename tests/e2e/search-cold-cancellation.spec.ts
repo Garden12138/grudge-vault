@@ -9,6 +9,7 @@ import { SqliteAssetRepository, SqliteJobRepository, SqliteRecordRepository } fr
 import { LocalWorkspaceManager } from "../../apps/desktop/src/main/workspace-manager";
 import { coldSearchEmbedding, type ColdSearchObservation } from "../../apps/desktop/src/e2e/cold-search-observer";
 import { armSearchFeedback, beginFeedbackTrace, finishFeedbackTrace, type FeedbackObservation } from "./search-feedback";
+import { focusDesktop } from "./ui-helpers";
 
 const recordCount = 10_000, fragmentCount = 50_000;
 // Windows runners take longer to seed and persist this large vector corpus.
@@ -154,6 +155,7 @@ test("cancels a real cold 10k-record search from the UI before embedding and can
     await desktop.evaluate((_, value) => { (globalThis as typeof globalThis & {
       __gvE2eColdSearch?: ColdSearchObservation;
     }).__gvE2eColdSearch = value; }, freshObservation());
+    await focusDesktop(desktop, page);
     await armSearchFeedback(page, "gv-search-first-feedback");
     const firstTraceSession = await beginFeedbackTrace(page);
     await page.locator(".search-input").getByRole("button", { name: "搜索", exact: true }).click();
@@ -191,6 +193,7 @@ test("cancels a real cold 10k-record search from the UI before embedding and can
       __gvE2eColdSearch?: ColdSearchObservation;
     }).__gvE2eColdSearch = value; }, freshObservation());
     await page.locator("#global-search-input").fill("下一次完整合成语义查询");
+    await focusDesktop(desktop, page);
     await armSearchFeedback(page, "gv-search-next-feedback");
     const nextTraceSession = await beginFeedbackTrace(page);
     await page.locator(".search-input button").click();

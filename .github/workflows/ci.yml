@@ -39,6 +39,8 @@ jobs:
           node-version: 24.10.0
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Verify packaging dependency collection
+        run: node scripts/verify-package-dependencies.mjs
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
@@ -56,7 +58,9 @@ jobs:
         if: runner.os != 'Linux'
         run: pnpm test:e2e
       - run: node scripts/prepare-package-assets.mjs
-      - run: pnpm exec electron-builder --config electron-builder.yml ${{ matrix.args }} --publish never
+      # Invoke the pinned builder directly so Windows dependency collection uses
+      # the action-installed pnpm, rather than a nested workspace command shim.
+      - run: node node_modules/electron-builder/out/cli/cli.js --config electron-builder.yml ${{ matrix.args }} --publish never
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
       - name: Smoke-test packaged Mac app
