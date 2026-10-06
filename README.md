@@ -6,6 +6,19 @@ Grudge Vault 通过对话、日记和多媒体，持续构建属于用户自己�
 
 “记仇”是产品人格，理性地保存记忆、理解模式并保护自身利益，才是产品价值。
 
+## 下载桌面版
+
+打开[最新版本发布页](https://github.com/Garden12138/grudge-vault/releases/latest)，在 Assets 中选择与你的电脑匹配的安装附件：
+
+| 平台 | 文件名末尾 |
+| --- | --- |
+| Windows 64 位 | `win-x64.exe` |
+| Mac，Apple Silicon（M 系列） | `mac-arm64.dmg` 或 `mac-arm64.zip` |
+| Mac，Intel | `mac-x64.dmg` 或 `mac-x64.zip` |
+| Linux 64 位 | `linux-x64.AppImage` |
+
+`SHA256SUMS` 提供下载文件的校验值。GitHub 自动生成的 Source code ZIP/TAR 包用于获取源码。当前 macOS 安装包尚未签名或公证。
+
 ## 产品闭环
 
 ```text

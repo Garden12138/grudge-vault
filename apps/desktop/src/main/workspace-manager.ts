@@ -292,6 +292,8 @@ export class LocalWorkspaceManager implements WorkspaceManagerPort {
 
   private async initializeTransientStorage(): Promise<void> {
     const root = this.transientRoot();
+    // Windows stat.mode is synthesized; the per-user data directory inherits its Windows ACLs.
+    const checkPosixPermissions = process.platform !== "win32";
     await mkdir(dirname(root), { recursive: true, mode: 0o700 });
     const previous = await lstat(root).catch((cause: NodeJS.ErrnoException) => {
       if (cause.code === "ENOENT") return undefined;
@@ -299,13 +301,13 @@ export class LocalWorkspaceManager implements WorkspaceManagerPort {
     });
     if (previous) {
       if (!previous.isDirectory() || previous.isSymbolicLink() ||
-        (previous.mode & 0o077) !== 0 ||
+        (checkPosixPermissions && (previous.mode & 0o077) !== 0) ||
         (process.getuid && previous.uid !== process.getuid())) {
         throw new AppError("CLEANUP_FAILED", "临时处理目录的所有权或权限异常；未删除其中内容。", true);
       }
       const markerPath = join(root, TRANSIENT_MARKER_NAME);
       const marker = await lstat(markerPath).catch(() => undefined);
-      if (!marker?.isFile() || marker.isSymbolicLink() || (marker.mode & 0o077) !== 0 ||
+      if (!marker?.isFile() || marker.isSymbolicLink() || (checkPosixPermissions && (marker.mode & 0o077) !== 0) ||
         (process.getuid && marker.uid !== process.getuid()) ||
         await readFile(markerPath, "utf8") !== TRANSIENT_MARKER) {
         throw new AppError("CLEANUP_FAILED", "临时处理目录缺少应用所有权标记；未删除其中内容。", true);

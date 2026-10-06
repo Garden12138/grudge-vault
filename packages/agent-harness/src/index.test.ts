@@ -2554,20 +2554,24 @@ describe("Phase 4 Agent Harness", () => {
   });
 
   it("accepts a plain direct reply only for the single clarification just displayed", async () => {
-    const context = createContext();
-    databases.push(context.database);
-    const conversation = context.application.createConversation("Clarify");
-    const recorded = await context.application.sendMessage({
-      conversationId: conversation.id, content: "Someone omitted my name from the report", intent: "record"
-    });
-    const harness = new AgentHarness(context.application);
-    const review = await harness.send({ conversationId: conversation.id, content: "请回顾并列出待补全问题" });
-    expect(review.run.analysis?.suggestedQuestions).toHaveLength(1);
-    const answer = await harness.send({ conversationId: conversation.id, content: "大约在 2026 年 8 月" });
-    expect(answer.run.intent).toBe("clarify");
-    expect(answer.run.actions[0]?.status).toBe("approved");
-    expect(context.application.listClarifications(recorded.event!.id)[0]?.status).toBe("answered");
-    expect(context.application.listEventRevisions(recorded.event!.id)[0]?.actor).toBe("agent");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-08-24T00:00:00.000Z"));
+    try {
+      const context = createContext();
+      databases.push(context.database);
+      const conversation = context.application.createConversation("Clarify");
+      const recorded = await context.application.sendMessage({
+        conversationId: conversation.id, content: "Someone omitted my name from the report", intent: "record"
+      });
+      const harness = new AgentHarness(context.application);
+      const review = await harness.send({ conversationId: conversation.id, content: "请回顾并列出待补全问题" });
+      expect(review.run.analysis?.suggestedQuestions).toHaveLength(1);
+      const answer = await harness.send({ conversationId: conversation.id, content: "大约在 2026 年 8 月" });
+      expect(answer.run.intent).toBe("clarify");
+      expect(answer.run.actions[0]?.status).toBe("approved");
+      expect(context.application.listClarifications(recorded.event!.id)[0]?.status).toBe("answered");
+      expect(context.application.listEventRevisions(recorded.event!.id)[0]?.actor).toBe("agent");
+    } finally { vi.useRealTimers(); }
   });
 
   it("rejects guessed object ids from model tools and returns a deterministic fallback", async () => {

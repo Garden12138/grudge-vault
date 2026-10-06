@@ -1960,7 +1960,7 @@ export class SqliteMemoryRepository implements MemoryRepositoryPort {
   listMessages(conversationId: string): Message[] {
     this.getConversationRequired(conversationId);
     return (this.database.prepare(
-      "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at, id"
+      "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at, rowid"
     ).all(conversationId) as Record<string, unknown>[]).map(mapMessage);
   }
 
@@ -3041,7 +3041,7 @@ export class SqliteAgentRepository implements AgentRepositoryPort {
 
   listRuns(conversationId: string): AgentRun[] {
     const rows = this.database.prepare(
-      "SELECT id FROM agent_runs WHERE conversation_id = ? ORDER BY created_at, id"
+      "SELECT id FROM agent_runs WHERE conversation_id = ? ORDER BY created_at, rowid"
     ).all(conversationId) as Array<{ id: string }>;
     return rows.map(({ id }) => this.getRun(id)).filter((run): run is AgentRun => Boolean(run));
   }

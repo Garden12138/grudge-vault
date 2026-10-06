@@ -12,7 +12,7 @@ describe("Day One import folder monitor", () => {
   const roots: string[] = [];
   afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
 
-  it("scans only stable top-level ZIP files and leaves the path in mode-0600 machine state", async () => {
+  it("scans only stable top-level ZIP files and keeps the path in private machine state", async () => {
     const root = await mkdtemp(join(tmpdir(), "grudge-vault-folder-")); roots.push(root);
     const workspace = join(root, "workspace"); const folder = join(root, "imports"); const nested = join(folder, "nested");
     await mkdir(workspace); await mkdir(nested, { recursive: true });
@@ -47,7 +47,8 @@ describe("Day One import folder monitor", () => {
       expect(imported).toBe(2);
       expect(wakes).toBe(2);
       expect(ingested).not.toContain("nested.zip");
-      expect((await stat(statePath)).mode & 0o777).toBe(0o600);
+      // Windows reports synthesized mode bits; this assertion applies to POSIX permissions.
+      if (process.platform !== "win32") expect((await stat(statePath)).mode & 0o777).toBe(0o600);
       expect(await readFile(statePath, "utf8")).toContain(folder);
       await expect(monitor.choose(workspace)).rejects.toBeInstanceOf(AppError);
     } finally {

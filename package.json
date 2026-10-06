@@ -1,6 +1,6 @@
 {
   "name": "grudge-vault",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "A local-first event memory and evidence vault.",
   "author": "Grudge Vault contributors",
@@ -15,7 +15,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:packaging": "node --test scripts/package-runtime-identity.test.mjs scripts/verify-mac-zip.test.mjs",
+    "test:packaging": "node --test scripts/package-runtime-identity.test.mjs scripts/verify-mac-zip.test.mjs scripts/prepare-release.test.mjs",
     "test:live-smoke-budget": "node --test scripts/live-smoke-budget.test.mjs",
     "test:screening-kit": "node --test scripts/screening-kit.test.mjs",
     "prepare:screening-kit": "node scripts/prepare-screening-kit.mjs",

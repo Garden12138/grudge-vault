@@ -545,6 +545,32 @@ describe("SQLite foundation", () => {
     database.close();
   });
 
+  it("preserves conversation and run insertion order at identical timestamps, including updates to older runs", () => {
+    const database = new Database(":memory:");
+    try {
+      database.pragma("foreign_keys = ON"); runMigrations(database);
+      const memory = new SqliteMemoryRepository(database), agents = new SqliteAgentRepository(database);
+      const now = "2026-08-24T00:00:00.000Z";
+      memory.createConversation({ id: "conversation-1", sourceId: "source-1", title: "Order", createdAt: now, updatedAt: now },
+        { id: "source-1", kind: "chat", name: "Order", createdAt: now });
+      const messageIds = ["message-z", "message-y", "message-a", "message-b"];
+      messageIds.forEach((id, index) => memory.appendMessage({
+        id, conversationId: "conversation-1", sourceItemId: `item-${index}`, role: index % 2 ? "assistant" : "user",
+        content: "synthetic", createdAt: now
+      }, { id: `item-${index}`, sourceId: "", content: "synthetic", recordedAt: now, assetRefs: [] }));
+      const runs: AgentRun[] = ["run-z", "run-a"].map((id, index) => ({
+        id, conversationId: "conversation-1", userMessageId: messageIds[index * 2]!, assistantMessageId: messageIds[index * 2 + 1]!,
+        intent: "review", mode: "private", status: "succeeded", toolSchemaVersion: 1,
+        contextHash: "a".repeat(64), responseVersion: 1, citations: [], toolCalls: [], actions: [], createdAt: now, completedAt: now
+      }));
+      runs.forEach(run => agents.saveRun(run));
+      expect(memory.listMessages("conversation-1").map(({ id }) => id)).toEqual(messageIds);
+      expect(agents.listRuns("conversation-1").map(({ id }) => id)).toEqual(["run-z", "run-a"]);
+      agents.saveRun({ ...runs[0]!, responseText: "older run updated" });
+      expect(agents.listRuns("conversation-1").map(({ id }) => id)).toEqual(["run-z", "run-a"]);
+    } finally { database.close(); }
+  });
+
   it("recovers expired leases and preserves attempt history", () => {
     const database = new Database(":memory:");
     runMigrations(database);

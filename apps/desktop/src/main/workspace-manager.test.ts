@@ -1417,6 +1417,7 @@ describe("encrypted workspace snapshots", () => {
   });
 
   it("rebinds a locked workspace across key protectors with a passphrase recovery package", async () => {
+    // Exercises several production-strength key derivations, including invalid recovery attempts.
     const root = await mkdtemp(join(tmpdir(), "grudge-vault-recovery-"));
     const workspacePath = join(root, "workspace");
     const recoveryPath = join(root, "keys.gvrecovery");
@@ -1462,7 +1463,7 @@ describe("encrypted workspace snapshots", () => {
       await source.close();
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   it("does not overwrite a locked workspace policy while recovering its keys", async () => {
     const root = await mkdtemp(join(tmpdir(), "grudge-vault-recovery-policy-race-"));

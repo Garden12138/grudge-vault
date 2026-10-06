@@ -202,6 +202,9 @@ test("exposes the workspace idle-lock policy without silently changing it during
 });
 
 test("runs the screened record, review, report and search flow", async () => {
+  // This journey includes multiple imports, report retries and media decoding on CI hosts.
+  // Keep individual assertion deadlines while allowing the complete journey to finish.
+  test.setTimeout(120_000);
   const root = await mkdtemp(join(tmpdir(), "grudge-vault-redesign-e2e-"));
   const workspace = join(root, "workspace");
   const userData = join(root, "user-data");

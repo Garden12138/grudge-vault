@@ -136,3 +136,13 @@ Release sign-off uses Node 24 and pnpm 11.23 for `lint`, `typecheck`, unit/integ
 14. Run the injected-adapter E2E path: Incremental Day One import → media derivation → OCR/Transcript search → Agent citation → automatic Review → Reminder navigation.
 
 Release sign-off uses Node 24.10+ and pnpm 11.23 for `lint`, `typecheck`, all unit/integration/E2E tests, the production build, and macOS/Windows/Linux packaging. Validation under Node 25 or pnpm 7 is informative only.
+
+## Publishing desktop installers
+
+Keep the root and workspace package versions identical, then commit the reviewed changes and push an annotated `vX.Y.Z` tag matching `apps/desktop/package.json`. Published tags are immutable; use a new patch version for release fixes.
+
+The tag workflow verifies Windows, Linux, Apple Silicon Mac and Intel Mac before building installers on their native runners. Mac packages are additionally checked for the native media helper, SQLite loading, runtime identity and matching renderer source. Only installer files are uploaded as packaging artifacts.
+
+The release job combines those artifacts and runs `scripts/prepare-release.mjs`. It requires the six versioned installers (Windows EXE, Linux AppImage, and DMG/ZIP for both Mac architectures), rejects missing or unexpected files, and produces `SHA256SUMS`. The job creates a draft GitHub Release, uploads the verified installers and checksums, then publishes it. A failed verification or packaging job prevents publication. A failed upload leaves the new release in draft; rerun the job after resolving the failure.
+
+For a release to be complete, check the tag workflow and the published Release assets. The GitHub tag page's automatic Source code ZIP/TAR archives do not contain installed applications. Pull requests and untagged `main` pushes run validation and packaging without publishing a release. Failed desktop checks retain `test-results/` as Actions artifacts for diagnosis. Current Mac installers are unsigned and unnotarized.
