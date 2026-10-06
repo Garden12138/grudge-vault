@@ -11,6 +11,10 @@ import { coldSearchEmbedding, type ColdSearchObservation } from "../../apps/desk
 import { armSearchFeedback, beginFeedbackTrace, finishFeedbackTrace, type FeedbackObservation } from "./search-feedback";
 
 const recordCount = 10_000, fragmentCount = 50_000;
+// Windows runners take longer to seed and persist this large vector corpus.
+// UI and cancellation assertions keep their own short deadlines.
+const corpusTestTimeout = process.platform === "win32" ? 420_000 : 180_000;
+const fullIndexWriteTimeout = process.platform === "win32" ? 240_000 : 45_000;
 const freshObservation = (): ColdSearchObservation => ({ armed: true, detailBatches: 0, details: 0, keyBatches: 0,
   keys: 0, embeddingCalls: 0, embeddingInputs: 0, started: 0, completed: 0, outcomes: [] });
 type Desktop = Awaited<ReturnType<typeof electron.launch>>;
@@ -119,7 +123,7 @@ function databaseSnapshot(workspace: string): { byteLength: number; sha256: stri
 // The extended budget covers building a real 10k/50k fixture; other E2E timeouts are unchanged.
 // eslint-disable-next-line no-empty-pattern
 test("cancels a real cold 10k-record search from the UI before embedding and can search the full index afterwards", async ({}, testInfo) => {
-  test.setTimeout(180_000);
+  test.setTimeout(corpusTestTimeout);
   const root = await mkdtemp(join(tmpdir(), "grudge-vault-cold-search-e2e-"));
   const workspace = join(root, "workspace"), userData = join(root, "user-data");
   let application: Awaited<ReturnType<typeof electron.launch>> | undefined;
@@ -233,7 +237,7 @@ test("cancels a real cold 10k-record search from the UI before embedding and can
 
 // eslint-disable-next-line no-empty-pattern
 test("pauses a real 10k-record scheduling check from settings and verifies full coverage without rebuilding", async ({}, testInfo) => {
-  test.setTimeout(180_000);
+  test.setTimeout(corpusTestTimeout);
   const root = await mkdtemp(join(tmpdir(), "grudge-vault-index-schedule-e2e-"));
   const workspace = join(root, "workspace"), userData = join(root, "user-data");
   let application: Awaited<ReturnType<typeof electron.launch>> | undefined;
@@ -343,7 +347,7 @@ test("pauses a real 10k-record scheduling check from settings and verifies full 
 
 // eslint-disable-next-line no-empty-pattern
 test("pauses a real 10k-record index build before embedding, resumes it and interrupts an external recheck", async ({}, testInfo) => {
-  test.setTimeout(180_000);
+  test.setTimeout(corpusTestTimeout);
   const root = await mkdtemp(join(tmpdir(), "grudge-vault-index-scan-e2e-"));
   const workspace = join(root, "workspace"), userData = join(root, "user-data");
   let application: Awaited<ReturnType<typeof electron.launch>> | undefined;
@@ -400,7 +404,7 @@ test("pauses a real 10k-record index build before embedding, resumes it and inte
 
     await arm();
     await card.getByRole("button", { name: "恢复并更新索引", exact: true }).click();
-    await expect.poll(async () => (await read()).indexBuild?.completed ?? 0, { timeout: 45_000 }).toBe(1);
+    await expect.poll(async () => (await read()).indexBuild?.completed ?? 0, { timeout: fullIndexWriteTimeout }).toBe(1);
     await expect(card.locator(".status")).toHaveText("已就绪");
     const completed = await read();
     expect(completed).toMatchObject({ detailBatches: 80, details: recordCount * 2, keyBatches: 0, keys: 0,
@@ -466,6 +470,7 @@ test("pauses a real 10k-record index build before embedding, resumes it and inte
         const observed = await application.evaluate(() => (globalThis as typeof globalThis & {
           __gvE2eColdSearch?: ColdSearchObservation;
         }).__gvE2eColdSearch);
+        process.stderr.write(`Synthetic index counters after failure: ${JSON.stringify(observed)}\n`);
         await testInfo.attach("aggregate-index-build-failure", { body: JSON.stringify({ observed,
           observationReadRetries: observationReadRetries.get(application) ?? 0,
           limits: "Passive synthetic counters sampled after the failed assertion, before closing the owned app; not an exact deadline snapshot." }),
