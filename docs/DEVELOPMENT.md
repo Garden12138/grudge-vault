@@ -147,4 +147,6 @@ CI invokes the pinned builder with Node directly, keeping the action-installed p
 
 The release job combines those artifacts and runs `scripts/prepare-release.mjs`. It requires the six versioned installers (Windows EXE, Linux AppImage, and DMG/ZIP for both Mac architectures), rejects missing or unexpected files, and produces `SHA256SUMS`. The job creates a draft GitHub Release, uploads the verified installers and checksums, then publishes it. A failed verification or packaging job prevents publication. A failed upload leaves the new release in draft; rerun the job after resolving the failure.
 
+Checksum entries use the published asset names, with spaces replaced by dots to match GitHub's upload normalization. The installer bytes and build artifact names are unchanged.
+
 For a release to be complete, check the tag workflow and the published Release assets. The GitHub tag page's automatic Source code ZIP/TAR archives do not contain installed applications. Pull requests and untagged `main` pushes run validation and packaging without publishing a release. Failed desktop checks retain `test-results/` as Actions artifacts for diagnosis. Current Mac installers are unsigned and unnotarized.

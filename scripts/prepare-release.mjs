@@ -24,7 +24,8 @@ export async function prepareRelease(tag, directory, version) {
     }
     const hash = createHash("sha256");
     for await (const chunk of createReadStream(path)) hash.update(chunk);
-    checksums.push(`${hash.digest("hex")}  ${name}`);
+    // GitHub normalizes spaces to dots in uploaded release asset names.
+    checksums.push(`${hash.digest("hex")}  ${name.replaceAll(" ", ".")}`);
   }
   await writeFile(join(directory, "SHA256SUMS"), `${checksums.join("\n")}\n`);
   return installers;

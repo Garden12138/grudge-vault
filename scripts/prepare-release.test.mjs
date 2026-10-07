@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -18,14 +18,18 @@ async function fixture(t) {
   return root;
 }
 
-test("requires all six platform installers and hashes their exact bytes, including filenames with spaces", async t => {
+test("hashes all six installers using their published GitHub download names", async t => {
   const root = await fixture(t);
   assert.deepEqual(await prepareRelease("v0.2.1", root, "0.2.1"), [...files].sort());
   const checksums = await readFile(join(root, "SHA256SUMS"), "utf8");
   assert.equal(checksums.trim().split("\n").length, 6);
   for (const name of files) {
-    const expected = createHash("sha256").update(`synthetic installer: ${name}`).digest("hex");
-    assert.ok(checksums.includes(`${expected}  ${name}\n`));
+    await rename(join(root, name), join(root, name.replaceAll(" ", ".")));
+  }
+  for (const line of checksums.trim().split("\n")) {
+    const [expected, name] = line.split("  ");
+    const downloadedBytes = await readFile(join(root, name));
+    assert.equal(createHash("sha256").update(downloadedBytes).digest("hex"), expected);
   }
 });
 
