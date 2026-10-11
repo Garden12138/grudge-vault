@@ -184,6 +184,29 @@ describe("Phase 4 Agent Harness", () => {
     for (const database of databases.splice(0)) if (database.open) database.close();
   });
 
+  it("grounds supplement questions in the current record and only proposes explicit user changes", async () => {
+    const context = createContext(); databases.push(context.database);
+    configureSyntheticAuxiliary(context.application);
+    const prompts: string[] = [];
+    const adapter: AgentModelAdapterPort = { identity: "synthetic.supplement", version: 1, async run(input) {
+      expect(input.system).toContain("不要罗列时间地点人物");
+      prompts.push(input.user);
+      await input.executeTool("submit_record_supplement", { message: "当时约定的奖金是多少钱？",
+        patch: { occurredAt: { kind: "relative", text: "大约上周" } } }, "synthetic-supplement");
+      return { model: input.model };
+    } };
+    const harness = new AgentHarness(context.application, { modelAdapter: adapter });
+    const detail = syntheticAuxiliaryReport({ mimeType: "audio/wav", sha256: "a".repeat(64), byteSize: 4 });
+    detail.source.text = "当天公司仍没给我发奖金。";
+    const before = JSON.stringify(detail);
+    expect((await harness.supplementRecord(detail, [])).patch).toEqual({});
+    const answer = [{ role: "assistant" as const, content: "当时约定的奖金是多少钱？" }, { role: "user" as const, content: "五千元，大约上周。" }];
+    expect((await harness.supplementRecord(detail, answer)).patch.occurredAt).toEqual({ kind: "relative", text: "大约上周" });
+    expect(JSON.parse(prompts[0]!).originalText).toBe(detail.source.text);
+    expect(JSON.parse(prompts[1]!).conversation).toEqual(answer);
+    expect(JSON.stringify(detail)).toBe(before);
+  });
+
   it("uses the official Bailian multimodal embedding endpoint for local text and image data", async () => {
     const requests: Array<{ url: string; body: Record<string, unknown>; authorization: string | null }> = [];
     const fetcher = vi.fn(async (input: string | URL | globalThis.Request, init?: globalThis.RequestInit) => {
@@ -1196,7 +1219,7 @@ describe("Phase 4 Agent Harness", () => {
       overrides: []
     });
     expect(preview).not.toHaveBeenCalled();
-    expect(result.state).toBe("partial"); expect(result.promptVersion).toBe("report-v3");
+    expect(result.state).toBe("partial"); expect(result.promptVersion).toBe("report-v4");
     expect(result.content.chronology[0]?.anchor).toBeUndefined();
     expect(result.content.mediaSegments).toHaveLength(4);
     expect(result.content.mediaSegments).toContainEqual(expect.objectContaining({

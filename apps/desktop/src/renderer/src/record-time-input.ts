@@ -50,7 +50,7 @@ export function timeEditorValue(draft: TimeEditorDraft): TimeEditorResult {
   const result: TemporalValue = { kind: "range", ...(from ? { from } : {}), ...(to ? { to } : {}) };
   const known = (text: string) => date.safeParse(text).success || month.test(text) || explicitInstant.safeParse(text).success;
   if (from && to && known(from) && known(to) && projectRecordDate({ occurredAt: result,
-    recordedAt: "2000-01-01T00:00:00Z" }, "UTC")?.basis === "recorded") {
+    recordedAt: "2000-01-01T00:00:00Z" }, "UTC")?.basis === "unknown") {
     return { error: "范围终点不能早于起点；月份仍按完整月份比较。" };
   }
   return { value: result };

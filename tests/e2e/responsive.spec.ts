@@ -1,4 +1,4 @@
-import { openDisclosure } from "./ui-helpers";
+import { openDisclosure, supplementRecord } from "./ui-helpers";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -77,7 +77,7 @@ test("invalidates previous screening feedback only when the input changes and al
     await expect(editor.getByLabel("当前记录待确认")).toBeVisible();
     await expect(page.getByRole("dialog")).toHaveCount(1);
     await expect(editor.locator(".banner.neutral")).toContainText("需要你确认");
-    await text.fill("合成编辑后补充的完整说明。旧提示不应代表这份新输入。");
+    await editor.getByLabel("补充什么？").fill("合成编辑后补充的完整说明。旧提示不应代表这份新输入。");
     await expect(editor.locator(".banner")).toHaveCount(0);
     const beforeIgnore = await page.evaluate(() => window.grudgeVault.pending.list());
     expect(beforeIgnore.ok && beforeIgnore.data.length).toBe(1);
@@ -250,10 +250,11 @@ test("keeps keyboard focus in the top dialog, protects the editor and restores t
     await editor.getByRole("button", { name: "判断并收录", exact: true }).click();
     await expect(editor.getByLabel("当前记录待确认")).toBeVisible();
     await expect(page.getByRole("dialog")).toHaveCount(1);
-    await expect(editor.getByLabel("发生了什么？")).toHaveValue("他又这样说了，我有些不安");
+    await expect(editor.getByLabel("补充什么？")).toHaveValue("");
     await editor.getByRole("button", { name: "取消", exact: true }).focus();
     await page.keyboard.press("Tab");
     await expect(editor.getByRole("button", { name: "关闭", exact: true })).toBeFocused();
+    await editor.getByLabel("补充什么？").fill("这段新补充尚未保存，关闭时需要确认。");
     page.once("dialog", (dialog) => dialog.dismiss());
     await page.keyboard.press("Escape"); await expect(editor).toBeVisible();
     await expect.poll(() => editor.evaluate((dialog) => dialog.contains(document.activeElement))).toBe(true);
@@ -297,15 +298,11 @@ test("fits the complete record, original, editing, review, search and settings p
       await page.locator(".record-card").click();
       await expect(page.getByRole("heading", { name: "事件摘要" })).toBeVisible();
       await expectLayout(page, `report ${viewport.width}`);
-      await page.getByRole("button", { name: "编辑标题", exact: true }).click();
-      await page.getByPlaceholder("输入标题").fill(longValue);
-      await page.locator(".supplement").getByRole("button", { name: "保存", exact: true }).click();
+      await supplementRecord(page, `标题改为：${longValue}`);
       await expect(page.getByRole("heading", { name: longValue, exact: true })).toBeVisible();
       await expectLayout(page, `long title ${viewport.width}`);
-      await page.getByRole("button", { name: "补充地点", exact: true }).click();
-      await page.getByPlaceholder("输入明确地点").fill(longValue);
-      await expectLayout(page, `location editor ${viewport.width}`);
-      await page.locator(".supplement").getByRole("button", { name: "保存", exact: true }).click();
+      await supplementRecord(page, `地点改为：${longValue}`);
+      await openDisclosure(page, "时间、地点与人物");
       await expect(page.locator(".report-field").getByText(longValue, { exact: true })).toBeVisible();
       await expectLayout(page, `long user field ${viewport.width}`);
       await page.getByRole("button", { name: "原始内容", exact: true }).click();

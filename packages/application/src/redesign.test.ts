@@ -64,6 +64,158 @@ describe("redesigned intake boundary", () => {
 
   const screening = (value: Awaited<ReturnType<ScreeningPort["screen"]>>): ScreeningPort => ({ async screen() { return value; } });
 
+  it("preserves the original day, imported origin and local attachments across multiple supplements and a restart", async () => {
+    const { service, records, path, stored, database } = await context();
+    const original = "当天原日记的完整经过。".repeat(50) + "原文末尾";
+    const reviewPort = screening({ decision: "review", categories: ["danger"], reason: "请补充具体行为", anchors: [], coverage: "complete", policyVersion: "test" });
+    const draft = await service.prepareDraft({ text: original, paths: [path], origin: "zip", sourceRecordedAt: "2026-04-13T13:47:56Z",
+      sourceVersion: "import-v1", sourceLocator: { connectorId: "dayone-zip", journalId: "journal", entryId: "entry" } });
+    const first = await service.screenAndSave(draft.sessionId, randomUUID(), reviewPort);
+    if (first.kind !== "needs_review") throw new Error("expected review");
+    const sha = records.getPendingInput(first.pendingId)!.media[0]!.asset.sha256;
+    await rm(path); service.clearTransientSessions();
+    const addition = await service.prepareDraft({ text: "做梦梦游伤害到自己了" });
+    const second = await service.rescreenPendingFromManual(first.pendingId, addition.sessionId, reviewPort);
+    if (second.kind !== "needs_review") throw new Error("expected review");
+    expect(service.getPending(second.pendingId).text).toContain(original);
+    service.clearTransientSessions();
+    const next = await service.prepareDraft({ text: "发生在2026年4月12日夜里" });
+    const seen: string[] = [];
+    const saved = await service.rescreenPendingFromManual(second.pendingId, next.sessionId, { async screen(input) {
+      seen.push(input.text); return { decision: "include", categories: ["danger"], reason: "本人事件", anchors: [
+        { sourceVersion: input.sourceVersion, textRange: [0, 3] },
+        { sourceVersion: input.sourceVersion, textRange: [Array.from(original).length + 1, Array.from(input.text).length] }
+      ], coverage: "complete", policyVersion: "test" };
+    } });
+    if (saved.kind !== "saved") throw new Error("expected saved");
+    const detail = service.getRecord(saved.recordId);
+    expect(detail.source.text).toBe(original);
+    const anchors = database.prepare("SELECT anchors_json FROM redesign_screening_results WHERE record_id = ?").pluck().get(saved.recordId) as string;
+    expect(JSON.parse(anchors)).toEqual([expect.objectContaining({ textRange: [0, 3] })]);
+    expect(detail.source).toMatchObject({ origin: "zip", recordedAt: "2026-04-13T13:47:56Z", entryId: "entry" });
+    expect(detail.attachments[0]!.sha256).toBe(sha); expect(stored.has(sha)).toBe(true);
+    expect(detail.overrides.find(item => item.fieldKey === "clarifications")?.value).toEqual([
+      expect.objectContaining({ response: "做梦梦游伤害到自己了" }), expect.objectContaining({ response: "发生在2026年4月12日夜里" })]);
+    expect(seen[0]).toContain(original); expect(seen[0]).toContain("做梦梦游伤害到自己了");
+    expect(service.listPending()).toHaveLength(0);
+    expect(database.prepare("SELECT count(*) FROM redesign_pending_assets").pluck().get()).toBe(0);
+    const clarifications = detail.overrides.find(item => item.fieldKey === "clarifications")!.value as Array<{ kind: "unknown"; topic: string; response: string }>;
+    const updated = await service.patchFields(saved.recordId, detail.record.revision, { clarifications: [...clarifications, { kind: "unknown", topic: "后来补充", response: "伤处已经处理。" }] });
+    expect(updated.source.text).toBe(original);
+  });
+
+  it("removes ignored local pending originals without deleting another review's shared attachment", async () => {
+    const { service, path, stored, assets } = await context(); const ids: string[] = [];
+    for (let n = 0; n < 2; n++) {
+      const draft = await service.prepareDraft({ text: `待确认 ${n}`, paths: [path] });
+      const result = await service.screenAndSave(draft.sessionId, randomUUID(), screening({ decision: "review", categories: [], reason: "待补充", anchors: [], coverage: "complete", policyVersion: "test" }));
+      if (result.kind !== "needs_review") throw new Error("expected review"); ids.push(result.pendingId);
+    }
+    await service.resolvePending(ids[0]!, "ignore", randomUUID()); expect(stored.size).toBe(1); expect(assets.list()).toHaveLength(1);
+    await service.resolvePending(ids[1]!, "ignore", randomUUID()); expect(stored.size).toBe(0); expect(assets.list()).toHaveLength(0);
+  });
+
+  it("repairs an already included old supplement while retaining its words, revisions and record ID", async () => {
+    const { service, database } = await context();
+    const draft = await service.prepareDraft({ text: "做梦梦游伤害到自己了" });
+    const saved = await service.screenAndSave(draft.sessionId, randomUUID(), screening({ decision: "include", categories: ["danger"], reason: "本人事件", anchors: [], coverage: "complete", policyVersion: "test" }));
+    if (saved.kind !== "saved") throw new Error("expected saved");
+    const text = "原来的完整日记经过。".repeat(30);
+    const importer: DayOneScreeningImporterPort = { async scanArchive(_path, _root, consumer, _signal, _limits, filter) {
+      const entry: NormalizedDayOneEntry = { externalId: "uuid:old-entry", fingerprint: "a".repeat(64), creationDate: "2026-04-13T13:47:56Z", journalDate: "2026-04-13", text, tags: [], media: [], contentHash: "b".repeat(64), raw: {} };
+      if (!filter || filter(entry)) await consumer.onEntry(entry, [], false);
+      return { totalEntries: 1, mediaEntries: 0, missingMedia: 0 };
+    } };
+    const restored = await service.restoreRecordOriginalFromZip(saved.recordId, 1, "uuid:old-entry", "/synthetic.zip", importer);
+    expect(restored.record).toMatchObject({ id: saved.recordId, revision: 2, origin: "zip", recordedAt: "2026-04-13T13:47:56Z" });
+    expect(restored.source.text).toBe(text);
+    expect(restored.overrides[0]!.value).toEqual([expect.objectContaining({ response: "做梦梦游伤害到自己了" })]);
+    expect(database.prepare("SELECT count(*) FROM redesign_sources WHERE record_id = ?").pluck().get(saved.recordId)).toBe(2);
+    expect(await service.restoreRecordOriginalFromZip(saved.recordId, 1, "uuid:old-entry", "/synthetic.zip", importer)).toEqual(restored);
+  });
+
+  async function oldPendingFixture() {
+    const contextValue = await context();
+    const stamp = "2026-10-01T00:00:00Z";
+    const entries: NormalizedDayOneEntry[] = ["first", "second", "changed"].map((name, index) => ({
+      externalId: `uuid:restore-${name}`, fingerprint: "f".repeat(64), creationDate: stamp, journalDate: "2026-10-01",
+      text: `合成旧待确认全文 ${name}，需要查看的末尾经过。`, tags: [], media: [], contentHash: String(index).repeat(64), raw: {}
+    }));
+    const pending = entries.map((entry, index) => contextValue.records.createPending({ id: randomUUID(), origin: "zip",
+      originLocator: JSON.stringify({ connectorId: "dayone-zip", journalId: "default", entryId: entry.externalId }),
+      sourceVersion: index === 2 ? "old-version" : entry.contentHash, excerpt: "合成旧摘录", reason: "需要确认", categories: ["rights"],
+      coverage: "complete", sessionAvailable: true, createdAt: stamp, updatedAt: stamp
+    }, randomUUID()));
+    const importer: DayOneScreeningImporterPort = { async scanArchive(_path, _root, consumer, _signal, _limits, filter) {
+      for (const entry of entries) if (!filter || filter(entry)) await consumer.onEntry(entry, [], false);
+      return { totalEntries: entries.length, mediaEntries: 0, missingMedia: 0 };
+    } };
+    return { ...contextValue, entries, pending, importer };
+  }
+
+  it("restores all matching old pending texts from one ZIP while keeping changed versions and formal data untouched", async () => {
+    const { service, records, database, entries, pending, importer } = await oldPendingFixture();
+    expect(await service.restorePendingDetailsFromZip(pending[0]!.id, join(tmpdir(), "synthetic-original.zip"), importer))
+      .toMatchObject({ restored: 2, detail: { text: entries[0]!.text, sessionAvailable: true } });
+    expect(service.getPending(pending[1]!.id).text).toBe(entries[1]!.text);
+    expect(service.getPending(pending[2]!.id).text).toBeUndefined();
+    expect(service.listPending().every(item => item.text === undefined)).toBe(true);
+    for (const table of ["redesign_records", "redesign_sources", "jobs", "assets"]) {
+      expect(database.prepare(`SELECT count(*) FROM ${table}`).pluck().get()).toBe(0);
+    }
+    expect(database.serialize().includes(Buffer.from(entries[0]!.text))).toBe(false);
+    const reopened = new SqliteRecordRepository(database, () => Buffer.alloc(32));
+    expect(reopened.getPending(pending[1]!.id)?.text).toBe(entries[1]!.text);
+    expect(records.listPending()).toHaveLength(3);
+  });
+
+  it.each(["missing", "changed", "duplicate"] as const)("rejects a %s requested ZIP source without partially backfilling other pending items", async failure => {
+    const { service, database, entries, pending, importer } = await oldPendingFixture();
+    if (failure === "missing") entries.shift();
+    if (failure === "changed") entries[0]!.contentHash = "changed-version";
+    if (failure === "duplicate") entries.push({ ...entries[0]! });
+    const before = database.serialize();
+    await expect(service.restorePendingDetailsFromZip(pending[0]!.id, join(tmpdir(), "synthetic-wrong.zip"), importer))
+      .rejects.toMatchObject({ code: failure === "duplicate" ? "IMPORT_INVALID_ARCHIVE" : "SOURCE_UNAVAILABLE" });
+    expect(database.serialize().equals(before)).toBe(true);
+  });
+
+  it("does not write recovered text after a workspace session changes during the ZIP scan", async () => {
+    const { service, database, pending, importer } = await oldPendingFixture();
+    const before = database.serialize();
+    const interrupted: DayOneScreeningImporterPort = { async scanArchive(...args) {
+      const result = await importer.scanArchive(...args); service.clearTransientSessions(); return result;
+    } };
+    await expect(service.restorePendingDetailsFromZip(pending[0]!.id, join(tmpdir(), "synthetic-interrupted.zip"), interrupted))
+      .rejects.toMatchObject({ code: "SOURCE_UNAVAILABLE" });
+    expect(database.serialize().equals(before)).toBe(true);
+    await expect(service.resolvePending(pending[0]!.id, "ignore", randomUUID())).resolves.toBeNull();
+  });
+
+  it.each([true, false])("recovers legacy detail only for the original source version (matching=%s) and always closes it", async matching => {
+    const { service, records, database } = await context();
+    const stamp = "2026-10-01T00:00:00Z", id = randomUUID();
+    records.createPending({ id, origin: "migration", sourceVersion: "legacy-v1", excerpt: "旧摘录", reason: "待确认",
+      originLocator: JSON.stringify({ connectorId: "legacy:synthetic-source", journalId: "events", entryId: "old-event" }),
+      categories: [], coverage: "partial", sessionAvailable: true, createdAt: stamp, updatedAt: stamp }, randomUUID());
+    const close = vi.fn(async () => {});
+    const source = { sourceWorkspaceId: "synthetic-source", close,
+      async scan(consumer: (entry: LegacyMigrationEntry) => Promise<void>) {
+        await consumer({ legacyEntityId: "old-event", title: "合成旧事件", occurredAt: { kind: "unknown" },
+          text: "旧工作区中的完整原文", sourceVersion: matching ? "legacy-v1" : "legacy-v2", recordedAt: stamp,
+          paths: [], fileNames: [], incompleteMedia: true, revisions: [] }); return 1;
+      } };
+    const before = database.serialize();
+    if (matching) {
+      expect(await service.restorePendingDetailsFromLegacy(id, source)).toMatchObject({ restored: 1, detail: { text: "旧工作区中的完整原文" } });
+      expect(service.listTimeline({}).records).toEqual([]);
+    } else {
+      await expect(service.restorePendingDetailsFromLegacy(id, source)).rejects.toMatchObject({ code: "SOURCE_UNAVAILABLE" });
+      expect(database.serialize().equals(before)).toBe(true);
+    }
+    expect(close).toHaveBeenCalledOnce();
+  });
+
   async function searchWorkspacePair(embedding?: RecordEmbeddingPort, description?: RecordMediaQueryDescriptionPort) {
     const first = await context(embedding, description), second = await context(embedding, description);
     const sessionFor = (value: typeof first): RedesignSession => ({ key: Buffer.alloc(32), records: value.records,
@@ -461,23 +613,22 @@ describe("redesigned intake boundary", () => {
     expect(stored.size).toBe(0);
   });
 
-  it("keeps a review pending and removes the newly stored object if its media changes before confirmation", async () => {
-    const { database, path, service, stored } = await context();
+  it("confirms from retained local media after the selected original changes or is removed", async () => {
+    const { path, service, stored } = await context();
+    const originalBytes = await readFile(path);
     const draft = await service.prepareDraft({ text: "图片需人工确认", paths: [path], sourceVersion: "review-media-v1" });
-    const review = await service.screenAndSave(draft.sessionId, randomUUID(), screening({
-      decision: "review", categories: ["rights"], reason: "需要人工确认",
-      anchors: [], coverage: "partial", policyVersion: "test-v1"
-    }));
+    const review = await service.screenAndSave(draft.sessionId, randomUUID(), screening({ decision: "review", categories: ["rights"],
+      reason: "需要人工确认", anchors: [], coverage: "partial", policyVersion: "test-v1" }));
     if (review.kind !== "needs_review") throw new Error("expected pending review");
-    const changed = Buffer.from(await readFile(path));
-    changed[changed.length - 1] = (changed.at(-1) ?? 0) ^ 1;
-    await writeFile(path, changed);
-    await expect(service.resolvePending(review.pendingId, "keep", randomUUID()))
-      .rejects.toMatchObject({ code: "SOURCE_UNAVAILABLE" });
-    expect(service.listPending()).toHaveLength(1);
-    expect(database.prepare("SELECT count(*) FROM redesign_records").pluck().get()).toBe(0);
-    expect(database.prepare("SELECT count(*) FROM assets").pluck().get()).toBe(0);
-    expect(stored.size).toBe(0);
+    await rm(path); service.clearTransientSessions();
+    const result = await service.resolvePending(review.pendingId, "keep", randomUUID());
+    expect(result?.kind).toBe("saved");
+    if (result?.kind !== "saved") throw new Error("expected saved");
+    const detail = service.getRecord(result.recordId);
+    expect(detail.source.text).toBe("图片需人工确认");
+    expect(detail.attachments).toHaveLength(1);
+    expect(stored.get(detail.attachments[0]!.sha256)).toEqual(originalBytes);
+    expect(service.listPending()).toHaveLength(0);
   });
 
   it("cleans a just-written encrypted attachment when its draft is invalidated before commit", async () => {
@@ -521,9 +672,10 @@ describe("redesigned intake boundary", () => {
     }
   });
 
-  it("isolates review items and removes their minimal excerpt when ignored", async () => {
-    const { database, service } = await context();
-    const draft = await service.prepareDraft({ text: "他又这样说了，我有些不安" });
+  it("keeps full review details encrypted after the session ends and removes them when ignored", async () => {
+    const { database, service, records } = await context();
+    const text = "他又这样说了，我有些不安。" + "这天的上下文。".repeat(100) + "末尾具体说的是扣除我的奖金。";
+    const draft = await service.prepareDraft({ text });
     const result = await service.screenAndSave(draft.sessionId, randomUUID(), screening({
       decision: "review", categories: ["danger"], reason: "无法确定是否与用户有关", anchors: [], coverage: "complete", policyVersion: "test-v1"
     }));
@@ -532,7 +684,15 @@ describe("redesigned intake boundary", () => {
     expect(database.prepare("SELECT count(*) AS count FROM redesign_record_fts").get()).toEqual({ count: 0 });
     if (result.kind !== "needs_review") throw new Error("unexpected");
     expect(service.listPending()[0]?.sessionAvailable).toBe(true);
+    expect(service.listPending()[0]?.text).toBeUndefined();
+    expect(service.getPending(result.pendingId).text).toBe(text);
+    expect(JSON.stringify(database.prepare("SELECT * FROM redesign_pending_reviews").get())).not.toContain("末尾具体说的是");
+    service.abandonDraft(draft.sessionId);
+    expect(service.getPending(result.pendingId)).toMatchObject({ text, sessionAvailable: true });
+    records.reencryptPending("single");
+    expect(records.getPending(result.pendingId)?.text).toBe(text);
     await service.resolvePending(result.pendingId, "ignore", randomUUID());
+    expect(() => service.getPending(result.pendingId)).toThrow();
     expect(database.prepare("SELECT count(*) AS count FROM redesign_pending_reviews").get()).toEqual({ count: 0 });
     expect(database.prepare("SELECT count(*) AS count FROM redesign_operations").get()).toEqual({ count: 0 });
   });
@@ -553,7 +713,7 @@ describe("redesigned intake boundary", () => {
     const record = service.listTimeline({ limit: 10 }).records[0]!;
     expect(service.getRecord(record.id).source.text).toBe("第一条待核对的工资争议");
     service.abandonDraft(second.sessionId);
-    expect(service.listPending()[0]?.sessionAvailable).toBe(false);
+    expect(service.listPending()[0]?.sessionAvailable).toBe(true);
   });
 
   it("does not let an unrelated saved operation satisfy a pending confirmation", async () => {
@@ -699,7 +859,8 @@ describe("redesigned intake boundary", () => {
     expect((await first).kind).toBe("saved");
     const records = service.listTimeline({ limit: 10 }).records;
     expect(records).toHaveLength(1);
-    expect(service.getRecord(records[0]!.id).source.text).toBe("完整事实甲：有人威胁我");
+    expect(service.getRecord(records[0]!.id).source.text).toBe("他又这样说了，我有些不安");
+    expect(service.getRecord(records[0]!.id).overrides).toEqual([expect.objectContaining({ fieldKey: "clarifications", value: [expect.objectContaining({ response: "完整事实甲：有人威胁我" })] })]);
     expect(service.listPending()).toHaveLength(0);
   });
 
@@ -712,7 +873,7 @@ describe("redesigned intake boundary", () => {
     }));
     if (review.kind !== "needs_review") throw new Error("expected review");
     service.abandonDraft(original.sessionId);
-    expect(service.listPending()[0]?.sessionAvailable).toBe(false);
+    expect(service.listPending()[0]?.sessionAvailable).toBe(true);
     const fullInput = "公司迟迟未支付约定奖金，我保留了付款邮件";
     const replacement = await service.prepareDraft({ text: fullInput, paths: [path] });
     const failed = await service.rescreenPendingFromManual(review.pendingId, replacement.sessionId, {
@@ -728,7 +889,8 @@ describe("redesigned intake boundary", () => {
     expect(saved.kind).toBe("saved");
     expect(service.listPending()).toHaveLength(0);
     const record = service.listTimeline({ limit: 10 }).records[0]!;
-    expect(service.getRecord(record.id).source.text).toBe(fullInput);
+    expect(service.getRecord(record.id).source.text).toBe("他又这样说了，我有些不安");
+    expect(service.getRecord(record.id).overrides[0]?.value).toEqual([expect.objectContaining({ response: fullInput })]);
     expect(record.attachmentCount).toBe(1);
     expect(await service.rescreenPendingFromManual(review.pendingId, replacement.sessionId, screening({
       decision: "include", categories: ["danger"], reason: "不应重新筛选",
@@ -799,12 +961,13 @@ describe("redesigned intake boundary", () => {
     const screen = vi.fn(async () => ({ decision: "include" as const, categories: ["danger" as const],
       reason: "补充明确本人遭遇的威胁", anchors: [], coverage: "complete" as const, policyVersion: "test-v2" }));
     const saved = await service.rescreenPendingFromManual(review.pendingId, replacement.sessionId, { screen });
-    expect(screen).toHaveBeenCalledWith(expect.objectContaining({ text, origin: "manual" }), undefined);
+    expect(screen).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringContaining(text), origin }), undefined);
     expect(saved.kind).toBe("saved");
     expect(service.listPending()).toHaveLength(0);
     const record = service.listTimeline({ limit: 10 }).records[0]!;
-    expect(record).toMatchObject({ origin: "manual", attachmentCount: 1 });
-    expect(service.getRecord(record.id).source.text).toBe(text);
+    expect(record).toMatchObject({ origin, attachmentCount: 1 });
+    expect(service.getRecord(record.id).source.text).toBe("原日记里他又这样说了，我有些不安");
+    expect(service.getRecord(record.id).overrides[0]?.value).toEqual([expect.objectContaining({ response: text })]);
     expect(await service.rescreenPendingFromManual(review.pendingId, replacement.sessionId, { screen })).toEqual(saved);
     expect(screen).toHaveBeenCalledOnce();
   });
@@ -846,7 +1009,7 @@ describe("redesigned intake boundary", () => {
     }));
     expect(migrated.review).toBe(1);
     const pending = service.listPending()[0]!;
-    expect(pending).toMatchObject({ origin: "migration", sessionAvailable: false });
+    expect(pending).toMatchObject({ origin: "migration", sessionAvailable: true });
     const replacement = await service.prepareDraft({ text: "重新提供的完整事实：有人威胁了我" });
     const saved = await service.rescreenPendingFromManual(pending.id, replacement.sessionId, screening({
       decision: "include", categories: ["danger"], reason: "存在明确威胁",
@@ -855,8 +1018,9 @@ describe("redesigned intake boundary", () => {
     expect(saved.kind).toBe("saved");
     expect(service.listPending()).toHaveLength(0);
     const record = service.listTimeline({ limit: 10 }).records[0]!;
-    expect(record.origin).toBe("manual");
-    expect(service.getRecord(record.id).source.text).toBe("重新提供的完整事实：有人威胁了我");
+    expect(record.origin).toBe("migration");
+    expect(service.getRecord(record.id).source.text).toBe("旧工作区里一条说不清的记录");
+    expect(service.getRecord(record.id).overrides[0]?.value).toEqual([expect.objectContaining({ response: "重新提供的完整事实：有人威胁了我" })]);
   });
 
   it("reopens the same legacy source version and retains its origin, revisions and attachment", async () => {
@@ -879,7 +1043,7 @@ describe("redesigned intake boundary", () => {
       anchors: [], coverage: "complete", policyVersion: "test-v1"
     }));
     const pending = service.listPending()[0]!;
-    expect(pending).toMatchObject({ origin: "migration", sessionAvailable: false });
+    expect(pending).toMatchObject({ origin: "migration", sessionAvailable: true });
     const close = vi.fn(async () => undefined);
     const result = await service.resolvePendingFromLegacyWorkspace(pending.id, sourceFor(close), {
       async screen() { throw new Error("Unchanged source must not be rescreened."); }
@@ -1243,7 +1407,7 @@ describe("redesigned intake boundary", () => {
     }));
     expect(initial.review).toBe(1);
     const pending = service.listPending()[0]!;
-    expect(pending.sessionAvailable).toBe(false);
+    expect(pending.sessionAvailable).toBe(true);
     await expect(service.resolvePendingFromDayOneZip(pending.id, archive, importer([]), screening({
       decision: "include", categories: ["danger"], reason: "不应调用", anchors: [], coverage: "complete", policyVersion: "test-v1"
     }), randomUUID())).rejects.toMatchObject({ code: "SOURCE_UNAVAILABLE" });
@@ -1789,12 +1953,12 @@ describe("redesigned intake boundary", () => {
     const { service } = await context(embedding);
     const instant = await dateRecord(service, { kind: "instant", value: "2026-09-20T00:30:00Z" });
     const calendar = await dateRecord(service, { kind: "date", value: "2026-09-20" });
-    const fallback = await dateRecord(service, { kind: "unknown" }, { sourceRecordedAt: "2026-09-20T00:30:00Z" });
+    await dateRecord(service, { kind: "unknown" }, { sourceRecordedAt: "2026-09-20T00:30:00Z" });
     service.setSearchIndexEnabled(true); await service.rebuildSearchIndex();
     for (const [timeZone, day, expected] of [
-      ["America/Los_Angeles", "2026-09-19", [instant.id, fallback.id]],
+      ["America/Los_Angeles", "2026-09-19", [instant.id]],
       ["America/Los_Angeles", "2026-09-20", [calendar.id]],
-      ["Asia/Shanghai", "2026-09-20", [instant.id, calendar.id, fallback.id]]
+      ["Asia/Shanghai", "2026-09-20", [instant.id, calendar.id]]
     ] as const) {
       const filter = { from: day, to: day, timeZone, limit: 100 };
       expect(service.listTimeline(filter).records.map(({ id }) => id).sort()).toEqual([...expected].sort());
@@ -1915,7 +2079,7 @@ describe("redesigned intake boundary", () => {
     expect(before.source.text).toBe(text);
     expect(service.listTimeline({ from: "2020-01-02", to: "2020-01-02", timeZone: "UTC" }).records).toEqual([]);
     expect(service.search({ text: "合同", from: "2026-09-29", to: "2026-09-29", timeZone: "UTC" }).hits)
-      .toMatchObject([{ record: { id: recordId, occurredAt: { kind: "unknown" } } }]);
+      .toEqual([]);
     const resolved = await service.runAnalysis(recordId, 1, timeAnalysis("2026-09-15"));
     expect(resolved.record.occurredAt).toEqual({ kind: "date", value: "2026-09-15" });
     expect(resolved.source).toEqual(before.source);
@@ -1975,7 +2139,7 @@ describe("redesigned intake boundary", () => {
     await service.runAnalysis(row.id, 3, timeAnalysis("2026-09-12"));
     expect(service.getRecord(row.id).record).toMatchObject({ occurredAt: { kind: "unknown" }, occurredAtSource: "user" });
     expect(service.listTimeline({ from: "2026-09-12", to: "2026-09-12", timeZone: "UTC" }).records).toHaveLength(0);
-    expect(service.listTimeline({ from: "2026-09-29", to: "2026-09-29", timeZone: "UTC" }).records).toHaveLength(1);
+    expect(service.listTimeline({ from: "2026-09-29", to: "2026-09-29", timeZone: "UTC" }).records).toHaveLength(0);
   });
 
   it("does not copy report-derived time into the source field during other edits or use stale reports", async () => {
@@ -1986,9 +2150,9 @@ describe("redesigned intake boundary", () => {
     if (saved.kind !== "saved") throw new Error("Expected synthetic record");
     await service.runAnalysis(saved.recordId, 1, timeAnalysis("2026-09-12"));
     const edited = await service.patchFields(saved.recordId, 1, { title: "用户改了标题，但没有补充发生日期" });
-    expect(edited.record.occurredAt).toEqual({ kind: "unknown" }); expect(edited.report?.recordRevision).toBe(1);
+    expect(edited.record.occurredAt).toEqual({ kind: "date", value: "2026-09-12" }); expect(edited.report?.recordRevision).toBe(1);
     expect(database.prepare("SELECT occurred_at_json FROM redesign_records WHERE id = ?").pluck().get(saved.recordId)).toBe('{"kind":"unknown"}');
-    expect(service.listTimeline({ from: "2026-09-12", to: "2026-09-12", timeZone: "UTC" }).records).toHaveLength(0);
+    expect(service.listTimeline({ from: "2026-09-12", to: "2026-09-12", timeZone: "UTC" }).records).toHaveLength(1);
     await service.runAnalysis(saved.recordId, 2, timeAnalysis("2026-09-20"));
     expect(service.getRecord(saved.recordId).record.occurredAt).toEqual({ kind: "date", value: "2026-09-20" });
     const snapshot = service.getRecord(saved.recordId);
@@ -2032,13 +2196,13 @@ describe("redesigned intake boundary", () => {
     expect(service.search({ text: "2042-05-06" }).hits).toMatchObject([{ record: { id: saved.recordId }, anchor: { surface: "report" } }]);
     expect(service.getRecord(saved.recordId)).toEqual(before);
     expect(database.prepare("SELECT count(*) AS count FROM jobs").get()).toEqual(jobsBefore);
-    expect(database.prepare("SELECT value_json FROM workspace_settings WHERE key = 'redesign.keyword-projection-v2'").get())
+    expect(database.prepare("SELECT value_json FROM workspace_settings WHERE key = 'redesign.keyword-projection-v3'").get())
       .toEqual({ value_json: "2" });
     const changes = database.prepare("SELECT total_changes() AS count").get();
     records.ensureKeywordProjection();
     expect(database.prepare("SELECT total_changes() AS count").get()).toEqual(changes);
     await service.patchFields(saved.recordId, 1, { location: "合成新补充地点" });
-    database.prepare("DELETE FROM workspace_settings WHERE key = 'redesign.keyword-projection-v2'").run();
+    database.prepare("DELETE FROM workspace_settings WHERE key = 'redesign.keyword-projection-v3'").run();
     records.ensureKeywordProjection();
     expect(service.search({ text: "2042-05-06" }).hits).toHaveLength(0);
   });
@@ -2072,12 +2236,12 @@ describe("redesigned intake boundary", () => {
     const before = service.getRecord(saved.recordId);
     database.prepare("UPDATE redesign_record_fts SET report_text = 'OLDKEYWORDPROJECTION' WHERE record_id = ?").run(saved.recordId);
     database.exec(`CREATE TRIGGER fail_keyword_marker AFTER INSERT ON workspace_settings
-      WHEN NEW.key = 'redesign.keyword-projection-v2' BEGIN SELECT RAISE(FAIL, 'synthetic-private-failure'); END;`);
+      WHEN NEW.key = 'redesign.keyword-projection-v3' BEGIN SELECT RAISE(FAIL, 'synthetic-private-failure'); END;`);
     expect(() => records.ensureKeywordProjection()).toThrowError(expect.objectContaining({ code: "WORKSPACE_INVALID",
       message: "无法更新本地关键词索引，请重试打开工作区。" }));
     expect(database.prepare("SELECT report_text FROM redesign_record_fts WHERE record_id = ?").get(saved.recordId))
       .toEqual({ report_text: "OLDKEYWORDPROJECTION" });
-    expect(database.prepare("SELECT count(*) AS count FROM workspace_settings WHERE key = 'redesign.keyword-projection-v2'").get())
+    expect(database.prepare("SELECT count(*) AS count FROM workspace_settings WHERE key = 'redesign.keyword-projection-v3'").get())
       .toEqual({ count: 0 });
     expect(service.getRecord(saved.recordId)).toEqual(before);
     database.exec("DROP TRIGGER fail_keyword_marker"); records.ensureKeywordProjection();

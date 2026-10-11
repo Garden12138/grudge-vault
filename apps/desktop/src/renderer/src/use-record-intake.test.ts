@@ -18,7 +18,7 @@ async function fixture(initialPendingId?: string) {
   const list = vi.fn(async () => ok([{ id: "returned-id", reason: "需要本人确认", sessionAvailable: true }]));
   const abandon = vi.fn(async () => ok(null)), abandonPreparation = vi.fn(async () => ok(null));
   window.grudgeVault = { intake: { prepare, screenAndSave, abandon, abandonPreparation, onMediaProgress: () => () => {} },
-    pending: { list, resolve, rescreenManual } } as unknown as GrudgeVaultApi;
+    pending: { list, get: async () => { const result = await list(); return ok(result.data[0]); }, resolve, rescreenManual } } as unknown as GrudgeVaultApi;
   let current!: ReturnType<typeof useRecordIntake>;
   const onSaved = vi.fn(), onPendingChanged = vi.fn(), onRescreenSettled = vi.fn();
   function Probe() { current = useRecordIntake({ ...(initialPendingId ? { initialPendingId } : {}), onSaved, onPendingChanged, onRescreenSettled }); return null; }
@@ -31,6 +31,7 @@ it("uses the returned pending ID and complete input when supplementing instead o
   await act(async () => f.current().submit(complete, []));
   expect(f.current().state).toBe("review"); expect(f.current().pendingItem?.id).toBe("returned-id");
   await act(async () => { f.current().resetFeedback(); });
+  expect(f.current().pendingItem?.id).toBe("returned-id");
   await act(async () => f.current().submit(`${complete}新事实`, []));
   expect(f.rescreenManual).toHaveBeenCalledWith("returned-id", "session");
   expect(f.prepare).toHaveBeenLastCalledWith(expect.objectContaining({ text: `${complete}新事实` }));
@@ -38,7 +39,7 @@ it("uses the returned pending ID and complete input when supplementing instead o
 });
 it("serializes repeated submit and confirmation clicks", async () => {
   const f = await fixture(), held = deferred<Awaited<ReturnType<typeof f.prepare>>>(); f.prepare.mockReturnValueOnce(held.promise);
-  let submitted!: Promise<void>; await act(async () => { submitted = f.current().submit("全文", []); void f.current().submit("全文", []); });
+  let submitted!: Promise<unknown>; await act(async () => { submitted = f.current().submit("全文", []); void f.current().submit("全文", []); });
   expect(f.prepare).toHaveBeenCalledOnce(); await act(async () => { held.resolve(ok({ sessionId: "session", textLength: 2 })); await submitted; });
   const confirmation = deferred<Awaited<ReturnType<typeof f.resolve>>>(); f.resolve.mockReturnValueOnce(confirmation.promise);
   let confirmed!: Promise<boolean>; await act(async () => { confirmed = f.current().resolve("keep"); void f.current().resolve("keep"); });
@@ -47,7 +48,7 @@ it("serializes repeated submit and confirmation clicks", async () => {
 });
 it.each(["release", "unmount"] as const)("abandons late prepared input after %s and never starts screening", async action => {
   const f = await fixture(), held = deferred<Awaited<ReturnType<typeof f.prepare>>>(); f.prepare.mockReturnValueOnce(held.promise);
-  let pending!: Promise<void>; await act(async () => { pending = f.current().submit("敏感全文", []); });
+  let pending!: Promise<unknown>; await act(async () => { pending = f.current().submit("敏感全文", []); });
   await act(async () => { if (action === "release") await f.current().release(); else { root?.unmount(); root = undefined; } });
   expect(f.abandonPreparation).toHaveBeenCalledOnce();
   await act(async () => { held.resolve(ok({ sessionId: "late-session", textLength: 4 })); await pending; });
@@ -55,7 +56,7 @@ it.each(["release", "unmount"] as const)("abandons late prepared input after %s 
 });
 it("ignores a late saved result after leaving the editor", async () => {
   const f = await fixture(), held = deferred<Awaited<ReturnType<typeof f.screenAndSave>>>(); f.screenAndSave.mockReturnValueOnce(held.promise);
-  let pending!: Promise<void>; await act(async () => { pending = f.current().submit("敏感全文", []); });
+  let pending!: Promise<unknown>; await act(async () => { pending = f.current().submit("敏感全文", []); });
   await act(async () => { root?.unmount(); root = undefined; });
   await act(async () => { held.resolve(ok({ kind: "saved", recordId: "late", reportState: "queued" })); await pending; });
   expect(f.onSaved).not.toHaveBeenCalled(); expect(f.list).not.toHaveBeenCalled(); expect(f.abandon).toHaveBeenCalledWith("session");

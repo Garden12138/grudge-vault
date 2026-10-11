@@ -942,7 +942,7 @@ describe("encrypted workspace snapshots", () => {
       });
       expect(summary).toMatchObject({ total: 1, review: 1, included: 0 });
       const pending = targetApplication.listPendingReviews()[0]!;
-      expect(pending).toMatchObject({ origin: "migration", sessionAvailable: false });
+      expect(pending).toMatchObject({ origin: "migration", sessionAvailable: true });
       const reopened = await targetManager.createLegacyMigrationSource(legacyPath);
       const saved = await targetApplication.resolvePendingReviewFromLegacyWorkspace(pending.id, reopened, {
         async screen() { throw new Error("The unchanged old source should not call the model again."); }

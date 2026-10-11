@@ -1396,6 +1396,17 @@ export const DEFAULT_MIGRATIONS: readonly Migration[] = [
         SELECT id FROM jobs WHERE type IN ('record.analyze', 'record.search-index-rebuild')
       );
     `
+  },
+  {
+    version: 25,
+    name: "redesign-retained-pending-assets",
+    sql: `
+      CREATE TABLE redesign_pending_assets (
+        pending_id TEXT NOT NULL REFERENCES redesign_pending_reviews(id) ON DELETE CASCADE,
+        asset_id TEXT NOT NULL REFERENCES assets(id),
+        PRIMARY KEY(pending_id, asset_id)
+      ) STRICT;
+    `
   }
 ];
 

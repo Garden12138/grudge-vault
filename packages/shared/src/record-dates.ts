@@ -8,7 +8,7 @@ export interface RecordDateProjection {
   lowerDay?: number;
   upperDay?: number;
   sortKey: string;
-  basis: "occurred" | "recorded";
+  basis: "occurred" | "unknown";
 }
 export interface RecordDateFilter {
   fromDay?: number;
@@ -101,11 +101,11 @@ export function projectRecordDate(record: RecordTime, timeZone: string): RecordD
       sortKey: from?.lowerKey ?? to!.upperKey, basis: "occurred"
     };
   }
-  const recorded = endpoint(record.recordedAt, timeZone);
-  return recorded ? { lowerDay: recorded.lower, upperDay: recorded.upper, sortKey: recorded.lowerKey, basis: "recorded" } : undefined;
+  return { sortKey: "000000000:000000000000000", basis: "unknown" };
 }
 
 export function recordDateMatches(projection: RecordDateProjection, filter: RecordDateFilter): boolean {
+  if (projection.basis === "unknown") return filter.fromDay === undefined && filter.toDay === undefined;
   return !(filter.fromDay !== undefined && projection.upperDay !== undefined && projection.upperDay < filter.fromDay ||
     filter.toDay !== undefined && projection.lowerDay !== undefined && projection.lowerDay > filter.toDay);
 }

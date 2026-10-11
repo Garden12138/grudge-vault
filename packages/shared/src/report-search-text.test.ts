@@ -18,10 +18,11 @@ describe("searchable report content projection", () => {
   it("includes all meaningful report fields and citation text, without internal identities", () => {
     const text = reportContentSearchText(report());
     for (const token of ["SUMMARYONLY", "TIMEONLY", "LOCATIONONLY", "PERSONONLY", "ROLEONLY", "CHRONOLOGYONLY", "MEDIAONLY",
-      "UNKNOWNQUESTIONONLY", "DISPUTEONLY", "SPECULATIONONLY", "SUGGESTIONONLY", "LEGALISSUEONLY", "COVERAGEONLY",
+      "UNKNOWNQUESTIONONLY", "DISPUTEONLY", "SPECULATIONONLY", "SUGGESTIONONLY", "LEGALISSUEONLY",
       "CITATIONTITLEONLY", "PUBLISHERONLY", "JURISDICTIONONLY", "EFFECTIVEONLY", "EXCERPTONLY", "https://www.gov.cn/synthetic",
       "2026-09-29T00:00:00.000Z"]) expect(text).toContain(token);
     expect(text).not.toContain("INTERNAL");
+    expect(text).not.toContain("COVERAGEONLY");
     expect(text).not.toMatch(/verificationStatus|sourceVersion|textRange|precision|claimId/);
   });
   it("excludes anchored descriptions only when separate semantic fragments retain their anchors", () => {

@@ -28,13 +28,13 @@ export function ReportTimeField({ field, userValue, userSupplied = false, userKi
 }
 
 export function ReportPeopleField({ people, onSupplement, disabled = false }: {
-  people: ReportPerson[]; onSupplement(): void; disabled?: boolean;
+  people: ReportPerson[]; onSupplement?(): void; disabled?: boolean;
 }) {
   const known = people.filter(({ name }) => name.trim());
   return <div className="report-field report-people-field"><span>人物</span>
     {known.length ? <ul className="report-person-list">{known.map(({ name, role, source }, index) =>
       <li key={index}><strong>{name}{role?.trim() ? `（${role}）` : ""}</strong><SourceBadge source={source} /></li>
     )}</ul> : <div><strong>待补充：有哪些相关人物？</strong></div>}
-    <button className="text-button" disabled={disabled} onClick={onSupplement}>补充人物信息</button>
+    {onSupplement && <button className="text-button" disabled={disabled} onClick={onSupplement}>补充人物信息</button>}
   </div>;
 }

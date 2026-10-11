@@ -19,18 +19,18 @@ describe("record time display without invented calendar precision", () => {
   it("does not represent an open or textual range as a single concrete date", () => {
     expect(timelineGroupLabel(record({ kind: "range", to: "2026-09-20" }))).toBe("? — 2026-09-20 · 时间范围");
     expect(timelineGroupLabel(record({ kind: "range", from: "上周一", to: "上周三" })))
-      .toBe(`上周一 — 上周三 · 时间范围 · ${dateLabel(record({ kind: "unknown" }).recordedAt)} · 记录日期`);
+      .toBe("时间待补充");
   });
   it("marks recording-date grouping when an occurrence date cannot be resolved", () => {
     for (const time of [{ kind: "unknown" }, { kind: "relative", text: "上周" }, { kind: "range" }] as const) {
-      expect(timelineGroupLabel(record(time))).toBe(`${dateLabel(record(time).recordedAt)} · 记录日期`);
+      expect(timelineGroupLabel(record(time))).toBe("时间待补充");
     }
   });
   it("retains occurrence labels at their original precision", () => {
     for (const [time, expected] of [
       [{ kind: "date", value: "2026-09-20" }, "2026-09-20"],
       [{ kind: "month", value: "2026-09" }, "2026-09"],
-      [{ kind: "relative", text: "上周" }, `上周 · ${dateLabel(record({ kind: "unknown" }).recordedAt)} · 记录日期`],
+      [{ kind: "relative", text: "上周" }, "上周"],
       [{ kind: "range", from: "2026-09", to: "2026-10" }, "2026-09 — 2026-10"]
     ] as const) expect(temporalLabel(record(time))).toBe(expected);
   });
@@ -45,11 +45,11 @@ describe("record time display without invented calendar precision", () => {
   it("preserves unparseable source text and does not crash on an invalid instant", () => {
     const value = "无法确定的较长时间说明，不应被截掉";
     expect(dateLabel(value)).toBe(value);
-    expect(temporalLabel(record({ kind: "instant", value }))).toBe(`${value} · ${dateLabel(record({ kind: "unknown" }).recordedAt)} · 记录日期`);
+    expect(temporalLabel(record({ kind: "instant", value }))).toBe(value);
     expect(dateLabel("2026-02-31")).toBe("2026-02-31");
     expect(dateLabel("2026-02-31T00:00:00.000Z")).toBe("2026-02-31T00:00:00.000Z");
     expect(temporalLabel(record({ kind: "instant", value: "2026-02-31T00:00:00.000Z" })))
-      .toBe(`2026-02-31T00:00:00.000Z · ${dateLabel(record({ kind: "unknown" }).recordedAt)} · 记录日期`);
+      .toBe("2026-02-31T00:00:00.000Z");
   });
   it("uses the captured query zone for cards, headings and recording dates even if the system zone changes", () => {
     vi.stubEnv("TZ", "Asia/Shanghai");
@@ -58,7 +58,7 @@ describe("record time display without invented calendar precision", () => {
     expect(dateLabel(value, "America/Los_Angeles")).toBe("2026年9月19日");
     expect(timelineGroupLabel(time, "America/Los_Angeles")).toBe("2026年9月19日");
     expect(temporalLabel(time, "America/Los_Angeles")).toContain("2026年9月19日");
-    expect(temporalLabel(record({ kind: "unknown" }), "America/Los_Angeles")).toBe("2026年9月28日 · 记录日期");
+    expect(temporalLabel(record({ kind: "unknown" }), "America/Los_Angeles")).toBe("时间待补充");
     expect(dateLabel("2026-09-20", "America/Los_Angeles")).toBe("2026年9月20日");
     expect(dateLabel(value, "invalid/zone")).toBe(value);
   });
@@ -74,8 +74,8 @@ describe("record time display without invented calendar precision", () => {
     for (const time of [{ kind: "date", value: "2026-02-30" }, { kind: "month", value: "2026-13" },
       { kind: "range", from: "2026-10", to: "2026-09" }] as const) {
       const value = record(time);
-      expect(temporalLabel(value, "UTC")).toContain("2026年9月29日 · 记录日期");
-      expect(timelineGroupLabel(value, "UTC")).toContain("2026年9月29日 · 记录日期");
+      expect(temporalLabel(value, "UTC")).not.toContain("记录日期");
+      expect(timelineGroupLabel(value, "UTC")).toBe("时间待补充");
       expect(occurrenceTimeLabel(value, "UTC")).not.toContain("记录日期");
     }
     expect(occurrenceTimeLabel(record({ kind: "relative", text: "上周" }))).toBe("上周");

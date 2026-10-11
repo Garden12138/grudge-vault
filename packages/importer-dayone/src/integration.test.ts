@@ -185,7 +185,20 @@ describe("Day One application integration", () => {
       });
       expect(imported).toMatchObject({ included: 0, skipped: 1, review: 1 });
       const pending = application.listPendingReviews()[0]!;
-      expect(pending.sessionAvailable).toBe(false);
+      expect(pending.sessionAvailable).toBe(true);
+      // Reproduce an installed old pending item: its encrypted payload has only an excerpt.
+      session.records!.deletePending(pending.id);
+      session.records!.createPending(pending, "00000000-0000-4000-8000-000000000106");
+      expect(application.getPendingReview(pending.id).text).toBeUndefined();
+      const before = Object.fromEntries(["redesign_records", "redesign_sources", "assets", "jobs", "redesign_operations"].map(table =>
+        [table, database.prepare(`SELECT * FROM ${table}`).all()]));
+      expect(await application.restorePendingReviewDetailsFromZip(pending.id, archivePath)).toMatchObject({
+        restored: 1, detail: { id: pending.id, text: expect.stringContaining("first"), sessionAvailable: false }
+      });
+      for (const [table, rows] of Object.entries(before)) expect(database.prepare(`SELECT * FROM ${table}`).all()).toEqual(rows);
+      expect(database.serialize().includes(Buffer.from(SKIPPED_ENTRY_MARKER))).toBe(false);
+      const recoveredText = application.getPendingReview(pending.id).text!;
+      expect(database.serialize().includes(Buffer.from(recoveredText))).toBe(false);
       const result = await application.resolvePendingReviewFromDayOneZip(pending.id, archivePath, {
         async screen() { throw new Error("The original review should be confirmed without a second model decision."); }
       }, "00000000-0000-4000-8000-000000000105");

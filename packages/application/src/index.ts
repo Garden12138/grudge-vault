@@ -405,6 +405,22 @@ export class GrudgeVaultApplication {
 
   listPendingReviews(): import("@grudge-vault/domain").PendingReview[] { return this.redesign.listPending(); }
 
+  getPendingReview(id: string): import("@grudge-vault/domain").PendingReview { return this.redesign.getPending(id); }
+
+  restorePendingReviewDetailsFromZip(id: string, archivePath: string, signal?: AbortSignal) {
+    if (!this.dayOneImporter?.scanArchive) throw new AppError("INTERNAL_ERROR", "ZIP 读取能力不可用。");
+    return this.redesign.restorePendingDetailsFromZip(id, archivePath, this.dayOneImporter as DayOneScreeningImporterPort, signal);
+  }
+
+  restoreRecordOriginalFromZip(id: string, expectedRevision: number, entryId: string, archivePath: string, signal?: AbortSignal) {
+    if (!this.dayOneImporter || !("scanArchive" in this.dayOneImporter)) throw new AppError("SOURCE_UNAVAILABLE", "ZIP 导入不可用。", true);
+    return this.redesign.restoreRecordOriginalFromZip(id, expectedRevision, entryId, archivePath, this.dayOneImporter as DayOneScreeningImporterPort, signal);
+  }
+
+  restorePendingReviewDetailsFromLegacy(id: string, source: LegacyMigrationSourcePort, signal?: AbortSignal) {
+    return this.redesign.restorePendingDetailsFromLegacy(id, source, signal);
+  }
+
   resolvePendingReview(id: string, action: "keep" | "ignore", operationId: string): Promise<import("@grudge-vault/domain").ScreenAndSaveResult | null> {
     return this.redesign.resolvePending(id, action, operationId);
   }

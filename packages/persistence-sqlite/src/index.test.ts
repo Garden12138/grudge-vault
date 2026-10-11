@@ -39,7 +39,7 @@ describe("SQLite foundation", () => {
       runMigrations(database);
       expect(database.pragma("journal_mode", { simple: true })).toBe("wal");
       expect(database.pragma("foreign_keys", { simple: true })).toBe(1);
-      expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 24 });
+      expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 25 });
       expect(database.prepare("SELECT count(*) AS count FROM pragma_module_list WHERE name = 'fts5'").get()).toEqual({ count: 1 });
       const sourceAssetColumns = database.prepare("PRAGMA table_info(redesign_record_assets)").all() as Array<{ name: string }>;
       expect(sourceAssetColumns.map(({ name }) => name)).toContain("source_id");
@@ -152,7 +152,7 @@ describe("SQLite foundation", () => {
       { id: "unretained", source_updated: 1, source_review_required: 1 }
     ]);
     runMigrations(database);
-    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 24 });
+    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 25 });
     database.close();
   });
 
@@ -161,7 +161,7 @@ describe("SQLite foundation", () => {
     runMigrations(database, [DEFAULT_MIGRATIONS[0]!]);
     expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 1 });
     runMigrations(database);
-    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 24 });
+    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 25 });
     expect(database.prepare("SELECT name FROM sqlite_master WHERE name = 'events'").get()).toEqual({ name: "events" });
     database.close();
   });
@@ -219,7 +219,7 @@ describe("SQLite foundation", () => {
       "agent_runs", "agent_tool_calls", "external_context_disclosures", "llm_provider_credentials",
       "llm_provider_settings", "llm_settings"
     ]);
-    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 24 });
+    expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: 25 });
     database.close();
   });
 

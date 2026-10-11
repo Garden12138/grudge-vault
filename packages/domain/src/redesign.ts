@@ -200,12 +200,32 @@ export interface EventRecordDetail {
   overrides: FieldOverride[];
 }
 
+export interface RecordSupplementMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+/** A read-only conversation reply. Changes are saved separately by the user. */
+export interface RecordSupplementReply {
+  message: string;
+  patch: {
+    title?: string;
+    occurredAt?: TemporalValue;
+    location?: string;
+    jurisdiction?: string;
+  };
+}
+
 export interface PendingReview {
   id: EntityId;
   origin: RecordOrigin;
   originLocator?: string;
   sourceVersion: string;
   excerpt: string;
+  /** Encrypted with the pending payload; loaded only when opening details. Older items may lack it. */
+  text?: string;
+  recordedAt?: IsoDateTime;
+  attachmentNames?: string[];
   reason: string;
   categories: EventCategory[];
   coverage: ScreeningCoverage;

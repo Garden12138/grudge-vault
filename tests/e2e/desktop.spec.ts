@@ -1,4 +1,4 @@
-import { focusDesktop, openDisclosure, settingsGroup } from "./ui-helpers";
+import { focusDesktop, openDisclosure, settingsGroup, supplementRecord } from "./ui-helpers";
 import { createReadStream, createWriteStream } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, open, readFile, readdir, rm, writeFile } from "node:fs/promises";
@@ -467,9 +467,9 @@ test("runs the screened record, review, report and search flow", async () => {
     const currentReview = page.getByLabel("当前记录待确认");
     await expect(currentReview).toBeVisible();
     await expect(page.getByRole("dialog")).toHaveCount(1);
-    page.once("dialog", dialog => dialog.dismiss());
-    await page.getByRole("dialog", { name: "新建记录" }).getByRole("button", { name: "关闭" }).click();
-    await expect(page.getByLabel("发生了什么？")).toHaveValue("他又这样说了，我有些不安");
+    await expect(page.getByLabel("补充什么？")).toHaveValue("");
+    await page.getByRole("dialog", { name: "新建记录" }).locator("summary").filter({ hasText: "原文" }).click();
+    await expect(page.getByRole("dialog", { name: "新建记录" }).locator("pre")).toHaveText("他又这样说了，我有些不安");
     await currentReview.getByRole("button", { name: "不收录并清空" }).click();
     await expect(page.getByLabel("发生了什么？")).toHaveValue("");
     expect(await page.evaluate(() => window.grudgeVault.pending.list())).toMatchObject({ ok: true, data: [] });
@@ -481,8 +481,8 @@ test("runs the screened record, review, report and search flow", async () => {
     await expect(page.getByText("项目奖金迟迟未结清，公司仍未支付", { exact: true })).toBeVisible({ timeout: 15_000 });
     await page.getByText("项目奖金迟迟未结清，公司仍未支付", { exact: true }).click();
     await expect(page.getByText("项目奖金尚未结清，需要核对约定与付款记录。")).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByRole("heading", { name: "待核对推测" })).toBeVisible();
-    await expect(page.getByText("公司可能故意拖欠，但目前没有证据。", { exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "待核对推测" })).toHaveCount(0);
+    await expect(page.getByText("公司可能故意拖欠，但目前没有证据。", { exact: true })).toHaveCount(0);
     const firstReportId = await page.evaluate(async () => {
       const search = await window.grudgeVault.records.search({ text: "项目奖金迟迟未结清" });
       if (!search.ok || !search.data.hits[0]) throw new Error("Synthetic record was not found.");
@@ -490,7 +490,7 @@ test("runs the screened record, review, report and search flow", async () => {
       if (!detail.ok || !detail.data.report) throw new Error("Initial report was not found.");
       return detail.data.report.id;
     });
-    await page.getByRole("button", { name: "重新分析", exact: true }).click();
+    await page.getByRole("button", { name: "重新整理", exact: true }).click();
     await expect.poll(async () => page.evaluate(async () => {
       const search = await window.grudgeVault.records.search({ text: "项目奖金迟迟未结清" });
       if (!search.ok || !search.data.hits[0]) return undefined;
@@ -498,50 +498,31 @@ test("runs the screened record, review, report and search flow", async () => {
       return detail.ok ? detail.data.report?.id : undefined;
     }), { timeout: 15_000 }).not.toBe(firstReportId);
     await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1)).toBe(true);
-    await openDisclosure(page, "法律视角");
-    await expect(page.getByText(/法域：新加坡/)).toBeVisible();
-    await openDisclosure(page, "法律视角");
-    await expect(page.getByText("依据待核验", { exact: true })).toBeVisible();
-    await openDisclosure(page, "法律视角");
-    await page.getByRole("button", { name: "修改法域" }).click();
-    await page.getByPlaceholder("输入适用法域").fill("日本");
-    await page.locator(".supplement").getByRole("button", { name: "保存", exact: true }).click();
-    await openDisclosure(page, "法律视角");
-    await expect(page.getByText(/旧报告的法律问题与依据暂不展示/)).toBeVisible();
-    await openDisclosure(page, "法律视角");
-    await expect(page.getByText("奖金是否构成约定的劳动报酬需要结合材料核验。")).toHaveCount(0);
-    await page.getByRole("button", { name: "重新分析", exact: true }).click();
+    await openDisclosure(page, "相关法律");
+    await expect(page.getByText(/法域：/)).toHaveCount(0);
+    await openDisclosure(page, "相关法律");
+    await expect(page.locator("summary").filter({ hasText: "相关法律" })).toBeVisible();
+    await supplementRecord(page, "法域改为日本。");
     await expect.poll(async () => page.evaluate(async () => {
       const search = await window.grudgeVault.records.search({ text: "项目奖金迟迟未结清" });
       if (!search.ok || !search.data.hits[0]) return false;
       const refreshed = await window.grudgeVault.records.get(search.data.hits[0].record.id);
-      return refreshed.ok && refreshed.data.report?.recordRevision === refreshed.data.record.revision &&
-        refreshed.data.record.reportState === "complete";
+      return refreshed.ok && refreshed.data.report?.recordRevision === refreshed.data.record.revision && refreshed.data.record.reportState === "complete";
     }), { timeout: 15_000 }).toBe(true);
-    await openDisclosure(page, "法律视角");
-    await expect(page.getByText(/法域：日本/)).toBeVisible();
-    await openDisclosure(page, "法律视角");
-    await expect(page.getByText("奖金是否构成约定的劳动报酬需要结合材料核验。")).toBeVisible();
-    await page.getByRole("button", { name: "补充地点" }).click();
-    await page.getByPlaceholder("输入明确地点").fill("上海办公室");
-    await page.locator(".supplement").getByRole("button", { name: "保存", exact: true }).click();
-    await expect(page.getByText("上海办公室")).toBeVisible();
-    await page.locator(".split-sections li").filter({ hasText: "奖金约定的具体金额和支付日期尚待补充。" })
-      .getByRole("button", { name: "补充此项" }).click();
-    await page.getByRole("textbox", { name: /针对“奖金约定的具体金额和支付日期尚待补充。”的补充说明/ })
-      .fill("我记得约定金额是五千元，仍需核对合同。");
-    await page.getByRole("button", { name: "保存补充" }).click();
-    await expect(page.getByText(/你已补充（用户陈述，待核对）：我记得约定金额是五千元/)).toBeVisible();
-    await page.getByRole("button", { name: "重新分析", exact: true }).click();
+    await openDisclosure(page, "相关法律");
+    await expect(page.getByText(/法域：/)).toHaveCount(0);
+    await supplementRecord(page, "地点是上海办公室。我记得约定金额是五千元，仍需核对合同。");
     await expect.poll(async () => page.evaluate(async () => {
       const search = await window.grudgeVault.records.search({ text: "项目奖金迟迟未结清" });
       if (!search.ok || !search.data.hits[0]) return undefined;
       const detail = await window.grudgeVault.records.get(search.data.hits[0].record.id);
       return detail.ok ? detail.data.record.reportState : undefined;
     }), { timeout: 15_000 }).toBe("complete");
-    await expect(page.getByText("此前补充的问题")).toBeVisible();
-    await expect(page.getByText("合同原件是否载明奖金金额？")).toBeVisible();
-    await expect(page.getByText(/你已补充（用户陈述，待核对）：我记得约定金额是五千元/)).toBeVisible();
+    await openDisclosure(page, "时间、地点与人物");
+    await expect(page.getByText("上海办公室", { exact: true })).toBeVisible();
+    await openDisclosure(page, "补充记录");
+    await expect(page.getByText("合同原件是否载明奖金金额？")).toHaveCount(0);
+    await expect(page.getByText(/^地点是上海办公室。我记得约定金额是五千元/)).toBeVisible();
 
     await page.getByRole("button", { name: "搜索", exact: true }).click();
     await page.getByPlaceholder("描述你记得的内容…").fill("奖金");
@@ -659,7 +640,7 @@ test("runs the screened record, review, report and search flow", async () => {
     await expect(page.locator(".record-card")).toHaveCount(2);
     await page.getByText("Day One 项目奖金未结清").click();
     await expect(page.getByText("来源待核对")).toBeVisible();
-    await expect(page.getByText(/当前原文和报告仍对应已收录的旧版本/)).toBeVisible();
+    await expect(page.getByText("导入来源有新版本，待核对。", { exact: true })).toBeVisible();
 
     await application.evaluate(({ dialog }, selectedZip) => {
       dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [selectedZip] });
@@ -695,7 +676,7 @@ test("runs the screened record, review, report and search flow", async () => {
     await page.locator(".record-card").last().scrollIntoViewIfNeeded();
     const timelineScroll = await page.evaluate(() => globalThis.scrollY);
     await page.locator(".record-card").last().click();
-    await page.getByRole("button", { name: "重新分析", exact: true }).click();
+    await page.getByRole("button", { name: "重新整理", exact: true }).click();
     await page.getByRole("button", { name: /返回时间线/ }).click();
     await expect(page.locator(".record-card")).toHaveCount(67);
     await expect.poll(() => page.evaluate((before) => Math.abs(globalThis.scrollY - before) <= 5 ? "restored" : JSON.stringify({ position: globalThis.scrollY, expected: before, maximum: document.documentElement.scrollHeight - globalThis.innerHeight }), timelineScroll))
@@ -796,11 +777,13 @@ test("runs the screened record, review, report and search flow", async () => {
     await pendingDrawer.getByRole("button", { name: "补充", exact: true }).click();
     await expect(pendingDrawer).toBeHidden();
     const zipSupplement = page.getByRole("dialog", { name: "补充待确认内容" });
-    await expect(zipSupplement.getByLabel("待核对内容")).toContainText("待核对点");
-    await expect(zipSupplement.getByLabel("补充需核对的内容")).toHaveValue("");
-    await zipSupplement.getByLabel("补充需核对的内容").fill("ZIP补充核对：公司拖欠我的奖金，我保留了付款邮件");
+    await expect(zipSupplement.getByLabel("待核对内容")).toContainText("补充会追加保存");
+    await expect(zipSupplement.getByLabel("补充什么？")).toHaveValue("");
+    await zipSupplement.getByLabel("补充什么？").fill("ZIP补充核对：公司拖欠我的奖金，我保留了付款邮件");
     await zipSupplement.getByRole("button", { name: "判断并收录", exact: true }).click();
     await expect(zipSupplement).toBeHidden({ timeout: 15_000 });
+    await expect(page.locator(".detail-panel h2")).toHaveText("Day One 里他又这样说了，我有些不安");
+    await openDisclosure(page, "补充记录");
     await expect(page.getByText("ZIP补充核对：公司拖欠我的奖金，我保留了付款邮件", { exact: true })).toBeVisible();
     const pendingAfterReview = await page.evaluate(() => window.grudgeVault.pending.list());
     expect(pendingAfterReview).toMatchObject({ ok: true, data: [] });
@@ -812,16 +795,16 @@ test("runs the screened record, review, report and search flow", async () => {
     await originalManualEditor.getByRole("button", { name: "判断并收录", exact: true }).click();
     await expect(originalManualEditor.getByLabel("当前记录待确认")).toBeVisible();
     await expect(page.getByRole("dialog")).toHaveCount(1);
-    page.once("dialog", (dialog) => dialog.accept());
     await originalManualEditor.getByRole("button", { name: "关闭" }).click();
     await page.locator(".page-header").getByRole("button", { name: /待确认/ }).click();
     await page.getByLabel("待确认", { exact: true }).getByRole("button", { name: "补充", exact: true }).click();
     const replacementEditor = page.getByRole("dialog", { name: "补充待确认内容" });
-    await expect(replacementEditor.getByLabel("补充需核对的内容")).toHaveValue("");
-    await replacementEditor.getByLabel("补充需核对的内容").fill("公司拖欠我的项目奖金，我保留了付款邮件");
+    await expect(replacementEditor.getByLabel("补充什么？")).toHaveValue("");
+    await replacementEditor.getByLabel("补充什么？").fill("公司拖欠我的项目奖金，我保留了付款邮件");
     await replacementEditor.getByRole("button", { name: "判断并收录", exact: true }).click();
     await expect(replacementEditor).toBeHidden({ timeout: 15_000 });
     expect(await page.evaluate(() => window.grudgeVault.pending.list())).toMatchObject({ ok: true, data: [] });
+    await openDisclosure(page, "补充记录");
     await expect(page.getByText("公司拖欠我的项目奖金，我保留了付款邮件", { exact: true })).toBeVisible();
 
     await application.evaluate(({ dialog }, selectedWorkspace) => {
@@ -837,10 +820,8 @@ test("runs the screened record, review, report and search flow", async () => {
     const legacyPending = page.getByLabel("待确认", { exact: true });
     await expect(legacyPending.getByText(/旧工作区复核记录/)).toBeVisible();
     await expect(legacyPending.getByRole("button", { name: "补充", exact: true })).toBeVisible();
-    page.once("dialog", (dialog) => dialog.accept());
-    await settingsGroup(page, "导入");
-    await openDisclosure(page, "从原件恢复");
-    await legacyPending.getByRole("button", { name: "选择旧工作区", exact: true }).click();
+    await expect(legacyPending.getByText("从原件恢复", { exact: true })).toHaveCount(0);
+    await legacyPending.getByRole("button", { name: "确认保留", exact: true }).click();
     await expect(legacyPending).toBeHidden({ timeout: 15_000 });
     await expect(page.getByText("旧工作区复核记录", { exact: true })).toBeVisible();
     expect(await page.evaluate(() => window.grudgeVault.pending.list())).toMatchObject({ ok: true, data: [] });
@@ -926,15 +907,16 @@ test("runs the screened record, review, report and search flow", async () => {
     }, refreshingRecordId)).toBe("complete");
     await expect(page.locator(".report-summary")).toHaveText("搜索详情后台报告第 1 版已完成。");
     await expect(page.locator(".report-placeholder")).toHaveCount(0);
-    await page.getByRole("button", { name: "重新分析", exact: true }).click();
+    await page.getByRole("button", { name: "重新整理", exact: true }).click();
     await expect.poll(() => application.evaluate(() => typeof (
       globalThis as typeof globalThis & { __gvE2eReleaseReportRefresh?: () => void }
     ).__gvE2eReleaseReportRefresh === "function")).toBe(true);
-    await expect(page.getByText(/当前展示上一版报告，新报告完成后会自动切换/)).toBeVisible();
+    await expect(page.locator(".banner.notice").filter({ hasText: "报告更新中" })).toBeVisible();
     await expect(page.locator(".report-summary")).toHaveText("搜索详情后台报告第 1 版已完成。");
-    await page.getByRole("button", { name: "补充地点", exact: true }).click();
-    await page.getByPlaceholder("输入明确地点").fill("尚未提交的本地地点");
-    await page.getByRole("button", { name: "原始内容", exact: true }).click();
+    await page.getByRole("button", { name: "对话补充", exact: true }).click();
+    const supplementDialog = page.getByRole("dialog", { name: "对话补充" });
+    await expect(supplementDialog.locator(".supplement-message.assistant")).toHaveCount(1);
+    await supplementDialog.getByLabel("你的补充").fill("尚未提交的本地地点");
     await application.evaluate(() => {
       const release = (globalThis as typeof globalThis & { __gvE2eReleaseReportRefresh?: () => void }).__gvE2eReleaseReportRefresh;
       if (!release) throw new Error("Expected the second live synthetic report request.");
@@ -944,12 +926,13 @@ test("runs the screened record, review, report and search flow", async () => {
       const result = await window.grudgeVault.records.get(id);
       return result.ok ? result.data.record.reportState : undefined;
     }, refreshingRecordId)).toBe("complete");
+    await expect(supplementDialog.getByLabel("你的补充")).toHaveValue("尚未提交的本地地点");
+    page.once("dialog", dialog => dialog.accept());
+    await supplementDialog.getByRole("button", { name: "关闭补充对话" }).click();
+    await page.getByRole("button", { name: "原始内容", exact: true }).click();
     await expect(page.getByRole("heading", { name: "原始文字", exact: true })).toBeVisible();
-    await expect(page.locator(".report-summary")).toHaveCount(0);
     await page.getByRole("button", { name: "事件报告", exact: true }).click();
     await expect(page.locator(".report-summary")).toHaveText("搜索详情后台报告第 2 版已完成。");
-    await expect(page.getByPlaceholder("输入明确地点")).toHaveValue("尚未提交的本地地点");
-    await page.locator(".inline-editor.supplement").getByRole("button", { name: "取消", exact: true }).click();
     await page.getByRole("button", { name: /返回搜索结果/ }).click();
     await expect(page.getByRole("heading", { name: "搜索", exact: true })).toBeVisible();
     await expect(page.locator(".search-results article")).toHaveCount(1);
@@ -1557,6 +1540,7 @@ test("shows report precision and person provenance and protects person supplemen
     };
     const firstText = "E2E报告字段来源：约在九月有合成奖金争议，参与者信息仍须核对。";
     await create(firstText);
+    await openDisclosure(page, "时间、地点与人物");
     const timeField = page.locator(".field-grid .report-field").filter({ has: page.locator("span", { hasText: /^时间$/ }) });
     const peopleField = page.locator(".report-people-field");
     await expect(timeField).toContainText("约在九月（大约时间）"); await expect(timeField.locator("em")).toHaveText("AI 整理");
@@ -1573,13 +1557,8 @@ test("shows report precision and person provenance and protects person supplemen
       })).toBe(true);
     }
     await reportWindow.evaluate((browserWindow) => browserWindow.setContentSize(1024, 900));
-    await page.getByRole("button", { name: "补充人物信息" }).click();
     const statement = "我记得合成人物补充名称参与沟通，具体角色仍需核对。";
-    await expect(page.getByRole("textbox", { name: /针对“有哪些相关人物及角色？”的补充说明/ })).toBeFocused();
-    await page.getByRole("textbox", { name: /针对“有哪些相关人物及角色？”的补充说明/ }).fill(statement);
-    await page.getByRole("button", { name: "保存补充" }).click();
-    await expect(page.getByText(`你已补充（用户陈述，待核对）：${statement}`)).toBeVisible();
-    await page.getByRole("button", { name: "重新分析", exact: true }).click();
+    await supplementRecord(page, statement);
     const detail = () => page.evaluate(async () => {
       const result = await window.grudgeVault.records.search({ text: "合成人物补充名称" });
       if (!result.ok || !result.data.hits[0]) return null;
@@ -1589,14 +1568,15 @@ test("shows report precision and person provenance and protects person supplemen
     const updated = (await detail())!;
     expect(updated.source.text).toBe(firstText);
     expect(updated.overrides.find(({ fieldKey }) => fieldKey === "clarifications")?.value)
-      .toEqual([{ kind: "unknown", topic: "有哪些相关人物及角色？", response: statement }]);
+      .toEqual([expect.objectContaining({ kind: "unknown", response: statement })]);
     expect(await application.evaluate(() => (globalThis as typeof globalThis & { __gvE2eReportFieldPrompts?: string[] })
-      .__gvE2eReportFieldPrompts?.at(-1)?.includes('clarifications=[{"kind":"unknown","topic":"有哪些相关人物及角色？","response":"我记得合成人物补充名称参与沟通，具体角色仍需核对。"}]'))).toBe(true);
+      .__gvE2eReportFieldPrompts?.at(-1)?.includes("我记得合成人物补充名称参与沟通，具体角色仍需核对。"))).toBe(true);
     await expect(peopleField.locator("li em")).toHaveText(["来自原始材料", "AI 整理"]);
-    await expect(page.getByText(`你已补充（用户陈述，待核对）：${statement}`)).toBeVisible();
+    await openDisclosure(page, "补充记录");
+    await expect(page.getByText(statement, { exact: true })).toBeVisible();
     await page.getByRole("button", { name: "返回时间线" }).click();
     await create("E2E报告字段来源人物待补充：合成奖金争议，没有明确日期与人物。");
-    await expect(timeField).toContainText("待补充：大约何时发生？"); await expect(timeField).not.toContainText("2099");
+    await expect(timeField).toHaveCount(0);
     expect(await page.evaluate(async () => {
       const result = await window.grudgeVault.records.search({ text: "2099" }); return result.ok ? result.data.hits.length : -1;
     })).toBe(0);
@@ -1606,13 +1586,9 @@ test("shows report precision and person provenance and protects person supplemen
       const detail = await window.grudgeVault.records.get(result.data.hits[0].record.id);
       return detail.ok ? { state: detail.data.record.reportState, time: detail.data.report?.content.time } : null;
     })).toMatchObject({ state: "complete", time: { source: "ai", prompt: "待补充：大约何时发生？" } });
-    await expect(peopleField).toContainText("待补充：有哪些相关人物？"); await expect(peopleField.locator("li")).toHaveCount(0);
-    await page.getByRole("button", { name: "补充人物信息" }).click();
-    await expect(page.getByRole("textbox", { name: /有哪些相关人物及角色/ })).toBeVisible();
-    await page.locator(".clarification-editor").getByRole("button", { name: "取消", exact: true }).click();
-    await page.getByRole("button", { name: "补充时间", exact: true }).click();
-    await page.locator('.supplement input[type="date"]').fill("2026-09-21");
-    await page.locator(".supplement").getByRole("button", { name: "保存", exact: true }).click();
+    await expect(peopleField).toHaveCount(0);
+    await supplementRecord(page, "事情发生在2026年9月21日。");
+    await openDisclosure(page, "时间、地点与人物");
     await expect(timeField).toContainText("2026-09-21"); await expect(timeField.locator("em")).toHaveText("你已补充");
     await expect(timeField).not.toContainText("2099");
     expect(await application.evaluate(() => (globalThis as typeof globalThis & { __gvE2eUnexpectedNetwork?: number })
@@ -1682,7 +1658,7 @@ test("repairs old report keyword coverage offline and preserves month ranges and
     const oldDatabase = new Database(join(workspace, "db/grudge-vault.sqlite3"));
     try {
       oldDatabase.prepare("UPDATE redesign_record_fts SET report_text = '' WHERE record_id = ?").run(before.record.id);
-      oldDatabase.prepare("DELETE FROM workspace_settings WHERE key = 'redesign.keyword-projection-v2'").run();
+      oldDatabase.prepare("DELETE FROM workspace_settings WHERE key = 'redesign.keyword-projection-v3'").run();
     } finally { oldDatabase.close(); }
     application = await launch(); page = await application.firstWindow(); await expect(page.locator(".new-record-button")).toBeVisible();
     expect(await application.evaluate(() => (globalThis as typeof globalThis & { __gvE2eInferenceCalls?: number }).__gvE2eInferenceCalls ?? 0)).toBe(0);
@@ -1840,8 +1816,7 @@ test("filters month and range overlap in the UI and carries its timezone through
     await page.locator(".filter-bar").getByLabel("至", { exact: true }).fill("2026-09-15");
     await expect(page.locator(".timeline-groups .record-card")).toHaveCount(2);
     await expect(page.locator(".timeline-groups .record-card").filter({ hasText: "合成明确时刻" })).toHaveCount(0);
-    await openDisclosure(page, "日期如何匹配？");
-    await expect(page.getByText(/月份与时间范围按可能重叠筛选/)).toBeVisible();
+    await expect(page.getByText("日期如何匹配？", { exact: true })).toHaveCount(0);
     await page.getByRole("button", { name: "搜索", exact: true }).click();
     await page.getByLabel("使用百炼语义检索").uncheck();
     await page.getByPlaceholder("描述你记得的内容…").fill("合成日期边界");
@@ -1875,12 +1850,11 @@ test("filters month and range overlap in the UI and carries its timezone through
       patch: { occurredAt: { kind: "range", from, to } } }), { id: ids[1]!, from: longFrom, to: longTo })).toMatchObject({ ok: true });
     await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.setSize(840, 760));
     await page.getByRole("button", { name: "时间线", exact: true }).click();
-    await expect(page.locator(".timeline-groups h2").filter({ hasText: longFrom })).toContainText(`${longFrom} — ${longTo} · 时间范围`);
-    await expect(page.locator(".timeline-groups h2").filter({ hasText: longFrom })).toContainText("记录日期");
-    expect(await page.locator(".timeline-groups h2").filter({ hasText: longFrom }).evaluate((element) =>
+    await expect(page.locator(".timeline-groups h2").filter({ hasText: "时间待补充" })).toBeVisible();
+    expect(await page.locator(".timeline-groups h2").filter({ hasText: "时间待补充" }).evaluate((element) =>
       element.scrollWidth <= element.clientWidth)).toBe(true);
     await expect(page.locator(".record-card-top > span:first-child").filter({ hasText: longFrom })).toContainText(`${longFrom} — ${longTo}`);
-    await expect(page.locator(".record-card-top > span:first-child").filter({ hasText: longFrom })).toContainText("记录日期");
+    await expect(page.locator(".record-card-top > span:first-child").filter({ hasText: longFrom })).not.toContainText("记录日期");
     expect(await page.locator(".record-card-top > span:first-child").filter({ hasText: longFrom }).evaluate((element) =>
       element.scrollWidth <= element.clientWidth)).toBe(true);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
@@ -1957,7 +1931,7 @@ test("projects current report time after restart without rewriting source dates 
     expect(await page.evaluate(() => window.grudgeVault.records.search({ text: "约2026年9月" }))).toMatchObject({ ok: true, data: { hits: [] } });
     await page.getByRole("button", { name: "搜索", exact: true }).click();
     await page.getByRole("button", { name: "时间线", exact: true }).click();
-    await expect(page.locator(".timeline-groups h2")).toContainText("记录日期");
+    await expect(page.locator(".timeline-groups h2")).toContainText("时间待补充");
     await expect(page.locator(".record-time-source")).toHaveText("你已补充");
     expect(await application.evaluate(() => (globalThis as typeof globalThis & { __gvE2eUnexpectedNetwork?: number }).__gvE2eUnexpectedNetwork ?? 0)).toBe(0);
   } finally { await application.close(); await rm(root, { recursive: true, force: true }); }
@@ -1980,7 +1954,7 @@ test("uses current protected legal context and persists pending effective inform
     await page.getByRole("dialog", { name: "新建记录" }).getByLabel("发生了什么？").fill(original);
     await page.getByRole("dialog", { name: "新建记录" }).getByRole("button", { name: "判断并收录", exact: true }).click();
     await expect(page.locator(".citation-card")).toHaveCount(1);
-    await openDisclosure(page, "法律视角");
+    await openDisclosure(page, "相关法律");
     await expect(page.locator(".citation-card")).toBeVisible();
     await expect(page.locator(".citation-card")).toContainText("待核验");
     await expect(page.locator(".citation-card")).toContainText("生效、失效信息及事发时点的适用性尚未核验。");
@@ -2154,7 +2128,7 @@ test("routes real macOS WAV clips through private screening, encrypted reports, 
     expect(await page.evaluate(({ id, revision }) => window.grudgeVault.records.reanalyze(id, revision), detail.record)).toMatchObject({ ok: true });
     await expect.poll(() => application.evaluate(() =>
       (globalThis as typeof globalThis & { __gvE2eNativeSegmentStarted?: boolean }).__gvE2eNativeSegmentStarted)).toBe(true);
-    await expect(page.getByRole("status").filter({ hasText: "报告任务进度 0%" })).toBeVisible();
+    await expect(page.getByRole("status").filter({ hasText: "正在分析 0%" })).toBeVisible();
     await page.getByRole("button", { name: "取消分析", exact: true }).click();
     await expect.poll(() => page.evaluate(async (id) => {
       const result = await window.grudgeVault.records.get(id); return result.ok ? result.data.record.reportState : undefined;

@@ -218,6 +218,13 @@ const patchRecordSchema = z.object({
     { message: "Clarifications exceed the input limit." }).optional()
   }).refine((value) => Object.keys(value).length > 0, { message: "At least one field is required." })
 });
+const recordSupplementInputSchema = z.object({
+  recordId: idSchema, expectedRevision: z.number().int().positive(),
+  messages: z.array(z.object({ role: z.enum(["user", "assistant"]), content: z.string().trim().min(1).max(2_000) }).strict()).max(40)
+    .refine((messages) => messages.length === 0 || messages.at(-1)?.role === "user", { message: "A user answer is required." })
+    .refine((messages) => messages.every(({ role }, index) => role === (index % 2 === 0 ? "assistant" : "user")),
+      { message: "Conversation messages must alternate." })
+});
 const pendingResolveSchema = z.object({ id: idSchema, action: z.enum(["keep", "ignore"]), operationId: idSchema });
 const pendingManualSchema = z.object({ id: idSchema, sessionId: idSchema });
 const pendingZipSchema = z.object({ id: idSchema, operationId: idSchema });
@@ -556,6 +563,29 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   });
   add("records:timeline", recordTimelineSchema, (filter) => dependencies.application.listRecordTimeline(filter as TimelineFilter));
   add("records:get", idSchema, (id) => dependencies.application.getRecordDetail(id));
+  add("records:restore-original", idRevisionSchema.extend({ entryId: z.string().min(1).max(256) }), async ({ id, expectedRevision, entryId }) => {
+    const current = dependencies.application.getRecordDetail(id);
+    if (current.record.revision !== expectedRevision) throw new AppError("REVISION_CONFLICT", "记录已变化，请重新核对。", true);
+    if (activeDayOneImport) throw new AppError("IMPORT_RUN_STATE_CONFLICT", "请等待当前 ZIP 处理结束。");
+    const controller = new AbortController(); activeDayOneImport = controller;
+    try {
+      const selection = await dialog.showOpenDialog(dependencies.window, { title: "补回旧版记录的原文", properties: ["openFile"],
+        filters: [{ name: "Day One JSON ZIP", extensions: ["zip"] }] });
+      if (selection.canceled || !selection.filePaths[0]) return null;
+      return await dependencies.application.restoreRecordOriginalFromZip(id, expectedRevision, entryId, selection.filePaths[0], controller.signal);
+    } finally { activeDayOneImport = undefined; }
+  });
+  add("records:supplement", recordSupplementInputSchema, async ({ recordId, expectedRevision, messages }) => {
+    const detail = dependencies.application.getRecordDetail(recordId);
+    if (detail.record.revision !== expectedRevision) throw new AppError("REVISION_CONFLICT", "记录已更新，请重新打开补充对话。", true);
+    const reply = await dependencies.agent.supplementRecord(detail, messages);
+    if (dependencies.application.getRecordDetail(recordId).record.revision !== expectedRevision) {
+      throw new AppError("REVISION_CONFLICT", "记录已更新，请重新打开补充对话。", true);
+    }
+    // Reuse the write boundary's validation before offering a proposed field change.
+    if (Object.keys(reply.patch).length) patchRecordSchema.parse({ recordId, expectedRevision, patch: reply.patch });
+    return reply;
+  });
   add("records:patch-fields", patchRecordSchema, async (input) => {
     const detail = await dependencies.application.patchRecordFields(
       input.recordId, input.expectedRevision, input.patch as PatchRecordFieldsInput["patch"]
@@ -596,6 +626,37 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   add("legal:set-default-jurisdiction", legalJurisdictionSchema, (jurisdiction) =>
     dependencies.application.setDefaultLegalJurisdiction(jurisdiction));
   add("pending:list", emptySchema, () => dependencies.application.listPendingReviews());
+  add("pending:get", idSchema, (id) => dependencies.application.getPendingReview(id));
+  add("pending:restore-details", idSchema, async id => {
+    const item = dependencies.application.getPendingReview(id);
+    if (item.text !== undefined) return { restored: 0, detail: item };
+    const controller = new AbortController();
+    if (item.origin === "zip") {
+      if (activeDayOneImport) throw new AppError("IMPORT_RUN_STATE_CONFLICT", "请等待当前 ZIP 处理结束。");
+      activeDayOneImport = controller;
+      try {
+        const selection = await dialog.showOpenDialog(dependencies.window, {
+          title: "选择原 Day One ZIP，补全待确认详情", properties: ["openFile"],
+          filters: [{ name: "Day One JSON ZIP", extensions: ["zip"] }]
+        });
+        if (selection.canceled || !selection.filePaths[0]) return null;
+        return await dependencies.application.restorePendingReviewDetailsFromZip(id, selection.filePaths[0], controller.signal);
+      } finally { activeDayOneImport = undefined; }
+    }
+    if (item.origin === "migration" && dependencies.workspaces.createLegacyMigrationSource) {
+      if (activeLegacyMigration) throw new AppError("IMPORT_RUN_STATE_CONFLICT", "请等待当前迁移结束。");
+      activeLegacyMigration = controller;
+      try {
+        const selection = await dialog.showOpenDialog(dependencies.window, {
+          title: "选择原工作区，补全待确认详情", properties: ["openDirectory"]
+        });
+        if (selection.canceled || !selection.filePaths[0]) return null;
+        const source = await dependencies.workspaces.createLegacyMigrationSource(selection.filePaths[0]);
+        return await dependencies.application.restorePendingReviewDetailsFromLegacy(id, source, controller.signal);
+      } finally { activeLegacyMigration = undefined; }
+    }
+    throw new AppError("SOURCE_UNAVAILABLE", "请补充这条内容的原文。", true);
+  });
   add("pending:resolve", pendingResolveSchema, async ({ id, action, operationId }) => {
     const result = await dependencies.application.resolvePendingReview(id, action, operationId);
     if (result?.kind === "saved") dependencies.getRunner()?.wake();

@@ -124,7 +124,9 @@ const api: GrudgeVaultApi = {
     onSearchMediaProgress: (callback) => subscribeMediaProgress(ipcRenderer, "records:search-media-progress", callback),
     timeline: (filter) => invoke("records:timeline", filter),
     get: (id) => invoke("records:get", id),
+    restoreOriginal: (id, expectedRevision, entryId) => invoke("records:restore-original", { id, expectedRevision, entryId }),
     patchFields: (input) => invoke("records:patch-fields", input),
+    supplement: (input) => invoke("records:supplement", input),
     reanalyze: (id, expectedRevision) => invoke("records:reanalyze", { id, expectedRevision }),
     search: (query) => invoke("records:search", query),
     prepareSearch: async ({ requestId, text, files }) => {
@@ -145,6 +147,8 @@ const api: GrudgeVaultApi = {
   },
   pending: {
     list: () => invoke("pending:list"),
+    get: (id) => invoke("pending:get", id),
+    restoreDetails: (id) => invoke("pending:restore-details", id),
     resolve: (id, action, operationId) => invoke("pending:resolve", { id, action, operationId }),
     rescreenManual: (id, sessionId) => invoke("pending:rescreen-manual", { id, sessionId }),
     chooseDayOneZip: (id, operationId) => invoke("pending:choose-dayone-zip", { id, operationId }),

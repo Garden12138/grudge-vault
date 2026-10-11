@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, createWriteStream } from "node:fs";
 import { link, lstat, mkdir, mkdtemp, open as openFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, extname, isAbsolute, join } from "node:path";
 import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { lookup as lookupMimeType } from "mime-types";
 import { needsNativeImageConversion, prepareNativeImage } from "./native-image";
@@ -20,6 +21,7 @@ import type {
   LegalCitation,
   Precision,
   ReportFieldSource,
+  ReportClarification,
   PendingReview,
   PreparedIntake,
   PreparedSearchQuery,
@@ -222,6 +224,7 @@ export interface RecordCommitInput {
   attachments: Asset[];
   screening: ScreeningResult;
   analysisJob: { id: string; createdAt: string };
+  clarifications?: ReportClarification[];
   legacyMigration?: {
     sourceWorkspaceId: string;
     legacyEntityId: string;
@@ -266,13 +269,16 @@ export interface RecordRepositoryPort {
   findRecordBySource(connectorId: string, journalId: string, entryId: string): EventRecordDetail | undefined;
   markSourceChanged(recordId: string, now: string): EventRecordDetail;
   commitRecord(input: RecordCommitInput): EventRecord;
-  createPending(item: PendingReview, operationId: string): PendingReview;
+  createPending(item: PendingReview, operationId: string, input?: RetainedPendingInput): PendingReview;
+  getPendingInput(id: string): RetainedPendingInput | undefined;
   listPending(): PendingReview[];
   getPending(id: string): PendingReview | undefined;
-  deletePending(id: string): void;
+  restorePendingDetails(items: Array<Pick<PendingReview, "id" | "sourceVersion" | "recordedAt" | "attachmentNames"> & { text: string }>): void;
+  deletePending(id: string): string[];
   reencryptPending(targetKeyId: string): void;
   listTimeline(filter: TimelineFilter): TimelinePage;
   getRecord(id: string): EventRecordDetail | undefined;
+  restoreRecordOriginal(recordId: string, expectedRevision: number, source: RetainedSource, now: string): EventRecordDetail;
   patchFields(recordId: string, expectedRevision: number, patch: Partial<Record<FieldOverride["fieldKey"], unknown>>, now: string): EventRecordDetail;
   enqueueAnalysis(recordId: string, expectedRevision: number, jobId: string, now: string): string;
   markAnalysisRunning(recordId: string, expectedRevision: number, now: string): EventRecordDetail;
@@ -303,6 +309,15 @@ export interface RecordRepositoryPort {
   ): Array<{ fragment: RecordSearchFragment; vector: Float32Array }>;
 }
 
+/** Encrypted with the pending text. Original files live in the local encrypted object vault. */
+export interface RetainedPendingInput {
+  media: Array<{ id: string; kind: TransientMediaInput["kind"]; asset: Asset }>;
+  incompleteMedia: boolean;
+  legacyMigration?: NonNullable<RecordCommitInput["legacyMigration"]>;
+  originalText?: string;
+  supplements?: string[];
+}
+
 export interface RedesignSession {
   key: Buffer;
   keyRing?: import("./index").WorkspaceKeyRing;
@@ -325,6 +340,8 @@ interface IntakeSession {
   sourceRecordedAt?: string;
   incompleteMedia: boolean;
   legacyMigration?: NonNullable<RecordCommitInput["legacyMigration"]>;
+  originalText?: string;
+  supplements?: string[];
   createdAt: string;
   expiresAt: string;
 }
@@ -1734,10 +1751,10 @@ export class RedesignService {
     }
   }
 
-  async screenAndSave(sessionId: string, operationId: string, screening: ScreeningPort, signal?: AbortSignal): Promise<ScreenAndSaveResult> {
+  async screenAndSave(sessionId: string, operationId: string, screening: ScreeningPort, signal?: AbortSignal, operationSessionId = sessionId): Promise<ScreenAndSaveResult> {
     throwIfAborted(signal);
     const workspace = this.current();
-    const scopedManualOperationId = manualIntakeOperationId(sessionId, operationId);
+    const scopedManualOperationId = manualIntakeOperationId(operationSessionId, operationId);
     const manualReplay = workspace.records.findOperation(scopedManualOperationId);
     if (manualReplay) return manualReplay;
     const session = this.requireSession(sessionId);
@@ -1833,10 +1850,11 @@ export class RedesignService {
           id: randomUUID(), origin: session.origin, sourceVersion: session.sourceVersion,
           ...(session.sourceLocator ? { originLocator: JSON.stringify(session.sourceLocator) } : {}),
           excerpt: truncateCodePoints(session.text || session.media.map(({ fileName }) => fileName).join("、"), EXCERPT_LIMIT),
+          text: session.text, recordedAt: session.sourceRecordedAt ?? session.createdAt, attachmentNames: session.media.map(({ fileName }) => fileName),
           reason: truncateCodePoints(result.reason, REASON_LIMIT), categories: result.categories,
           coverage: result.coverage, sessionAvailable: true, createdAt: now, updatedAt: now
         };
-        const retained = workspace.records.createPending(pending, commitOperationId);
+        const retained = await this.retainPending(session, pending, commitOperationId, signal);
         if (retained.id === pending.id) this.pendingSessions.set(pending.id, session.id);
         if (changedPrior) workspace.records.markSourceChanged(changedPrior.record.id, now);
         return { kind: "needs_review", pendingId: pending.id };
@@ -1865,10 +1883,144 @@ export class RedesignService {
 
   listPending(): PendingReview[] {
     this.pruneExpiredSessions();
-    return this.current().records.listPending().map((item) => ({
-      ...item,
-      sessionAvailable: this.sessions.has(this.pendingSessions.get(item.id) ?? "")
-    }));
+    return this.current().records.listPending().map((item) => {
+      const summary = { ...item, sessionAvailable: this.pendingAvailable(item) };
+      delete summary.text;
+      return summary;
+    });
+  }
+
+  getPending(id: string): PendingReview {
+    this.pruneExpiredSessions();
+    const records = this.current().records;
+    let item = records.getPending(id);
+    if (!item) throw new AppError("ENTITY_NOT_FOUND", "待确认项不存在。");
+    const session = this.sessions.get(this.pendingSessions.get(id) ?? "");
+    if (item.text === undefined && session) {
+      records.restorePendingDetails([{ id, sourceVersion: item.sourceVersion, text: session.text,
+        recordedAt: session.sourceRecordedAt ?? session.createdAt, attachmentNames: session.media.map(({ fileName }) => fileName) }]);
+      item = records.getPending(id)!;
+    }
+    return { ...item, sessionAvailable: this.pendingAvailable(item) };
+  }
+
+  async restoreRecordOriginalFromZip(recordId: string, expectedRevision: number, entryId: string, archivePath: string,
+    importer: DayOneScreeningImporterPort, signal: AbortSignal = new AbortController().signal): Promise<EventRecordDetail> {
+    const workspace = this.current(), epoch = this.transientEpoch;
+    const before = workspace.records.getRecord(recordId);
+    if (!before) throw new AppError("ENTITY_NOT_FOUND", "记录不存在。");
+    if (before.source.connectorId === "dayone-zip" && before.source.entryId === entryId) return before;
+    if (before.record.revision !== expectedRevision) throw new AppError("REVISION_CONFLICT", "记录已变化，请重新核对。", true);
+    if (before.source.origin !== "manual" || before.attachments.length || before.source.connectorId) {
+      throw new AppError("INVALID_INPUT", "仅可修复旧版补充流程产生的无附件手动记录。", true);
+    }
+    const root = await this.transientDirectory("record-original-");
+    let found: NormalizedDayOneEntry | undefined, count = 0;
+    try {
+      await importer.scanArchive(archivePath, root, {
+        onIssue: async () => {}, onProgress: () => {}, onEntry: async entry => {
+          count++; found = entry;
+          if (entry.media.length) throw new AppError("INVALID_INPUT", "原日记含附件，请完整核对后恢复。", true);
+        }
+      }, signal, undefined, entry => entry.externalId === entryId);
+      throwIfAborted(signal); this.assertWorkspaceStillActive(workspace, epoch);
+      if (!found?.text || count !== 1) throw new AppError("SOURCE_UNAVAILABLE", "没有找到唯一的原日记。", true);
+      const existing = workspace.records.findRecordBySource("dayone-zip", dayOneJournalId(found), found.externalId);
+      if (existing && existing.record.id !== recordId) throw new AppError("REVISION_CONFLICT", "原日记已对应其他记录，未修改。", true);
+      const now = new Date().toISOString();
+      const restored = workspace.records.restoreRecordOriginal(recordId, expectedRevision, {
+        id: randomUUID(), recordId, origin: "zip", connectorId: "dayone-zip", journalId: dayOneJournalId(found), entryId: found.externalId,
+        sourceVersion: found.contentHash, contentHash: inputHash(found.text, []), text: found.text, recordedAt: found.creationDate, createdAt: now
+      }, now);
+      this.searchProjectionRevision++;
+      await this.refreshSearchIndexAfterCommit();
+      this.assertWorkspaceStillActive(workspace, epoch);
+      return restored;
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
+
+  async restorePendingDetailsFromZip(id: string, archivePath: string, importer: DayOneScreeningImporterPort,
+    signal: AbortSignal = new AbortController().signal): Promise<{ restored: number; detail: PendingReview }> {
+    if (!isAbsolute(archivePath)) throw new AppError("INVALID_INPUT", "请选择原 ZIP。");
+    const workspace = this.current(), epoch = this.transientEpoch;
+    const requested = this.getPending(id);
+    if (requested.text !== undefined) return { restored: 0, detail: requested };
+    const locatorOf = (item: PendingReview) => {
+      if (item.origin !== "zip" || !item.originLocator) return undefined;
+      try {
+        const value = JSON.parse(item.originLocator) as Record<string, unknown>;
+        return value.connectorId === "dayone-zip" && typeof value.journalId === "string" && typeof value.entryId === "string"
+          ? JSON.stringify([value.journalId, value.entryId]) : undefined;
+      } catch { return undefined; }
+    };
+    const requestedKey = locatorOf(requested);
+    if (!requestedKey) throw new AppError("SOURCE_UNAVAILABLE", "这条内容没有可核对的 ZIP 来源。");
+    const candidates = workspace.records.listPending().filter(item => item.text === undefined && locatorOf(item));
+    const keys = new Set(candidates.map(locatorOf));
+    const matches = new Map<string, NormalizedDayOneEntry[]>();
+    const releases: Array<() => void> = [];
+    let root: string | undefined;
+    try {
+      for (const item of candidates) releases.push(this.claimPending(item.id));
+      root = await this.transientDirectory("pending-details-");
+      await importer.scanArchive(archivePath, root, {
+        onIssue: async () => {}, onProgress: () => {},
+        onEntry: async entry => {
+          const key = JSON.stringify([dayOneJournalId(entry), entry.externalId]);
+          matches.set(key, [...(matches.get(key) ?? []), entry]);
+        }
+      }, signal, undefined, entry => keys.has(JSON.stringify([dayOneJournalId(entry), entry.externalId])));
+      throwIfAborted(signal);
+      this.assertWorkspaceStillActive(workspace, epoch);
+      const selected = matches.get(requestedKey);
+      if (!selected?.length) throw new AppError("SOURCE_UNAVAILABLE", "所选 ZIP 没有这条内容，请选择最初导入的 ZIP。", true);
+      if (selected.length !== 1) throw new AppError("IMPORT_INVALID_ARCHIVE", "ZIP 中这条内容重复，无法确定原文。", true);
+      if (selected[0]!.contentHash !== requested.sourceVersion) {
+        throw new AppError("SOURCE_UNAVAILABLE", "所选 ZIP 的内容已有变化，请选择最初导入的 ZIP。", true);
+      }
+      const updates = candidates.flatMap(item => {
+        const entries = matches.get(locatorOf(item)!);
+        const entry = entries?.length === 1 ? entries[0] : undefined;
+        return entry?.contentHash === item.sourceVersion ? [{ id: item.id, sourceVersion: item.sourceVersion,
+          text: entry.text, recordedAt: entry.creationDate,
+          attachmentNames: entry.media.map(({ fileName, identifier }) => fileName ?? identifier ?? "未命名附件") }] : [];
+      });
+      workspace.records.restorePendingDetails(updates);
+      return { restored: updates.length, detail: this.getPending(id) };
+    } finally {
+      try { if (root) await rm(root, { recursive: true, force: true }); }
+      finally { releases.forEach(release => release()); }
+    }
+  }
+
+  async restorePendingDetailsFromLegacy(id: string, source: LegacyMigrationSourcePort,
+    signal: AbortSignal = new AbortController().signal): Promise<{ restored: number; detail: PendingReview }> {
+    const workspace = this.current(), epoch = this.transientEpoch;
+    let release: (() => void) | undefined;
+    try {
+      release = this.claimPending(id);
+      const pending = this.getPending(id);
+      if (pending.text !== undefined) return { restored: 0, detail: pending };
+      let locator: { journalId: "events" | "source_items"; entryId: string };
+      try {
+        const value = JSON.parse(pending.originLocator ?? "") as Record<string, unknown>;
+        if (pending.origin !== "migration" || value.connectorId !== `legacy:${source.sourceWorkspaceId}` ||
+          (value.journalId !== "events" && value.journalId !== "source_items") || typeof value.entryId !== "string") throw new Error();
+        locator = { journalId: value.journalId, entryId: value.entryId };
+      } catch { throw new AppError("SOURCE_UNAVAILABLE", "请选择最初迁移的旧工作区。", true); }
+      const matches: LegacyMigrationEntry[] = [];
+      await source.scan(async entry => {
+        if ((entry.sourceCollection ?? "events") === locator.journalId && entry.legacyEntityId === locator.entryId) matches.push(entry);
+      }, signal, { sourceCollection: locator.journalId, legacyEntityId: locator.entryId });
+      throwIfAborted(signal); this.assertWorkspaceStillActive(workspace, epoch);
+      const entry = matches.length === 1 ? matches[0] : undefined;
+      if (!entry || entry.sourceVersion !== pending.sourceVersion) throw new AppError("SOURCE_UNAVAILABLE", "所选工作区没有这条内容的原版本。", true);
+      workspace.records.restorePendingDetails([{ id, sourceVersion: pending.sourceVersion,
+        text: entry.text, recordedAt: entry.recordedAt, attachmentNames: entry.fileNames }]);
+      return { restored: 1, detail: this.getPending(id) };
+    } finally {
+      try { await source.close(); } finally { release?.(); }
+    }
   }
 
   async resolvePending(id: string, action: "keep" | "ignore", operationId: string): Promise<ScreenAndSaveResult | null> {
@@ -1887,23 +2039,23 @@ export class RedesignService {
       const pending = workspace.records.getPending(id);
       if (!pending) throw new AppError("ENTITY_NOT_FOUND", "待确认项不存在。");
       if (action === "ignore") {
-        workspace.records.deletePending(id);
+        const unused = workspace.records.deletePending(id);
+        await Promise.all(unused.map(hash => workspace.vault.remove(hash)));
         const sessionId = this.pendingSessions.get(id);
         if (sessionId) this.sessions.delete(sessionId);
         this.pendingSessions.delete(id);
         return null;
       }
-      const session = this.sessions.get(this.pendingSessions.get(id) ?? "");
-      if (!session) throw new AppError("SOURCE_UNAVAILABLE", "原始输入会话已失效，请重新提供完整内容。");
-      const categories: EventCategory[] = pending.categories.length ? pending.categories : ["grudge"];
-      const result: ScreeningResult = {
-        decision: "include", categories, reason: `用户确认保留：${pending.reason}`,
-        anchors: [], coverage: pending.coverage, policyVersion: "user-review-v1"
-      };
-      const saved = await this.commitIncluded(session, commitOperationId, result);
-      workspace.records.deletePending(id);
-      this.pendingSessions.delete(id);
-      return saved;
+      const resumed = await this.resumePending(pending);
+      try {
+        const categories: EventCategory[] = pending.categories.length ? pending.categories : ["grudge"];
+        const result: ScreeningResult = { decision: "include", categories, reason: `用户确认保留：${pending.reason}`,
+          anchors: [], coverage: pending.coverage, policyVersion: "user-review-v2" };
+        const saved = await this.commitIncluded(resumed.session, commitOperationId, result);
+        workspace.records.deletePending(id);
+        this.pendingSessions.delete(id);
+        return saved;
+      } finally { await resumed.dispose(); }
     } finally {
       release();
     }
@@ -1913,32 +2065,27 @@ export class RedesignService {
     id: string, sessionId: string, screening: ScreeningPort, signal?: AbortSignal
   ): Promise<ScreenAndSaveResult> {
     const release = this.claimPending(id);
+    let resumed: Awaited<ReturnType<RedesignService["resumePending"]>> | undefined;
     try {
       const workspace = this.current();
       const operationId = deterministicUuid(`pending-manual-rescreen:${id}:${sessionId}`);
-      const previousResult = workspace.records.findOperation(manualIntakeOperationId(sessionId, operationId));
-      if (previousResult) {
-        if (workspace.records.getPending(id)) workspace.records.deletePending(id);
-        this.pendingSessions.delete(id);
-        return previousResult;
-      }
+      const previousResult = workspace.records.findOperation(operationId)
+        ?? workspace.records.findOperation(manualIntakeOperationId(sessionId, operationId));
+      if (previousResult) return previousResult;
       const pending = workspace.records.getPending(id);
-      if (!pending || !["manual", "migration", "zip", "dayone"].includes(pending.origin)) {
-        throw new AppError("ENTITY_NOT_FOUND", "请选择一条可重新提供完整内容的待确认项。");
-      }
-      const session = this.requireSession(sessionId);
-      if (session.origin !== "manual") throw new AppError("INVALID_INPUT", "请重新提供完整的手动输入。", true);
-      const oldSessionId = this.pendingSessions.get(id);
-      const result = await this.screenAndSave(sessionId, operationId, screening, signal);
+      if (!pending) throw new AppError("ENTITY_NOT_FOUND", "待确认项不存在。");
+      const addition = this.requireSession(sessionId);
+      if (addition.origin !== "manual") throw new AppError("INVALID_INPUT", "请填写本次补充。", true);
+      resumed = await this.resumePending(pending, addition, signal);
+      const result = await this.screenAndSave(resumed.session.id, operationId, screening, signal, sessionId);
       if (result.kind !== "failed") {
-        workspace.records.deletePending(id);
+        const unused = workspace.records.deletePending(id);
+        await Promise.all(unused.map(hash => workspace.vault.remove(hash)));
+        this.abandonDraft(sessionId);
         this.pendingSessions.delete(id);
-        if (oldSessionId && oldSessionId !== sessionId) this.sessions.delete(oldSessionId);
       }
       return result;
-    } finally {
-      release();
-    }
+    } finally { try { await resumed?.dispose(); } finally { release(); } }
   }
 
   async resolvePendingFromDayOneZip(
@@ -2371,6 +2518,7 @@ export class RedesignService {
                 entryId: entry.legacyEntityId
               }), sourceVersion: entry.sourceVersion,
               excerpt: truncateCodePoints(entry.text || entry.title || "旧记录的媒体无法完整检查", EXCERPT_LIMIT),
+              text: entry.text, recordedAt: entry.recordedAt, attachmentNames: entry.fileNames.length ? entry.fileNames : entry.paths.map(path => basename(path)),
               reason: "旧记录含无法完整检查或安全迁移的内容，需要重新提供原件后人工确认。",
               categories: [], coverage: "partial", sessionAvailable: false, createdAt: now, updatedAt: now
             }, operationId);
@@ -2438,6 +2586,94 @@ export class RedesignService {
     return this.current().records.failReport(recordId, expectedRevision, errorCode, new Date().toISOString());
   }
 
+  private pendingAvailable(item: PendingReview): boolean {
+    return this.sessions.has(this.pendingSessions.get(item.id) ?? "") || (item.text !== undefined && (Boolean(item.text.trim()) || Boolean(this.current().records.getPendingInput(item.id)?.media.length)) && codePointLength(item.text) <= RECORD_TEXT_LIMIT &&
+      (Boolean(this.current().records.getPendingInput(item.id)) || !item.attachmentNames?.length));
+  }
+
+  private async retainPending(session: IntakeSession, item: PendingReview, operationId: string, signal?: AbortSignal): Promise<PendingReview> {
+    const workspace = this.current();
+    const media: RetainedPendingInput["media"] = [];
+    const newlyStored: string[] = [];
+    try {
+      for (const source of session.media) {
+        throwIfAborted(signal); this.assertDraftStillActive(session);
+        const stored = source.bytes
+          ? await workspace.vault.putStream(Readable.from([Buffer.from(source.bytes)]), workspace.keyRing ?? workspace.key, source.byteSize)
+          : await workspace.vault.put(source.path!, workspace.keyRing ?? workspace.key);
+        if (!stored.deduplicated) newlyStored.push(stored.sha256);
+        if (stored.sha256 !== session.verifiedMediaHashes?.get(source.id) || stored.byteSize !== source.byteSize) {
+          throw new AppError("SOURCE_UNAVAILABLE", "附件已变化，本次内容尚未保存。", true);
+        }
+        media.push({ id: source.id, kind: source.kind, asset: {
+          id: workspace.assets.findBySha256(stored.sha256)?.id ?? randomUUID(), sha256: stored.sha256,
+          byteSize: stored.byteSize, mimeType: source.mimeType, originalFileName: source.fileName,
+          vaultFormat: stored.vaultFormat, integrityStatus: "pending", availabilityStatus: "available", createdAt: item.createdAt
+        } });
+      }
+      throwIfAborted(signal); this.assertDraftStillActive(session);
+      return workspace.records.createPending(item, operationId, { media, incompleteMedia: session.incompleteMedia,
+        ...(session.legacyMigration ? { legacyMigration: session.legacyMigration } : {}),
+        ...(session.originalText !== undefined ? { originalText: session.originalText } : {}),
+        ...(session.supplements ? { supplements: session.supplements } : {}) });
+    } catch (error) {
+      await Promise.all(newlyStored.filter(hash => !workspace.assets.findBySha256(hash)).map(hash => workspace.vault.remove(hash)));
+      throw error;
+    }
+  }
+
+  private async resumePending(pending: PendingReview, addition?: IntakeSession, signal?: AbortSignal): Promise<{ session: IntakeSession; dispose(): Promise<void> }> {
+    const workspace = this.current(), epoch = this.transientEpoch;
+    if (pending.text === undefined) throw new AppError("SOURCE_UNAVAILABLE", "这条旧记录缺少原文，请先补全原文。", true);
+    const input = workspace.records.getPendingInput(pending.id);
+    if (!input && pending.attachmentNames?.length) throw new AppError("SOURCE_UNAVAILABLE", "这条旧记录的附件尚未保存在本地，请补全原附件。", true);
+    let root: string | undefined, sessionId: string | undefined;
+    try {
+      const paths: string[] = [], names: string[] = [];
+      for (const { asset } of input?.media ?? []) {
+        root ??= await this.transientDirectory("pending-local-");
+        const path = join(root, `${paths.length}${extname(asset.originalFileName)}`);
+        await pipeline(await workspace.vault.open(asset.sha256, workspace.keyRing ?? workspace.key), createWriteStream(path, { flags: "wx", mode: 0o600 }), { signal });
+        if (await fileHash(path, asset.byteSize, signal) !== asset.sha256) throw new AppError("SOURCE_UNAVAILABLE", "本地原附件未通过校验。", true);
+        paths.push(path); names.push(asset.originalFileName);
+      }
+      const originalText = input?.originalText ?? pending.text;
+      const supplements = [...(input?.supplements ?? []), ...(addition?.text.trim() ? [addition.text] : [])];
+      const text = [originalText, ...supplements.map(value => `【补充】\n${value}`)].filter(Boolean).join("\n\n");
+      const inlineMedia: InlineImageInput[] = [];
+      for (const media of addition?.media ?? []) {
+        if (media.path) { paths.push(media.path); names.push(media.fileName); }
+        else inlineMedia.push({ fileName: media.fileName, mimeType: media.mimeType, bytes: media.bytes! });
+      }
+      let sourceLocator: IntakeSession["sourceLocator"];
+      if (pending.originLocator) {
+        try {
+          const parsed = JSON.parse(pending.originLocator) as Record<string, unknown>;
+          if ([parsed.connectorId, parsed.journalId, parsed.entryId].every(value => typeof value === "string" && value)) {
+            sourceLocator = parsed as IntakeSession["sourceLocator"];
+          }
+        } catch { /* Older records may not have structured provenance. */ }
+      }
+      const prepared = await this.prepareDraft({ text, paths, fileNames: names, inlineMedia, origin: pending.origin,
+        sourceVersion: addition ? createHash("sha256").update(pending.sourceVersion).update(text).update(addition.sourceVersion).digest("hex") : pending.sourceVersion,
+        ...(sourceLocator ? { sourceLocator } : {}), sourceRecordedAt: pending.recordedAt ?? pending.createdAt,
+        incompleteMedia: input?.incompleteMedia ?? false,
+        ...(input?.legacyMigration ? { legacyMigration: input.legacyMigration } : {}) }, signal);
+      sessionId = prepared.sessionId;
+      const session = this.requireSession(sessionId);
+      session.originalText = originalText; session.supplements = supplements;
+      session.verifiedMediaHashes = new Map();
+      for (const media of session.media) session.verifiedMediaHashes.set(media.id, await transientMediaHash(media, signal));
+      if (epoch !== this.transientEpoch || this.current().records !== workspace.records) throw new AppError("SOURCE_UNAVAILABLE", "账本已切换，请重新打开这条待确认。", true);
+      const ownedRoot = root, ownedSession = sessionId;
+      return { session, dispose: async () => { this.abandonDraft(ownedSession); if (ownedRoot) await rm(ownedRoot, { recursive: true, force: true }); } };
+    } catch (error) {
+      if (sessionId) this.abandonDraft(sessionId);
+      if (root) await rm(root, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
   private async commitIncluded(
     session: IntakeSession, operationId: string, screening: ScreeningResult, signal?: AbortSignal
   ): Promise<ScreenAndSaveResult> {
@@ -2491,7 +2727,7 @@ export class RedesignService {
       const record: EventRecord = {
         id, origin: session.origin, categories: screening.categories,
         title: session.legacyMigration?.projectedTitle || titleFrom(session),
-        summary: truncateCodePoints(session.text.trim() || screening.reason, 180), revision: 1,
+        summary: truncateCodePoints(session.text.trim() || screening.reason, 180), revision: session.supplements?.length ? 2 : 1,
         // A date mentioned in the source may concern a contract, citation or another event.
         // Only a contextual report or explicit user field may supply new occurrence time.
         occurredAt: session.legacyMigration?.projectedOccurredAt ?? { kind: "unknown" },
@@ -2502,23 +2738,30 @@ export class RedesignService {
       };
       const source: RetainedSource = {
         id: randomUUID(), recordId: id, origin: session.origin, sourceVersion: session.sourceVersion,
-        contentHash: inputHash(session.text, attachments),
+        contentHash: inputHash(session.originalText ?? session.text, attachments),
         ...(session.sourceLocator ?? {}),
-        ...(session.text ? { text: session.text } : {}),
+        ...((session.originalText ?? session.text) ? { text: session.originalText ?? session.text } : {}),
         recordedAt: session.sourceRecordedAt ?? session.createdAt, createdAt: now
       };
       const retainedScreening: ScreeningResult = {
         ...screening,
-        anchors: screening.anchors.map(({ temporaryMediaRef, ...anchor }) => ({
-          ...anchor,
-          ...(temporaryMediaRef ? { assetId: assetIdByTemporaryRef.get(temporaryMediaRef)! } : {})
-        }))
+        anchors: screening.anchors.flatMap(({ temporaryMediaRef, textRange: inputRange, ...anchor }) => {
+          // Supplement offsets refer to the combined screening input, not the retained original.
+          const textRange = inputRange && inputRange[1] <= codePointLength(source.text ?? "") ? inputRange : undefined;
+          if (inputRange && !textRange && !temporaryMediaRef) return [];
+          return [{ ...anchor, ...(textRange ? { textRange } : {}), ...(temporaryMediaRef ? { assetId: assetIdByTemporaryRef.get(temporaryMediaRef)! } : {}) }];
+        })
       };
       throwIfAborted(signal);
       this.assertDraftStillActive(session);
       committed = workspace.records.commitRecord({
         operationId, record, source, attachments, screening: retainedScreening,
         analysisJob: { id: randomUUID(), createdAt: now },
+        ...(session.supplements?.length ? { clarifications: session.supplements.flatMap((response, supplementIndex) => {
+          const parts = response.match(/[\s\S]{1,1000}/gu) ?? [];
+          return parts.map((part, partIndex) => ({ kind: "unknown" as const,
+            topic: `补充经过 ${supplementIndex + 1}${parts.length > 1 ? ` · ${partIndex + 1}` : ""}`, response: part }));
+        }) } : {}),
         ...(session.legacyMigration ? { legacyMigration: session.legacyMigration } : {})
       });
       this.searchProjectionRevision += 1;
@@ -2631,6 +2874,7 @@ export class RedesignService {
     records.createPending({
       id: randomUUID(), origin: "zip", originLocator: JSON.stringify(locator), sourceVersion: entry.contentHash,
       excerpt: truncateCodePoints(entry.text || "仅含当前无法检查的媒体", EXCERPT_LIMIT),
+      text: entry.text, recordedAt: entry.creationDate, attachmentNames: entry.media.map(({ fileName, identifier }) => fileName ?? identifier ?? "未命名附件"),
       reason: "来源内容或媒体未能完整检查，需要重新提供可检查的原件。", categories: [], coverage: "partial",
       sessionAvailable: false, createdAt: now, updatedAt: now
     }, operationId);

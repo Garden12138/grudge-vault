@@ -57,7 +57,7 @@ function occurrenceLabel(record: RecordTime, timeZone?: string): string {
   if (time.kind === "date" || time.kind === "month") return time.value;
   if (time.kind === "range") return rangeLabel(time) ?? "时间范围待补充";
   if (time.kind === "relative") return time.text;
-  return `${dateLabel(record.recordedAt, timeZone)} · 记录日期`;
+  return "时间待补充";
 }
 
 export function occurrenceTimeLabel(record: RecordTime, timeZone?: string): string {
@@ -67,23 +67,16 @@ export function occurrenceTimeLabel(record: RecordTime, timeZone?: string): stri
 }
 
 export function temporalLabel(record: RecordTime, timeZone?: string): string {
-  const label = occurrenceTimeLabel(record, timeZone);
-  const zone = recordTimeZone(timeZone);
-  const fallback = zone && projectRecordDate(record, zone)?.basis === "recorded" && record.occurredAt.kind !== "unknown";
-  return `${label}${fallback ? ` · ${dateLabel(record.recordedAt, timeZone)} · 记录日期` : ""}`;
+  return occurrenceTimeLabel(record, timeZone);
 }
 
 export function timelineGroupLabel(record: RecordTime, timeZone?: string): string {
   const time = record.occurredAt;
   const zone = recordTimeZone(timeZone);
-  const fallback = zone && projectRecordDate(record, zone)?.basis === "recorded";
-  const recorded = `${dateLabel(record.recordedAt, timeZone)} · 记录日期`;
+  if (!zone || projectRecordDate(record, zone)?.basis !== "occurred") return "时间待补充";
   const precision = record.occurredAtPrecision === "approximate" ? "（大约时间）" : "";
-  if (time.kind === "instant" || time.kind === "date") return fallback ? recorded : `${dateLabel(time.value, timeZone)}${precision}`;
-  if (time.kind === "month") return fallback ? recorded : `${time.value}${precision}`;
-  if (time.kind === "range") {
-    const label = rangeLabel(time);
-    if (label) return `${label} · 时间范围${fallback ? ` · ${recorded}` : ""}`;
-  }
-  return recorded;
+  if (time.kind === "instant" || time.kind === "date") return `${dateLabel(time.value, timeZone)}${precision}`;
+  if (time.kind === "month") return `${time.value}${precision}`;
+  if (time.kind === "range") return `${rangeLabel(time)} · 时间范围`;
+  return "时间待补充";
 }

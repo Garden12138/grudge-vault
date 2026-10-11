@@ -14,7 +14,6 @@ export function reportContentSearchText(content: AnalysisReportContent, options:
     ...content.unknowns, ...content.disputes, ...(content.speculations ?? []), ...content.suggestions,
     ...content.legalIssues,
     ...content.citations.flatMap((citation) => [citation.title, citation.publisher, citation.jurisdiction,
-      citation.effectiveInfo ?? "", citation.supportingExcerpt, citation.url, citation.retrievedAt]),
-    ...content.coverageNotes
+      citation.effectiveInfo ?? "", citation.supportingExcerpt, citation.url, citation.retrievedAt])
   ].filter((text) => text.trim()).join("\n");
 }

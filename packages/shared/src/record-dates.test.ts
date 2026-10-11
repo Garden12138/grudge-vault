@@ -36,17 +36,17 @@ describe("record calendar intervals", () => {
     expect(matches({ kind: "range", from: "很久以前", to: "2026-09-20" }, "2026-08-01")).toBe(true);
     expect(matches({ kind: "range", from: "2026-09-10", to: "待补充" }, "2026-09-09")).toBe(false);
   });
-  it("falls back to the recorded date for unknown, relative and wholly unparseable times", () => {
+  it("keeps unknown, relative and wholly unparseable occurrence times out of date filters", () => {
     for (const time of [{ kind: "unknown" }, { kind: "relative", text: "几年前" }, { kind: "range" },
       { kind: "range", from: "很久以前", to: "后来" }, { kind: "date", value: "2026-02-30" }] as const) {
-      expect(project(time).basis).toBe("recorded");
-      expect(matches(time, "2026-11-03")).toBe(true);
+      expect(project(time).basis).toBe("unknown");
+      expect(matches(time, "2026-11-03")).toBe(false);
       expect(matches(time, "2026-09-15")).toBe(false);
     }
   });
   it("does not reverse contradictory bounds or invent an interval between them", () => {
-    expect(project({ kind: "range", from: "2026-10", to: "2026-09" }).basis).toBe("recorded");
-    expect(project({ kind: "range", from: "2026-09-10T10:00:00Z", to: "2026-09-10T09:00:00Z" }).basis).toBe("recorded");
+    expect(project({ kind: "range", from: "2026-10", to: "2026-09" }).basis).toBe("unknown");
+    expect(project({ kind: "range", from: "2026-09-10T10:00:00Z", to: "2026-09-10T09:00:00Z" }).basis).toBe("unknown");
   });
   it("keeps calendar dates and months invariant in western and eastern zones", () => {
     for (const zone of ["America/Los_Angeles", "Asia/Shanghai", "UTC"]) {
@@ -59,7 +59,7 @@ describe("record calendar intervals", () => {
     expect(matches(time, "2026-09-19", undefined, "America/Los_Angeles")).toBe(true);
     expect(matches(time, "2026-09-20", undefined, "America/Los_Angeles")).toBe(false);
     expect(matches(time, "2026-09-20", undefined, "Asia/Shanghai")).toBe(true);
-    expect(matches({ kind: "unknown" }, "2026-11-02", undefined, "America/Los_Angeles")).toBe(true);
+    expect(matches({ kind: "unknown" }, "2026-11-02", undefined, "America/Los_Angeles")).toBe(false);
   });
   it("normalizes offset-equivalent instants for sorting", () => {
     expect(project({ kind: "instant", value: "2026-09-20T00:30:00Z" }).sortKey)
@@ -90,8 +90,8 @@ describe("record calendar intervals", () => {
     expect(recordTimeZone("Etc/UTC")).toBe(recordTimeZone("UTC"));
   });
   it("does not infer timezone-less clock values or roll invalid calendar dates", () => {
-    expect(project({ kind: "instant", value: "2026-09-20T10:00:00" }).basis).toBe("recorded");
+    expect(project({ kind: "instant", value: "2026-09-20T10:00:00" }).basis).toBe("unknown");
     expect(project({ kind: "range", from: "2026-02-30T00:00:00Z", to: "2026-03-01" }).lowerDay).toBeUndefined();
-    expect(projectRecordDate({ occurredAt: { kind: "unknown" }, recordedAt: "invalid" }, "UTC")).toBeUndefined();
+    expect(projectRecordDate({ occurredAt: { kind: "unknown" }, recordedAt: "invalid" }, "UTC")?.basis).toBe("unknown");
   });
 });

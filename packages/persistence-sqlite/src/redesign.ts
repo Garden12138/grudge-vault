@@ -19,8 +19,8 @@ import type {
   TimelineFilter,
   TimelinePage
 } from "@grudge-vault/domain";
-import type { RecordCommitInput, RecordRepositoryPort, VaultKey } from "@grudge-vault/application";
-import { AppError, findCaseInsensitiveTextRange, projectRecordDate, projectRecordOccurrence, resolveRecordDateFilter,
+import type { RecordCommitInput, RecordRepositoryPort, RetainedPendingInput, VaultKey } from "@grudge-vault/application";
+import { AppError, codePointLength, findCaseInsensitiveTextRange, projectRecordDate, projectRecordOccurrence, resolveRecordDateFilter,
   reportContentSearchText, type RecordOccurrenceProjection } from "@grudge-vault/shared";
 
 function json<T>(value: unknown): T { return JSON.parse(String(value)) as T; }
@@ -90,7 +90,7 @@ function mapOverride(row: Record<string, unknown>): FieldOverride {
   return value;
 }
 
-type PendingSensitive = Pick<PendingReview, "originLocator" | "excerpt" | "reason" | "categories">;
+type PendingSensitive = Pick<PendingReview, "originLocator" | "excerpt" | "reason" | "categories" | "text" | "recordedAt" | "attachmentNames"> & { input?: RetainedPendingInput };
 
 function pendingSensitive(row: Record<string, unknown>): PendingSensitive {
   return {
@@ -177,8 +177,9 @@ function reportSearchText(report: AnalysisReport | undefined): string {
 
 const RECORD_SORT_AT_SQL = "json_extract(r.date_projection_json, '$.sortKey')";
 const CURRENT_REPORT_TIME_SQL = `(SELECT json_extract(p.content_json, '$.time') FROM redesign_reports p
-  WHERE p.record_id = r.id AND p.record_revision = r.revision AND p.state IN ('complete', 'partial')
-  ORDER BY (p.state = 'complete') DESC, p.updated_at DESC, p.rowid DESC LIMIT 1)`;
+  WHERE p.record_id = r.id AND p.record_revision <= r.revision AND p.state IN ('complete', 'partial')
+  AND p.created_at >= (SELECT s.created_at FROM redesign_sources s WHERE s.record_id = r.id ORDER BY s.created_at DESC, s.rowid DESC LIMIT 1)
+  ORDER BY p.record_revision DESC, (p.state = 'complete') DESC, p.updated_at DESC, p.rowid DESC LIMIT 1)`;
 const USER_TIME_SQL = "EXISTS (SELECT 1 FROM redesign_field_overrides o WHERE o.record_id = r.id AND o.field_key = 'occurredAt')";
 const OCCURRENCE_SQL = `gv_record_occurrence(r.occurred_at_json, ${CURRENT_REPORT_TIME_SQL}, ${USER_TIME_SQL})`;
 
@@ -222,6 +223,7 @@ export class SqliteRecordRepository implements RecordRepositoryPort {
     if (filter.category) { conditions.push("EXISTS (SELECT 1 FROM json_each(r.categories_json) WHERE value = ?)"); values.push(filter.category); }
     const dateConditions: string[] = [];
     const dateValues: unknown[] = [];
+    if (dates.fromDay !== undefined || dates.toDay !== undefined) dateConditions.push("json_extract(r.date_projection_json, '$.basis') != 'unknown'");
     if (dates.fromDay !== undefined) {
       dateConditions.push("(json_extract(r.date_projection_json, '$.upperDay') IS NULL OR json_extract(r.date_projection_json, '$.upperDay') >= ?)");
       dateValues.push(dates.fromDay);
@@ -250,7 +252,7 @@ export class SqliteRecordRepository implements RecordRepositoryPort {
   }
 
   ensureKeywordProjection(): void {
-    const key = "redesign.keyword-projection-v2";
+    const key = "redesign.keyword-projection-v3";
     const current = this.database.prepare("SELECT value_json FROM workspace_settings WHERE key = ?").get(key) as
       { value_json: string } | undefined;
     if (current?.value_json === "2") return;
@@ -315,6 +317,9 @@ export class SqliteRecordRepository implements RecordRepositoryPort {
       id: String(row.id), origin: row.origin as PendingReview["origin"],
       ...(sensitive.originLocator ? { originLocator: sensitive.originLocator } : {}),
       sourceVersion: String(row.source_version), excerpt: sensitive.excerpt, reason: sensitive.reason,
+      ...(typeof sensitive.text === "string" ? { text: sensitive.text } : {}),
+      ...(sensitive.recordedAt ? { recordedAt: sensitive.recordedAt } : {}),
+      ...(sensitive.attachmentNames ? { attachmentNames: sensitive.attachmentNames } : {}),
       categories: sensitive.categories, coverage: row.coverage as PendingReview["coverage"],
       sessionAvailable: false, createdAt: String(row.created_at), updatedAt: String(row.updated_at)
     };
@@ -422,10 +427,12 @@ export class SqliteRecordRepository implements RecordRepositoryPort {
           candidate.availabilityStatus, candidate.supersededByAssetId ?? null, candidate.deletedAt ?? null, candidate.createdAt);
         const stored = this.database.prepare("SELECT id FROM assets WHERE sha256 = ?").get(candidate.sha256) as { id: string };
         storedAssetIds.set(candidate.id, stored.id);
+        this.database.prepare("UPDATE assets SET original_file_name = ? WHERE id = ? AND original_file_name = '待确认附件'")
+          .run(candidate.originalFileName, stored.id);
         this.database.prepare(`
           INSERT INTO redesign_record_assets(record_id, source_id, asset_id) VALUES (?, ?, ?) ON CONFLICT DO NOTHING
         `).run(recordId, input.source.id, stored.id);
-        if (inserted.changes === 1) {
+        if (inserted.changes === 1 || !this.database.prepare("SELECT 1 FROM jobs WHERE type = 'asset.verify' AND json_extract(payload_json, '$.assetId') = ?").get(stored.id)) {
           this.database.prepare(`
             INSERT INTO jobs(id, type, payload_json, state, progress, attempts, max_attempts, available_at, lease_until, last_error, created_at, updated_at)
             VALUES (?, 'asset.verify', ?, 'queued', 0, 0, 3, ?, NULL, NULL, ?, ?)
@@ -471,6 +478,15 @@ export class SqliteRecordRepository implements RecordRepositoryPort {
             legacy.actor, legacy.reason, legacy.createdAt);
         }
       }
+      if (input.clarifications?.length) {
+        const priorValue = this.database.prepare("SELECT value_json FROM redesign_field_overrides WHERE record_id = ? AND field_key = 'clarifications'")
+          .get(recordId) as { value_json: string } | undefined;
+        const values = [...(priorValue ? json<unknown[]>(priorValue.value_json) : []), ...input.clarifications];
+        this.database.prepare(`INSERT INTO redesign_field_overrides(id, record_id, field_key, value_json, actor, revision, created_at, updated_at)
+          VALUES (?, ?, 'clarifications', ?, 'user', ?, ?, ?) ON CONFLICT(record_id, field_key) DO UPDATE SET
+          value_json = excluded.value_json, revision = excluded.revision, updated_at = excluded.updated_at`)
+          .run(randomUUID(), recordId, JSON.stringify(values), revision, input.record.createdAt, input.record.createdAt);
+      }
       this.reindex(recordId);
       this.saveRevision(
         recordId,
@@ -483,7 +499,35 @@ export class SqliteRecordRepository implements RecordRepositoryPort {
     })();
   }
 
-  createPending(item: PendingReview, operationId: string): PendingReview {
+  restoreRecordOriginal(recordId: string, expectedRevision: number, source: RetainedSource, now: string): EventRecordDetail {
+    return this.database.transaction(() => {
+      const current = this.getRecordRequired(recordId);
+      if (current.record.revision !== expectedRevision) throw new AppError("REVISION_CONFLICT", "记录已变化，请重新核对。", true);
+      if (current.source.origin !== "manual" || current.attachments.length || current.source.connectorId || source.recordId !== recordId || !source.text?.trim()) {
+        throw new AppError("INVALID_INPUT", "当前记录不符合原文修复条件。", true);
+      }
+      const revision = expectedRevision + 1;
+      const prior = current.overrides.find(item => item.fieldKey === "clarifications")?.value;
+      const clarifications = [...(Array.isArray(prior) ? prior : []), ...(current.source.text ? [{ kind: "unknown", topic: "先前补充", response: current.source.text }] : [])];
+      if (clarifications.length > 100 || clarifications.reduce((total, item) => total + codePointLength(JSON.stringify(item)), 0) > 50_000) {
+        throw new AppError("INVALID_INPUT", "补充内容过多，请先整理后再修复。", true);
+      }
+      this.database.prepare(`INSERT INTO redesign_sources(id, record_id, origin, connector_id, journal_id, entry_id, source_version,
+        content_hash, text, recorded_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(source.id, recordId, source.origin, source.connectorId, source.journalId, source.entryId, source.sourceVersion,
+          source.contentHash, source.text, source.recordedAt, source.createdAt);
+      this.database.prepare(`UPDATE redesign_records SET origin = ?, recorded_at = ?, revision = ?, report_state = 'stale', updated_at = ? WHERE id = ?`)
+        .run(source.origin, source.recordedAt, revision, now, recordId);
+      this.database.prepare(`INSERT INTO redesign_field_overrides(id, record_id, field_key, value_json, actor, revision, created_at, updated_at)
+        VALUES (?, ?, 'clarifications', ?, 'user', ?, ?, ?) ON CONFLICT(record_id, field_key) DO UPDATE SET
+        value_json = excluded.value_json, revision = excluded.revision, updated_at = excluded.updated_at`)
+        .run(randomUUID(), recordId, JSON.stringify(clarifications), revision, now, now);
+      this.reindex(recordId); this.saveRevision(recordId, revision, "user", "补回旧版补充流程遗漏的原文", now);
+      return this.getRecordRequired(recordId);
+    })();
+  }
+
+  createPending(item: PendingReview, operationId: string, input?: RetainedPendingInput): PendingReview {
     return this.database.transaction(() => {
       const existing = this.findOperation(operationId);
       if (existing?.kind === "needs_review") return this.getPendingRequired(existing.pendingId);
@@ -494,7 +538,16 @@ export class SqliteRecordRepository implements RecordRepositoryPort {
           sealed_payload
         ) VALUES (?, ?, NULL, ?, '', '', '[]', ?, ?, ?, ?)
       `).run(item.id, item.origin, item.sourceVersion, item.coverage, item.createdAt, item.updatedAt,
-        sealPending(item.id, item, this.getPendingKey()));
+        sealPending(item.id, { ...item, ...(input ? { input } : {}) }, this.getPendingKey()));
+      for (const { asset } of input?.media ?? []) {
+        // Names and other source metadata remain inside the encrypted pending payload.
+        this.database.prepare(`INSERT INTO assets(id, sha256, byte_size, mime_type, original_file_name,
+          vault_format, integrity_status, availability_status, created_at)
+          VALUES (?, ?, ?, ?, '待确认附件', ?, 'pending', 'available', ?) ON CONFLICT(sha256) DO NOTHING`)
+          .run(asset.id, asset.sha256, asset.byteSize, asset.mimeType, asset.vaultFormat, asset.createdAt);
+        this.database.prepare(`INSERT INTO redesign_pending_assets(pending_id, asset_id)
+          SELECT ?, id FROM assets WHERE sha256 = ? ON CONFLICT DO NOTHING`).run(item.id, asset.sha256);
+      }
       const result: ScreenAndSaveResult = { kind: "needs_review", pendingId: item.id };
       this.database.prepare("INSERT INTO redesign_operations(operation_id, result_json, entity_id, created_at) VALUES (?, ?, ?, ?)")
         .run(operationId, JSON.stringify(result), item.id, item.createdAt);
@@ -512,11 +565,46 @@ export class SqliteRecordRepository implements RecordRepositoryPort {
     return row ? this.mapPending(row) : undefined;
   }
 
-  deletePending(id: string): void {
+  getPendingInput(id: string): RetainedPendingInput | undefined {
+    const row = this.database.prepare("SELECT sealed_payload FROM redesign_pending_reviews WHERE id = ?").get(id) as { sealed_payload: string } | undefined;
+    return row ? openPending(id, row.sealed_payload, this.getPendingKey()).input : undefined;
+  }
+
+  restorePendingDetails(items: Array<Pick<PendingReview, "id" | "sourceVersion" | "recordedAt" | "attachmentNames"> & { text: string }>): void {
     this.database.transaction(() => {
+      for (const update of items) {
+        const item = this.getPending(update.id);
+        if (!item || item.sourceVersion !== update.sourceVersion || item.text !== undefined) {
+          throw new AppError("REVISION_CONFLICT", "待确认内容已变化，请重新打开详情。", true);
+        }
+        const input = this.getPendingInput(item.id);
+        this.database.prepare("UPDATE redesign_pending_reviews SET sealed_payload = ? WHERE id = ?")
+          .run(sealPending(item.id, { ...item, ...update, ...(input ? { input } : {}) }, this.getPendingKey()), item.id);
+      }
+    })();
+  }
+
+  deletePending(id: string): string[] {
+    return this.database.transaction(() => {
+      const candidates = this.database.prepare(`SELECT a.id, a.sha256 FROM assets a
+        JOIN redesign_pending_assets p ON p.asset_id = a.id WHERE p.pending_id = ?
+        AND a.original_file_name = '待确认附件'`).all(id) as Array<{ id: string; sha256: string }>;
       this.database.prepare("DELETE FROM redesign_operations WHERE entity_id = ?").run(id);
       const deleted = this.database.prepare("DELETE FROM redesign_pending_reviews WHERE id = ?").run(id);
       if (deleted.changes !== 1) throw new AppError("ENTITY_NOT_FOUND", "待确认项不存在。");
+      const removed: string[] = [];
+      if (!candidates.length) return removed;
+      const quote = (value: string) => `"${value.replaceAll('"', '""')}"`;
+      const tables = this.database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>;
+      const references = tables.flatMap(({ name }) => (this.database.prepare(`PRAGMA foreign_key_list(${quote(name)})`).all() as Array<{ table: string; from: string }> )
+        .filter(fk => fk.table === "assets").map(fk => ({ table: name, column: fk.from })));
+      for (const asset of candidates) {
+        const referenced = references.some(ref => this.database.prepare(`SELECT 1 FROM ${quote(ref.table)} WHERE ${quote(ref.column)} = ? LIMIT 1`).get(asset.id));
+        if (referenced) continue;
+        this.database.prepare("DELETE FROM assets WHERE id = ?").run(asset.id);
+        removed.push(asset.sha256);
+      }
+      return removed;
     })();
   }
 

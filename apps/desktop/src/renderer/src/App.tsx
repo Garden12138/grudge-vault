@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import type {
   Asset, EventCategory, EventRecord, EventRecordDetail, PendingReview,
   RecordOrigin, RecordSearchHit, RecordSearchPage, RecordSearchQuery, ReportClarification, SourceAnchor, TimelineFilter,
-  WorkspaceSecuritySettings, TemporalValue
+  WorkspaceSecuritySettings
 } from "@grudge-vault/domain";
 import { codePointLength, RECORD_QUERY_TEXT_LIMIT } from "@grudge-vault/shared";
 import { mediaAnchorSeek } from "./media-anchor";
@@ -24,7 +24,8 @@ import { ReportField, ReportPeopleField, ReportTimeField } from "./report-fields
 import { CitationCard } from "./legal-citation";
 import { occurrenceTimeLabel, recordTimeSourceLabel, temporalLabel } from "./record-time";
 import { searchCoverageMessage, searchIndexIncomplete } from "./search-coverage";
-import { RecordTimeEditor } from "./record-time-editor";
+import { RecordSupplementDialog } from "./RecordSupplementDialog";
+import { PendingReviewDetails } from "./PendingReviewDetails";
 import { WorkspaceLanding } from "./WorkspaceLanding";
 import { WorkspacePasswordSettings } from "./WorkspacePasswordSettings";
 import { TimelineRail, RecordStatus } from "./TimelineRail";
@@ -166,23 +167,16 @@ export function RecordDetail({ detail, onBack, onReload, sourceAnchor, refreshEr
 }) {
   const [tab, setTab] = useState<"report" | "source">(sourceAnchor ? recordAnchorTab(sourceAnchor) : "report");
   const [activeAnchor, setActiveAnchor] = useState<SourceAnchor | undefined>(sourceAnchor);
-  const [editField, setEditField] = useState<"title" | "occurredAt" | "location" | "jurisdiction" | null>(null);
-  const [editValue, setEditValue] = useState("");
+  const [showSupplement, setShowSupplement] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [defaultJurisdiction, setDefaultJurisdiction] = useState("中国大陆");
   const [activeAnalysisJobId, setActiveAnalysisJobId] = useState<string>();
   const [analysisProgress, setAnalysisProgress] = useState<number>();
-  const [clarificationEditor, setClarificationEditor] = useState<{ kind: ReportClarification["kind"]; topic: string }>();
-  const [clarificationValue, setClarificationValue] = useState("");
   const { record, report } = detail;
   const reportMatchesCurrentRevision = report?.recordRevision === record.revision;
   useEffect(() => {
     if (sourceAnchor) { setActiveAnchor(sourceAnchor); setTab(recordAnchorTab(sourceAnchor)); }
   }, [sourceAnchor]);
-  useEffect(() => { void window.grudgeVault.legal.getDefaultJurisdiction().then((result) => {
-    if (result.ok) setDefaultJurisdiction(result.data);
-  }); }, []);
   useEffect(() => {
     if (record.reportState !== "queued" && record.reportState !== "running") {
       setActiveAnalysisJobId(undefined);
@@ -206,37 +200,11 @@ export function RecordDetail({ detail, onBack, onReload, sourceAnchor, refreshEr
     return () => { disposed = true; unsubscribe(); };
   }, [record.id, record.revision, record.reportState]);
   const locationOverride = detail.overrides.find(({ fieldKey }) => fieldKey === "location");
-  const jurisdictionOverride = detail.overrides.find(({ fieldKey }) => fieldKey === "jurisdiction");
   const occurredAtOverride = detail.overrides.find(({ fieldKey }) => fieldKey === "occurredAt");
   const clarifications = reportClarifications(detail.overrides.find(({ fieldKey }) => fieldKey === "clarifications")?.value);
-  const visibleClarificationKeys = new Set([
-    ...(report?.content.unknowns ?? []).map((topic) => `unknown\0${topic}`),
-    ...(report?.content.disputes ?? []).map((topic) => `dispute\0${topic}`),
-    ...(report?.content.speculations ?? []).map((topic) => `speculation\0${topic}`)
-  ]);
-  const unmatchedClarifications = clarifications.filter(({ kind, topic }) => !visibleClarificationKeys.has(`${kind}\0${topic}`));
-  const beginEdit = (field: NonNullable<typeof editField>, value = "") => { setEditField(field); setEditValue(value); };
-  const saveField = async () => {
-    if (!editField || editField === "occurredAt" || !editValue.trim()) return;
-    setBusy(true); setError("");
-    try {
-      const value = editValue.trim();
-      const updated = unwrap(await window.grudgeVault.records.patchFields({
-        recordId: record.id, expectedRevision: record.revision, patch: { [editField]: value }
-      }));
-      setEditField(null); setEditValue(""); await onReload(updated);
-    } catch (cause) { setError(displayError(cause)); }
-    finally { setBusy(false); }
-  };
-  const saveTime = async (value: TemporalValue) => {
-    setBusy(true); setError("");
-    try {
-      const updated = unwrap(await window.grudgeVault.records.patchFields({ recordId: record.id,
-        expectedRevision: record.revision, patch: { occurredAt: value } }));
-      setEditField(null); await onReload(updated);
-    } catch (cause) { setError(displayError(cause)); }
-    finally { setBusy(false); }
-  };
+  const knownTime = occurredAtOverride ? record.occurredAt.kind !== "unknown" : Boolean(report?.content.time.value?.value.trim() && report.content.time.value.precision !== "unknown");
+  const location = String(locationOverride?.value ?? report?.content.location.value ?? "").trim();
+  const people = report?.content.people.filter(({ name }) => name.trim()) ?? [];
   const reanalyze = async () => {
     setBusy(true); setError("");
     try { unwrap(await window.grudgeVault.records.reanalyze(record.id, record.revision)); await onReload(); }
@@ -253,87 +221,49 @@ export function RecordDetail({ detail, onBack, onReload, sourceAnchor, refreshEr
     } catch (cause) { setError(displayError(cause)); }
     finally { setBusy(false); }
   };
-  const saveClarification = async () => {
-    if (!clarificationEditor || !clarificationValue.trim()) return;
-    setBusy(true); setError("");
-    try {
-      const { kind, topic } = clarificationEditor;
-      const next: ReportClarification[] = clarifications.filter((item) => item.kind !== kind || item.topic !== topic);
-      next.push({ kind, topic, response: clarificationValue.trim() });
-      const updated = unwrap(await window.grudgeVault.records.patchFields({
-        recordId: record.id, expectedRevision: record.revision, patch: { clarifications: next }
-      }));
-      setClarificationEditor(undefined); setClarificationValue("");
-      await onReload(updated);
-    } catch (cause) { setError(displayError(cause)); }
-    finally { setBusy(false); }
-  };
-  const editClarification = (kind: ReportClarification["kind"], topic: string) => {
-    setClarificationEditor({ kind, topic });
-    setClarificationValue(clarifications.find((item) => item.kind === kind && item.topic === topic)?.response ?? "");
-  };
-  const issueItems = (kind: ReportClarification["kind"], topics: string[]) => topics.map((topic, index) => {
-    const response = clarifications.find((item) => item.kind === kind && item.topic === topic)?.response;
-    return <li key={`${kind}-${index}`}><span>{topic}</span>
-      {response && <p className="clarification-response">你已补充（用户陈述，待核对）：{response}</p>}
-      <button className="text-button" disabled={busy} onClick={() => editClarification(kind, topic)}>{response ? "修改此项补充" : "补充此项"}</button>
-    </li>;
-  });
   const openCitation = async (url: string) => {
     setError("");
     try { unwrap(await window.grudgeVault.external.open(url)); }
     catch (cause) { setError(displayError(cause)); }
   };
-  const fieldEditor = (field: NonNullable<typeof editField>) => editField !== field ? null : <div className="inline-editor supplement">
-    {field === "occurredAt" ? <RecordTimeEditor initialValue={record.occurredAt} busy={busy} onSave={saveTime} onCancel={() => setEditField(null)} /> : <><input aria-label={field === "title" ? "编辑标题" : field === "location" ? "编辑地点" : "编辑法域"} autoFocus type="text" value={editValue} placeholder={field === "title" ? "输入标题" : field === "location" ? "输入明确地点" : "输入适用法域"} onChange={(event) => setEditValue(event.target.value)} /><button className="primary" disabled={busy || !editValue.trim()} onClick={() => void saveField()}>保存</button><button disabled={busy} onClick={() => setEditField(null)}>取消</button></>}
-  </div>;
-  const clarificationForm = clarificationEditor && <div className="inline-editor clarification-editor"><label>针对“{clarificationEditor.topic}”的补充说明<textarea autoFocus maxLength={2_000} value={clarificationValue} onChange={(event) => setClarificationValue(event.target.value)} /></label><button className="primary" disabled={busy || !clarificationValue.trim()} onClick={() => void saveClarification()}>保存补充</button><button disabled={busy} onClick={() => setClarificationEditor(undefined)}>取消</button></div>;
   return <section className="detail-panel">
     <header className="detail-header">
       <button className="text-button" onClick={onBack}>← {backLabel}</button>
       <div><div className="chips">{record.categories.map((category) => <span className={`chip chip-${category}`} key={category}>{CATEGORY_LABEL[category]}</span>)}</div><h2>{record.title}</h2><p>{temporalLabel(record, timeZone)} · {ORIGIN_LABEL[record.origin]}{recordTimeSourceLabel(record) &&
-        <small className="record-time-source" title="时间来源不等于事实已核实">{recordTimeSourceLabel(record)}</small>}</p><button className="text-button" disabled={busy} onClick={() => beginEdit("title", record.title)}>编辑标题</button>{fieldEditor("title")}</div>
-      <RecordStatus record={record} />
+        <small className="record-time-source" title="时间来源不等于事实已核实">{recordTimeSourceLabel(record)}</small>}</p></div>
+      <div className="detail-actions"><RecordStatus record={record} /><button disabled={busy} onClick={() => void reanalyze()}>重新整理</button><button className="primary" disabled={busy} onClick={() => setShowSupplement(true)}>对话补充</button></div>
     </header>
     {error && <div className="banner error" role="alert">{error}</div>}
     {refreshError && <div className="banner error" role="alert">无法载入最新记录状态：{refreshError} 当前保留上次成功读取的内容。<button disabled={busy} onClick={() => void onReload()}>重新载入</button></div>}
-    {record.sourceReviewRequired && <div className="banner neutral" role="status">导入来源出现尚未收录的新版本，请核对。当前原文和报告仍对应已收录的旧版本；重新分析旧版本不会消除这项提醒。</div>}
-    {activeAnalysisJobId && analysisProgress !== undefined && <p className="muted" role="status">报告任务进度 {Math.round(analysisProgress * 100)}%（处理进度，不代表全部媒体已检查）。</p>}
+    {record.sourceReviewRequired && <div className="banner neutral" role="status">导入来源有新版本，待核对。</div>}
+    {activeAnalysisJobId && analysisProgress !== undefined && <p className="muted" role="status">正在分析 {Math.round(analysisProgress * 100)}%</p>}
     <div className="segmented" role="tablist"><button className={tab === "report" ? "active" : ""} onClick={() => setTab("report")}>事件报告</button><button className={tab === "source" ? "active" : ""} onClick={() => setTab("source")}>原始内容</button></div>
     {tab === "source" ? <div className="source-view">
       <h3>原始文字</h3><AnchoredSource text={detail.source.text || "这条记录只有媒体原件。"} {...(activeAnchor ? { anchor: activeAnchor } : {})} />
-      <h3>原件</h3>{detail.attachments.length ? <ul>{detail.attachments.map((asset) => <AttachmentItem asset={asset} {...(activeAnchor ? { anchor: activeAnchor } : {})} key={asset.id} />)}</ul> : <p className="muted">没有附件</p>}
+      {detail.attachments.length > 0 && <><h3>附件</h3><ul>{detail.attachments.map((asset) => <AttachmentItem asset={asset} {...(activeAnchor ? { anchor: activeAnchor } : {})} key={asset.id} />)}</ul></>}
     </div> : <div className="report-view">
       {activeAnchor?.surface && activeAnchor.surface !== "source" && <div className="banner neutral">搜索命中{activeAnchor.surface === "report" ? "事件报告" : activeAnchor.surface === "user" ? `用户补充${activeAnchor.fieldKey ? `（${activeAnchor.fieldKey}）` : ""}` : "记录标题或摘要"}。</div>}
         {record.reportState === "stale" && !record.sourceReviewRequired && <div className="banner notice">补充已保存，报告待更新。<button disabled={busy} onClick={() => void reanalyze()}>更新报告</button></div>}
-      {!report && <div className="report-placeholder"><h3>{record.sourceReviewRequired ? "来源待核对" : record.reportState === "failed" ? "分析未完成" : "已保存，正在分析"}</h3><p>正式记录已经安全保存。分析失败不会丢失原文或原件。</p>{record.reportState === "failed" && <button className="primary" disabled={busy} onClick={() => void reanalyze()}>重试分析</button>}{activeAnalysisJobId && <button disabled={busy} onClick={() => void cancelAnalysis()}>取消分析</button>}</div>}
+      {!report && <div className="report-placeholder"><h3>{record.sourceReviewRequired ? "来源待核对" : record.reportState === "failed" ? "分析未完成" : "已保存，正在分析"}</h3>{record.reportState === "failed" && <button className="primary" disabled={busy} onClick={() => void reanalyze()}>重试分析</button>}{activeAnalysisJobId && <button disabled={busy} onClick={() => void cancelAnalysis()}>取消分析</button>}</div>}
       {report && <section className="report-section"><h3>事件摘要</h3><p className="report-summary">{report.content.summary}</p></section>}
-        <section className="report-section field-grid">
-          <div className="report-field-cell"><ReportTimeField field={report?.content.time ?? { value: { value: "", precision: "unknown" }, source: "ai" }} userSupplied={Boolean(occurredAtOverride)} userKind={record.occurredAt.kind} {...(occurredAtOverride && record.occurredAt.kind !== "unknown" ? { userValue: occurrenceTimeLabel(record, timeZone) } : {})} /><button className="text-button" disabled={busy} onClick={() => beginEdit("occurredAt")}>补充时间</button>{fieldEditor("occurredAt")}</div>
-          <div className="report-field-cell"><ReportField label="地点" value={String(locationOverride?.value ?? report?.content.location.value ?? "")} prompt={report?.content.location.prompt ?? "待补充：事情发生在哪里？"} source={locationOverride ? "user" : report?.content.location.source ?? "ai"} /><button className="text-button" disabled={busy} onClick={() => beginEdit("location", String(locationOverride?.value ?? report?.content.location.value ?? ""))}>补充地点</button>{fieldEditor("location")}</div>
-          <div className="report-field-cell"><ReportPeopleField people={report?.content.people ?? []} disabled={busy} onSupplement={() => editClarification("unknown", "有哪些相关人物及角色？")} />{clarificationEditor?.topic === "有哪些相关人物及角色？" && clarificationForm}</div>
-        </section>
+        {(knownTime || location || people.length > 0) && <Disclosure title="时间、地点与人物" className="report-section" forceOpen={activeAnchor?.surface === "user" && ["occurredAt", "location"].includes(activeAnchor.fieldKey ?? "")}><div className="field-grid">
+          {knownTime && <ReportTimeField field={report?.content.time ?? { value: { value: "", precision: "unknown" }, source: "ai" }} userSupplied={Boolean(occurredAtOverride)} userKind={record.occurredAt.kind} {...(occurredAtOverride && record.occurredAt.kind !== "unknown" ? { userValue: occurrenceTimeLabel(record, timeZone) } : {})} />}
+          {location && <ReportField label="地点" value={location} source={locationOverride ? "user" : report?.content.location.source ?? "ai"} />}
+          {people.length > 0 && <ReportPeopleField people={people} />}
+        </div></Disclosure>}
       {report && <>
-        {(record.reportState === "queued" || record.reportState === "running") && <div className="banner notice">当前展示上一版报告，新报告完成后会自动切换。{activeAnalysisJobId && <button disabled={busy} onClick={() => void cancelAnalysis()}>取消分析</button>}</div>}
-        {record.reportState === "failed" && <div className="banner error" role="alert">新报告分析失败，当前仍展示上一版成功报告。<button disabled={busy} onClick={() => void reanalyze()}>重试分析</button></div>}
-        {record.reportState === "partial" && <div className="banner notice">部分内容尚未完成处理；已完成的报告仍可查看。<button disabled={busy} onClick={() => void reanalyze()}>重试未完成分析</button></div>}
-        <section className="report-section next-steps"><h3>下一步</h3>{report.content.suggestions.length ? <><ol>{report.content.suggestions.slice(0, 2).map((item, index) => <li key={index}>{item}</li>)}</ol>{report.content.suggestions.length > 2 && <Disclosure title="更多建议"><ol start={3}>{report.content.suggestions.slice(2).map((item, index) => <li key={index}>{item}</li>)}</ol></Disclosure>}</> : <p className="muted">先补充尚不明确的事实，再核对原始材料。</p>}</section>
-        <Disclosure title="事件经过" className="report-section" forceOpen={activeAnchor?.surface === "report"}><h3>事件经过</h3>{report.content.chronology.length ? <ol className="chronology">{report.content.chronology.map((step) => <li key={step.id}>{step.anchor ? <button className="anchor-link" onClick={() => { setActiveAnchor(step.anchor); setTab("source"); }}>{step.text}<span>查看对应原始内容</span></button> : step.text}</li>)}</ol> : <p className="muted">尚未整理出明确经过。</p>}</Disclosure>
-        {(report.content.mediaSegments?.length ?? 0) > 0 && <Disclosure title="媒体片段" className="report-section" forceOpen={Boolean(activeAnchor?.surface === "report" && activeAnchor.assetId)}><h3>媒体片段</h3><p className="muted">模型生成的描述与建议定位，请对照原件核实。</p><ol className="chronology">{report.content.mediaSegments!.map((segment) => <li key={segment.id}><button className="anchor-link" onClick={() => { setActiveAnchor(segment.anchor); setTab("source"); }}>{segment.description}<span>查看对应原始内容</span></button></li>)}</ol></Disclosure>}
-        <section className="report-section split-sections"><div><h3>缺失与争议</h3>
-          {report.content.unknowns.length > 0 && <><h4>待补充</h4><ul>{issueItems("unknown", report.content.unknowns)}</ul></>}
-          {report.content.disputes.length > 0 && <><h4>存在争议</h4><ul>{issueItems("dispute", report.content.disputes)}</ul></>}
-          {(report.content.speculations?.length ?? 0) > 0 && <><h4>待核对推测</h4><ul>{issueItems("speculation", report.content.speculations ?? [])}</ul></>}
-          {report.content.unknowns.length === 0 && report.content.disputes.length === 0 &&
-            (report.content.speculations?.length ?? 0) === 0 && <p className="muted">当前报告没有列出缺失、争议或推测。</p>}
-          {unmatchedClarifications.length > 0 && <div className="prior-clarifications"><h4>此前补充的问题</h4><ul>{unmatchedClarifications.map(({ kind, topic, response }) => <li key={`${kind}-${topic}`}><span>{topic}</span><p className="clarification-response">你已补充（用户陈述，待核对）：{response}</p><button className="text-button" disabled={busy} onClick={() => editClarification(kind, topic)}>修改此项补充</button></li>)}</ul></div>}
-          {clarificationEditor?.topic !== "有哪些相关人物及角色？" && clarificationForm}
-        </div></section>
-        {record.categories.includes("rights") && <Disclosure title="法律视角 · 依据待核验" className="report-section legal" forceOpen={editField === "jurisdiction" || activeAnchor?.surface === "user" && activeAnchor.fieldKey === "jurisdiction"}><h3>法律视角</h3><button className="text-button" disabled={busy} onClick={() => beginEdit("jurisdiction", String(jurisdictionOverride?.value ?? defaultJurisdiction))}>修改法域</button>{fieldEditor("jurisdiction")}{reportMatchesCurrentRevision ? <><p className="muted">法域：{String(jurisdictionOverride?.value ?? defaultJurisdiction)} · 下列内容是待核验问题，不是确定法律结论。</p><ul>{report.content.legalIssues.map((item, index) => <li key={index}>{item}</li>)}</ul>{report.content.citations.length === 0 ? <span className="verification-pending">依据待核验</span> : <ul className="citation-list">{report.content.citations.map((citation) => <CitationCard citation={citation} issues={report.content.legalIssues} onOpen={openCitation} key={citation.id} />)}</ul>}</> : <p className="verification-pending" role="status">记录已有新的补充或来源版本；旧报告的法律问题与依据暂不展示。请重新分析后核对当前法域、事实和事发时间。</p>}</Disclosure>}
-        {report.content.coverageNotes.length > 0 && <section className="report-section warning"><h3>覆盖限制</h3><ul>{report.content.coverageNotes.map((item, index) => <li key={index}>{item}</li>)}</ul></section>}
+        {(record.reportState === "queued" || record.reportState === "running") && <div className="banner notice">报告更新中{activeAnalysisJobId && <button disabled={busy} onClick={() => void cancelAnalysis()}>取消分析</button>}</div>}
+        {record.reportState === "failed" && <div className="banner error" role="alert">报告更新失败<button disabled={busy} onClick={() => void reanalyze()}>重试分析</button></div>}
+        {record.reportState === "partial" && <div className="banner notice compact-status"><span>报告未完成</span><button disabled={busy} onClick={() => void reanalyze()}>继续分析</button></div>}
+        {report.content.chronology.length > 0 && <section className="report-section"><h3>事件经过</h3><ol className="chronology">{report.content.chronology.map((step) => <li key={step.id}>{step.anchor ? <button className="anchor-link" onClick={() => { setActiveAnchor(step.anchor); setTab("source"); }}>{step.text}<span>查看原文</span></button> : step.text}</li>)}</ol></section>}
+        {report.content.suggestions.length > 0 && <Disclosure title="建议" className="report-section next-steps" forceOpen={activeAnchor?.surface === "report"}><ol>{report.content.suggestions.map((item, index) => <li key={index}>{item}</li>)}</ol></Disclosure>}
+        {(report.content.mediaSegments?.length ?? 0) > 0 && <Disclosure title="媒体片段" className="report-section" forceOpen={Boolean(activeAnchor?.surface === "report" && activeAnchor.assetId)}><ol className="chronology">{report.content.mediaSegments!.map((segment) => <li key={segment.id}><button className="anchor-link" onClick={() => { setActiveAnchor(segment.anchor); setTab("source"); }}>{segment.description}<span>查看原件</span></button></li>)}</ol></Disclosure>}
+        {clarifications.length > 0 && <Disclosure title="补充记录" className="report-section" forceOpen={activeAnchor?.surface === "user" && activeAnchor.fieldKey === "clarifications"}><ul>{clarifications.map(({ kind, topic, response }) => <li key={`${kind}-${topic}`}><p className="clarification-response">{response}</p></li>)}</ul></Disclosure>}
+        {record.categories.includes("rights") && (report.content.legalIssues.length > 0 || report.content.citations.length > 0) && <Disclosure title="相关法律" className="report-section legal" forceOpen={activeAnchor?.surface === "user" && activeAnchor.fieldKey === "jurisdiction"}>{reportMatchesCurrentRevision ? <><ul>{report.content.legalIssues.map((item, index) => <li key={index}>{item}</li>)}</ul>{report.content.citations.length > 0 && <ul className="citation-list">{report.content.citations.map((citation) => <CitationCard citation={citation} issues={report.content.legalIssues} onOpen={openCitation} key={citation.id} />)}</ul>}</> : <p className="verification-pending" role="status">补充已保存，法律依据待更新。</p>}</Disclosure>}
       </>}
-      <section className="report-section report-tools"><button disabled={busy} onClick={() => void reanalyze()}>重新分析</button><Disclosure title="报告详情">{report && <ReportField label="报告版本" value={`记录修订 ${report.recordRevision}`} source="ai" />}<p className="capability-help">来源标记表示信息来自哪里，不代表事实已核实。重新分析会发送当前材料给已启用的模型，可能产生费用。</p></Disclosure></section>
+      {report && activeAnchor?.surface === "report" && <Disclosure title="相关内容" className="report-section" forceOpen><ul>{[...report.content.unknowns, ...report.content.disputes, ...(report.content.speculations ?? []), report.content.time.prompt, report.content.location.prompt].filter(Boolean).map((item, index) => <li key={index}>{item}</li>)}</ul></Disclosure>}
     </div>}
+    {showSupplement && <RecordSupplementDialog detail={detail} onClose={() => setShowSupplement(false)} onSaved={async (updated) => { await onReload(updated); setShowSupplement(false); }} />}
   </section>;
 }
 
@@ -383,7 +313,7 @@ export function TimelineView({ onNew, onSettings, pendingCount, onPending, openR
     globalThis.requestAnimationFrame(() => globalThis.scrollTo({ top: listScrollPosition.current }));
   }} onReload={async (value) => { await reloadSelection(value); await load(); }} />;
   return <div className="page timeline-page"><div className="timeline-background" aria-hidden="true"><i /><i /><i /></div>
-    <header className="page-header"><div><p className="eyebrow">事件账本</p><h1>时间线</h1><p>沿着时间，回看值得留下的事。</p></div><div className="header-actions"><button onClick={onPending}>待确认{pendingCount > 0 && <b>{pendingCount}</b>}</button>{!emptyVault && <button className="primary" onClick={onNew}><Icon name="plus" />新建记录</button>}</div></header>
+    <header className="page-header"><div><h1>时间线</h1></div><div className="header-actions"><button onClick={onPending}>待确认{pendingCount > 0 && <b>{pendingCount}</b>}</button>{!emptyVault && <button className="primary" onClick={onNew}><Icon name="plus" />新建记录</button>}</div></header>
     <TimelineImportStatus state={importReceipt} hasZipRecords={records.some(({ origin }) => origin === "zip")} onSettings={onSettings} />
     {(!emptyVault || filtered) && <div className="filter-bar">
       <label>类别<select value={filter.category ?? ""} onChange={(event) => setFilter((current) => { const next = { ...current }; delete next.category; return event.target.value ? { ...next, category: event.target.value as EventCategory } : next; })}><option value="">全部</option><option value="grudge">冲突</option><option value="rights">权益</option><option value="danger">危险</option></select></label>
@@ -392,11 +322,10 @@ export function TimelineView({ onNew, onSettings, pendingCount, onPending, openR
       <label>至<input type="date" value={filter.to ?? ""} onChange={(event) => setFilter((current) => { const next = { ...current }; delete next.to; return event.target.value ? { ...next, to: event.target.value } : next; })} /></label>
       <button className="text-button" onClick={() => setFilter({ limit: 60 })}>清除筛选</button>
     </div>}
-    {(!emptyVault || filtered) && <Disclosure title="日期如何匹配？"><p>月份与时间范围按可能重叠筛选；时间未确定时按记录日期。明确时刻按本次查询的本地日期。</p></Disclosure>}
     {selectionMessage && <div className="banner error" role="alert">{selectionMessage}</div>}
     {error && <div className="banner error" role="alert">{records.length ? "列表读取未完成；当前保留上次成功读取的内容。" : "暂时无法读取时间线；不能据此判断没有记录。"} {error}<button onClick={() => void Promise.all([load(), presence.reload()])}>重新载入时间线</button></div>}
     {refreshing && records.length > 0 && <p className="muted" role="status">正在更新列表；当前展示上次成功读取的内容。</p>}
-    {loading || (refreshing && records.length === 0) ? <div className="loading" role="status">正在载入时间线…</div> : records.length === 0 ? error ? <p className="muted">未完成读取，请重新载入后查看。</p> : filtered ? <section className="empty-state small"><h2>没有符合筛选的记录</h2><p>试试调整类别、来源或日期。</p><button onClick={() => setFilter({ limit: 60 })}>清除筛选</button></section> : presence.error ? <div className="banner error" role="alert">暂时无法确认账本是否为空。<button onClick={() => void presence.reload()}>重新读取账本状态</button></div> : presence.loading ? <p role="status">正在核对账本状态…</p> : emptyVault ? <EmptyTimeline onNew={onNew} onSettings={onSettings} /> : <p className="muted">当前没有可显示的记录，请重新载入。</p> : <><div className="timeline-guide"><span>{records.length} 条记录{nextCursor ? " · 还有更早的记录" : ""}</span><span>移到节点查看预览 · 点击查看详情</span></div><TimelineRail records={records} timeZone={resultTimeZone} onOpen={id => void open(id)} />{nextCursor && <button className="load-more" disabled={loadingMore || refreshing} onClick={() => void loadMore()}>{loadingMore ? "正在载入…" : "载入更多"}</button>}</>}
+    {loading || (refreshing && records.length === 0) ? <div className="loading" role="status">正在载入时间线…</div> : records.length === 0 ? error ? <p className="muted">未完成读取，请重新载入后查看。</p> : filtered ? <section className="empty-state small"><h2>没有符合筛选的记录</h2><p>试试调整类别、来源或日期。</p><button onClick={() => setFilter({ limit: 60 })}>清除筛选</button></section> : presence.error ? <div className="banner error" role="alert">暂时无法确认账本是否为空。<button onClick={() => void presence.reload()}>重新读取账本状态</button></div> : presence.loading ? <p role="status">正在核对账本状态…</p> : emptyVault ? <EmptyTimeline onNew={onNew} onSettings={onSettings} /> : <p className="muted">当前没有可显示的记录，请重新载入。</p> : <><div className="timeline-guide"><span>{records.length} 条记录{nextCursor ? " · 还有更早的记录" : ""}</span></div><TimelineRail records={records} timeZone={resultTimeZone} onOpen={id => void open(id)} />{nextCursor && <button className="load-more" disabled={loadingMore || refreshing} onClick={() => void loadMore()}>{loadingMore ? "正在载入…" : "载入更多"}</button>}</>}
   </div>;
 }
 
@@ -419,45 +348,16 @@ function PendingDrawer({ items, loading, loadError, onClose, onChanged, onSaved,
     try { const result = unwrap(await window.grudgeVault.pending.resolve(item.id, action, globalThis.crypto.randomUUID())); await onChanged(); if (result?.kind === "saved") onSaved(result.recordId); }
     catch (cause) { setError(displayError(cause)); } finally { setBusy(undefined); }
   };
-  const resolveZip = async (item: PendingReview) => {
-    setBusy(item.id); setError(""); setNotice("");
-    try {
-      const result = unwrap(await window.grudgeVault.pending.chooseDayOneZip(item.id, globalThis.crypto.randomUUID()));
-      if (!result) return;
-      await onChanged();
-      if (result.kind === "saved") onSaved(result.recordId);
-      if (result.kind === "failed") setError(`重新筛选失败（${result.code}），请检查模型设置后重试。`);
-      if (result.kind === "skipped") setNotice("所选 ZIP 中的日记版本已变化；重新筛选后判定为普通日常，旧待确认项已清理。");
-      if (result.kind === "needs_review") setNotice("日记版本已变化，已重新筛选并更新待确认项；仍未建立正式记录。");
-    } catch (cause) { setError(displayError(cause)); }
-    finally { setBusy(undefined); }
-  };
-  const resolveLegacy = async (item: PendingReview) => {
-    if (!window.confirm("将只读核对所选旧工作区中的这条原始记录；若版本已变化，新内容会发送给当前模型重新筛选。确认继续吗？")) return;
-    setBusy(item.id); setError(""); setNotice("");
-    try {
-      const result = unwrap(await window.grudgeVault.pending.chooseLegacyWorkspace(item.id, globalThis.crypto.randomUUID()));
-      if (!result) return;
-      await onChanged();
-      if (result.kind === "saved") onSaved(result.recordId);
-      if (result.kind === "failed") setError(`旧记录核对失败（${result.code}），请检查模型设置或旧工作区后重试。`);
-      if (result.kind === "skipped") setNotice("旧记录版本已变化；重新筛选后判定为普通日常，旧待确认项已清理。");
-      if (result.kind === "needs_review") setNotice("旧记录版本已变化，已重新筛选并更新待确认项；仍未建立正式记录。");
-    } catch (cause) { setError(displayError(cause)); }
-    finally { setBusy(undefined); }
-  };
   return <div className="drawer-backdrop"><aside ref={dialogRef} tabIndex={-1} className="drawer" role="dialog" aria-modal="true" aria-label="待确认">
-    <header><div><p className="eyebrow">与正式记录隔离</p><h2>待确认</h2></div><button className="icon-button" aria-label="关闭" onClick={onClose}><Icon name="close" /></button></header>
-    <p className="drawer-help">这里只保留最小摘录和判断原因，不会进入时间线或搜索。普通日常不会出现在这里。</p>
+      <header><h2>待确认</h2><button className="icon-button" aria-label="关闭" onClick={onClose}><Icon name="close" /></button></header>
     {error && <div className="banner error">{error}</div>}
     {notice && <div className="banner notice" role="status">{notice}</div>}
     {loadError && <div className="banner error" role="alert">暂时无法读取待确认：{loadError}<button onClick={() => void onChanged()}>重新读取待确认</button></div>}
-    {loading ? <p role="status">正在读取待确认…</p> : loadError ? null : items.length === 0 ? <div className="empty compact"><h3>没有待确认内容</h3><p>需要你判断的项目会出现在这里。</p></div> : <div className="pending-list">{items.map((item) => <article key={item.id}>
+    {loading && items.length === 0 ? <p role="status">正在读取待确认…</p> : loadError && items.length === 0 ? null : items.length === 0 ? <div className="empty compact"><h3>没有待确认内容</h3><p>需要你判断的项目会出现在这里。</p></div> : <div className="pending-list">{items.map((item) => <article key={item.id}>
       <div className="chips">{item.categories.map((category) => <span className={`chip chip-${category}`} key={category}>{CATEGORY_LABEL[category]}</span>)}<span className="chip subtle">{ORIGIN_LABEL[item.origin]}</span></div>
-      <blockquote>{item.excerpt || "（只有媒体）"}</blockquote><p>{item.reason}</p>
-      {!item.sessionAvailable && <p className="muted">原始处理会话已结束。点击“补充”写清需要核对的经过，并添加你希望留存的附件。</p>}
-      <footer><button disabled={Boolean(busy)} onClick={() => void resolve(item, "ignore")}>忽略并清理</button><button className="primary" disabled={Boolean(busy)} onClick={() => onReprovide(item.id)}>补充</button>{item.sessionAvailable && <button disabled={Boolean(busy)} onClick={() => void resolve(item, "keep")}>确认保留</button>}</footer>
-      {!item.sessionAvailable && (item.origin === "zip" || item.origin === "migration") && <Disclosure title="从原件恢复"><p>也可重新选择原件核对。保留原件可恢复导入来源{item.origin === "migration" ? "和旧修订" : ""}；版本变化时会重新筛选。</p><button disabled={Boolean(busy)} onClick={() => void (item.origin === "zip" ? resolveZip(item) : resolveLegacy(item))}>{item.origin === "zip" ? "选择原 ZIP" : "选择旧工作区"}</button></Disclosure>}
+      <blockquote>{item.excerpt || "（只有媒体）"}</blockquote><PendingReviewDetails item={item} onChanged={onChanged} onReprovide={() => onReprovide(item.id)} /><p>{item.reason}</p>
+      <footer><button disabled={Boolean(busy)} onClick={() => void resolve(item, "ignore")}>忽略并清理</button><button className="primary" disabled={Boolean(busy)} onClick={() => onReprovide(item.id)}>补充</button><button disabled={Boolean(busy) || !item.sessionAvailable} onClick={() => void resolve(item, "keep")}>确认保留</button></footer>
+
     </article>)}</div>}
   </aside></div>;
 }
@@ -872,7 +772,7 @@ export function SettingsView({ onDataChanged, initialGroup = "model", navigation
       </section>
       <section className="settings-card"><div className="settings-card-header"><div><h2>迁移与存储</h2><p>旧工作区保持不变，相关记录在当前新版工作区中重新加密。</p></div></div><div className="settings-form">{migrationMessage && <div className="banner notice">{migrationMessage}</div>}<button className="primary" disabled={migrationBusy || !modelFresh || !settings?.activeProvider} onClick={() => void migrateLegacy()}>{migrationBusy ? "正在逐条迁移…" : "选择旧工作区并开始筛选迁移"}</button>{migrationBusy && <button onClick={() => void cancelLegacy()}>停止本次迁移</button>}<p className="capability-help">只接受格式版本 1／2。修订、来源映射和所需附件随正式记录迁移；普通日常不会复制，无法完整检查的内容进入待确认。</p>{!modelFresh ? <p className="capability-help">模型配置尚未完成读取，暂不能开始新的迁移。</p> : !settings?.activeProvider && <p className="capability-help">请先连接并启用模型服务。</p>}</div></section></div>
     <div className="settings-group" hidden={group !== "privacy"}>
-      <section className="settings-card"><div className="settings-card-header"><div><h2>数据如何保存与使用</h2><p>本机保存和模型服务是两个不同的边界。</p></div></div><div className="settings-form privacy-facts"><p><strong>原始附件：</strong>加密保存在本机工作区。</p><p><strong>记录正文、报告及搜索索引：</strong>保存在本机数据库，未做整库加密；工作区锁定不能替代磁盘加密。</p><p><strong>模型服务：</strong>筛选与分析会发送文字和附件，语义查询与索引会发送对应内容。服务商可能计费，并按其政策留存。</p><p><strong>尚未收录的输入：</strong>完整编辑内容只在内存中；待确认只保存加密的短摘录，不代表原文已经保存。</p></div></section>
+      <section className="settings-card"><div className="settings-card-header"><div><h2>数据如何保存与使用</h2><p>本机保存和模型服务是两个不同的边界。</p></div></div><div className="settings-form privacy-facts"><p><strong>原始附件：</strong>加密保存在本机工作区。</p><p><strong>记录正文、报告及搜索索引：</strong>保存在本机数据库，未做整库加密；工作区锁定不能替代磁盘加密。</p><p><strong>模型服务：</strong>筛选与分析会发送文字和附件，语义查询与索引会发送对应内容。服务商可能计费，并按其政策留存。</p><p><strong>尚未收录的输入：</strong>完整编辑内容只在内存中；待确认会在本机加密保存全文和可读取的原附件，补充会保留原文。</p></div></section>
       {group === "privacy" && <WorkspacePasswordSettings />}<AutoLockSettings />      <section className="settings-card"><div className="settings-card-header"><div><h2>法律地域</h2><p>用于报告中的法律问题整理；不会自动生成确定结论。</p></div></div><div className="settings-form"><SnapshotNotice name="默认地域" snapshot={legalSnapshot} /><label className="field">默认地域<input maxLength={200} disabled={legalBusy || !legalFresh} value={defaultJurisdiction} onChange={(event) => { legalDraftDirty.current = true; setDefaultJurisdiction(event.target.value); setLegalMessage(""); }} placeholder="例如：中国大陆" /></label>{legalMessage && <div className="banner notice">{legalMessage}</div>}<button className="primary" disabled={legalBusy || !legalFresh || !defaultJurisdiction.trim()} onClick={() => void saveDefaultJurisdiction()}>{legalBusy ? "正在保存…" : "保存默认地域"}</button><Disclosure title="法律检索与隐私说明"><div className="banner neutral">启用百炼 qwen3.8-omni-flash 后，中国大陆权益报告会尽量删去姓名、联系方式等标识，再将法律问题联网检索，并重新读取官方网页核对标题与原文摘录；请勿在法律问题中输入不必要的私密信息。具体法律适用性和事发时点仍标“依据待核验”。其他地域暂不检索。</div></Disclosure></div></section>
 </div>
   </div>;
@@ -894,7 +794,7 @@ export function App() {
   const refreshVisiblePending = async () => { if (isCurrentSession(session)) await refreshPending(); };
   useEffect(() => {
     const handleShortcut = (event: globalThis.KeyboardEvent) => {
-      if (!isCurrentSession(session) || showNew || showPending || !(event.metaKey || event.ctrlKey)) return;
+      if (!isCurrentSession(session) || showNew || showPending || document.querySelector('[role="dialog"][aria-modal="true"]') || !(event.metaKey || event.ctrlKey)) return;
       const key = event.key.toLocaleLowerCase("en-US");
       if (key === "n") {
         event.preventDefault(); setShowNew(true);

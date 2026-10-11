@@ -34,7 +34,7 @@ export function useRecordIntake({ initialPendingId, onSaved, onPendingChanged, o
   }, [release]);
   const current = (scope: number) => active.current && epoch.current === scope;
   const resetFeedback = () => { if (submitting.current) return;
-    setState("editing"); setMessage(""); setPendingItem(undefined); setPendingReadError(""); setConfigurationError(false);
+    setState("editing"); setMessage(""); if (!pendingId.current) setPendingItem(undefined); setPendingReadError(""); setConfigurationError(false);
   };
   const fail = (cause: unknown) => {
     setState("failed"); setMessage(displayError(cause));
@@ -45,7 +45,7 @@ export function useRecordIntake({ initialPendingId, onSaved, onPendingChanged, o
     if (!id) return;
     setPendingReadError("");
     try {
-      const item = unwrap(await window.grudgeVault.pending.list()).find((item) => item.id === id);
+      const item = unwrap(await window.grudgeVault.pending.get(id));
       if (!current(scope) || pendingId.current !== id) return;
       if (!item) { setPendingItem(undefined); setPendingReadError("这项待确认已变化，请重新提供完整内容并判断。"); return; }
       setPendingItem(item);
@@ -59,7 +59,7 @@ export function useRecordIntake({ initialPendingId, onSaved, onPendingChanged, o
     if (result.kind === "skipped") { pendingId.current = undefined; setPendingItem(undefined); setState("skipped");
       setMessage("不属于收录范围，尚未保存。你可以补充具体经过后重新判断。"); onPendingChanged(); return; }
     if (result.kind === "needs_review") {
-      pendingId.current = result.pendingId; setState("review"); setMessage("需要你确认是否留存。当前只保存了短摘录，完整内容尚未入库。");
+      pendingId.current = result.pendingId; setState("review"); setMessage("需要你确认是否留存。全文和可读取的附件已保存在本机。");
       onPendingChanged(); await readPending(scope); return;
     }
     const code = APP_ERROR_CODES.find((code) => code === result.code);
@@ -81,6 +81,7 @@ export function useRecordIntake({ initialPendingId, onSaved, onPendingChanged, o
       const result = unwrap(await (id ? window.grudgeVault.pending.rescreenManual(id, prepared.sessionId)
         : window.grudgeVault.intake.screenAndSave(prepared.sessionId, globalThis.crypto.randomUUID())));
       await acceptResult(result, scope);
+      return result.kind === "needs_review";
     } catch (cause) { if (current(scope)) { preparationId.current = undefined; fail(cause); } }
     finally { submitting.current = false; if (current(scope)) setBusy(false); }
   };

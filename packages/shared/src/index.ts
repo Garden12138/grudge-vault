@@ -63,7 +63,8 @@ import type {
   RecoveryPackageSummary,
   LegalVerificationResult
   , PreparedIntake, ScreenAndSaveResult, ScreenedZipImportSummary, ScreenedZipImportProgress, ScreenedZipImportReceipt, LegacyMigrationSummary, PendingReview, TimelineFilter, TimelinePage,
-  EventRecordDetail, FieldOverride, PreparedSearchQuery, RecordSearchIndexStatus, RecordSearchQuery, RecordSearchPage
+  EventRecordDetail, FieldOverride, PreparedSearchQuery, RecordSearchIndexStatus, RecordSearchQuery, RecordSearchPage,
+  RecordSupplementMessage, RecordSupplementReply
 } from "@grudge-vault/domain";
 
 export { codePointLength, RECORD_QUERY_TEXT_LIMIT, RECORD_TEXT_LIMIT } from "./text-limits";
@@ -434,7 +435,9 @@ export interface GrudgeVaultApi {
     onSearchMediaProgress(callback: (value: NativeMediaProgress & { sessionId: string }) => void): () => void;
     timeline(filter: TimelineFilter): Promise<IpcResult<TimelinePage>>;
     get(id: string): Promise<IpcResult<EventRecordDetail>>;
+    restoreOriginal(id: string, expectedRevision: number, entryId: string): Promise<IpcResult<EventRecordDetail | null>>;
     patchFields(input: PatchRecordFieldsInput): Promise<IpcResult<EventRecordDetail>>;
+    supplement(input: { recordId: string; expectedRevision: number; messages: RecordSupplementMessage[] }): Promise<IpcResult<RecordSupplementReply>>;
     reanalyze(id: string, expectedRevision: number): Promise<IpcResult<string>>;
     search(query: RecordSearchQuery): Promise<IpcResult<RecordSearchPage>>;
     prepareSearch(input: { requestId: string; text: string; files: File[] }): Promise<IpcResult<PreparedSearchQuery>>;
@@ -447,6 +450,8 @@ export interface GrudgeVaultApi {
   };
   pending: {
     list(): Promise<IpcResult<PendingReview[]>>;
+    get(id: string): Promise<IpcResult<PendingReview>>;
+    restoreDetails(id: string): Promise<IpcResult<{ restored: number; detail: PendingReview } | null>>;
     resolve(id: string, action: "keep" | "ignore", operationId: string): Promise<IpcResult<ScreenAndSaveResult | null>>;
     rescreenManual(id: string, sessionId: string): Promise<IpcResult<ScreenAndSaveResult>>;
     chooseDayOneZip(id: string, operationId: string): Promise<IpcResult<ScreenAndSaveResult | null>>;

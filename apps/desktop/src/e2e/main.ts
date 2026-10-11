@@ -66,6 +66,29 @@ class E2eAgentModelAdapter implements AgentModelAdapterPort {
       await input.executeTool("confirm_model_capability", { ok: true }, "e2e-capability-call");
       return { text: "capability confirmed", model: input.model };
     }
+    if (structured === "submit_record_supplement") {
+      const context = JSON.parse(input.user) as { originalText: string; conversation: Array<{ role: string; content: string }> };
+      const answers = context.conversation.filter(({ role }) => role === "user");
+      const last = answers.at(-1)?.content ?? "";
+      const patch: Record<string, unknown> = {};
+      const times: Record<string, unknown> = {
+        "事情发生在2026年8月，具体哪天记不清。": { kind: "month", value: "2026-08" },
+        "事情发生在2026年9月到10月那段时间。": { kind: "range", from: "2026-09", to: "2026-10" },
+        "大约上周，具体日期记不清。": { kind: "relative", text: "大约上周，具体日期记不清" },
+        "事情发生在2026年10月2日15:30，北京时间 UTC+08:00。": { kind: "instant", value: "2026-10-02T07:30:00.000Z" },
+        "事情发生在2026年9月21日。": { kind: "date", value: "2026-09-21" },
+        "时间记不清，先标为不确定。": { kind: "unknown" }
+      };
+      if (times[last]) patch.occurredAt = times[last];
+      if (last.includes("法域改为日本")) patch.jurisdiction = "日本";
+      if (last.includes("地点是上海办公室")) patch.location = "上海办公室";
+      if (last.startsWith("标题改为：")) patch.title = last.slice("标题改为：".length);
+      if (last.startsWith("地点改为：")) patch.location = last.slice("地点改为：".length);
+      await input.executeTool(structured, { message: !answers.length
+        ? context.originalText.includes("奖金") ? "关于当天没收到奖金这件事，当时约定的金额是多少、什么时候支付？" : "关于当天的冲突，对方具体说了什么，你当时怎样回应？"
+        : "你提到的细节已放在这次对话里。还有当时的聊天记录或其他经过想补充吗？", patch }, "e2e-record-supplement");
+      return { model: input.model };
+    }
     if (process.env.GRUDGE_VAULT_E2E_RASTER_FLOW === "1" && structured === "submit_screening") {
       const images = (input.userContent as Array<{ type: string; image_url?: { url: string } }> | undefined)
         ?.filter(({ type }) => type === "image_url") ?? [];
@@ -178,7 +201,7 @@ class E2eAgentModelAdapter implements AgentModelAdapterPort {
         (state.__gvE2eNativeCalls ??= []).push("screen");
         if (!JSON.stringify(input.userContent).includes("合成片段后段含争议话语")) throw new Error("Synthetic checked tail was not passed to screening");
       }
-      const ambiguous = input.user.includes("他又这样说了");
+      const ambiguous = input.user.includes("他又这样说了") && !/【补充】[\s\S]*(奖金|威胁|梦游)/.test(input.user);
       await input.executeTool("submit_screening", {
         decision: ordinary ? "skip" : ambiguous ? "review" : "include",
         categories: ordinary ? [] : input.user.includes("奖金") ? ["rights"] : ["grudge"],
